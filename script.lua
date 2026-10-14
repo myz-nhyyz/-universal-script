@@ -1,5 +1,5 @@
--- Context: Luau (Roblox Client Executor Environment - Synapse/Wave/Solara/Fluxus compatible)
--- Architecture: Single-file immediate/retained hybrid ScreenGui + RunService.Heartbeat / RenderStepped loops.
+-- Context: Luau (Roblox Client Executor - Mobile & PC Cross-Platform Compatible)
+-- Architecture: Custom touch/mouse drag engine with click-threshold detection + Humanoid.MoveDirection flight vectoring.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -9,7 +9,6 @@ local CoreGui = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
-local Mouse = LocalPlayer:GetMouse()
 
 -- // CONFIGURATION & STATE
 local Config = {
@@ -59,50 +58,148 @@ end
 local oldGui = getGuiParent():FindFirstChild("OllieBenchUI")
 if oldGui then oldGui:Destroy() end
 
--- // UI BUILDER (Draggable, Tabbed, Sliders, Dropdowns)
+-- // CROSS-PLATFORM DRAGGABLE HELPER (Distinguishes Drag vs Click/Tap)
+local function makeDraggable(dragHandle, targetFrame, onTapCallback)
+    local dragging = false
+    local dragInput = nil
+    local dragStart = nil
+    local startPos = nil
+    local movedBeyondThreshold = false
+
+    dragHandle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            movedBeyondThreshold = false
+            dragStart = input.Position
+            startPos = targetFrame.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    if dragging then
+                        dragging = false
+                        if not movedBeyondThreshold and onTapCallback then
+                            onTapCallback()
+                        end
+                    end
+                end
+            end)
+        end
+    end)
+
+    dragHandle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    table.insert(State.Connections, UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            if delta.Magnitude > 6 then
+                movedBeyondThreshold = true
+            end
+            targetFrame.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + delta.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + delta.Y
+            )
+        end
+    end))
+end
+
+-- // UI BUILDER
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "OllieBenchUI"
 ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.Parent = getGuiParent()
 
+-- // 1. FLOATING MINI APP ICON (42x42 px - Mobile & PC Toggle)
+local AppIcon = Instance.new("TextButton")
+AppIcon.Name = "FloatingAppIcon"
+AppIcon.Size = UDim2.new(0, 42, 0, 42)
+AppIcon.Position = UDim2.new(0, 25, 0.45, 0)
+AppIcon.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+AppIcon.Text = "O"
+AppIcon.TextColor3 = Color3.fromRGB(90, 170, 255)
+AppIcon.Font = Enum.Font.Code
+AppIcon.TextSize = 18
+AppIcon.AutoButtonColor = true
+AppIcon.Parent = ScreenGui
+
+local IconCorner = Instance.new("UICorner", AppIcon)
+IconCorner.CornerRadius = UDim.new(0, 10)
+
+local IconStroke = Instance.new("UIStroke", AppIcon)
+IconStroke.Color = Color3.fromRGB(80, 140, 210)
+IconStroke.Thickness = 1.8
+
+local StatusDot = Instance.new("Frame")
+StatusDot.Size = UDim2.new(0, 8, 0, 8)
+StatusDot.Position = UDim2.new(1, -10, 0, 2)
+StatusDot.BackgroundColor3 = Color3.fromRGB(65, 210, 105)
+StatusDot.BorderSizePixel = 0
+StatusDot.Parent = AppIcon
+Instance.new("UICorner", StatusDot).CornerRadius = UDim.new(1, 0)
+
+-- // 2. MAIN WINDOW (Compact & Mobile Screen Friendly)
 local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 480, 0, 380)
-MainFrame.Position = UDim2.new(0.5, -240, 0.5, -190)
+MainFrame.Size = UDim2.new(0, 440, 0, 310)
+MainFrame.Position = UDim2.new(0.5, -220, 0.5, -155)
 MainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 MainFrame.BorderSizePixel = 0
 MainFrame.Active = true
-MainFrame.Draggable = true
 MainFrame.Parent = ScreenGui
 
-local UICorner = Instance.new("UICorner", MainFrame)
-UICorner.CornerRadius = UDim.new(0, 6)
-
-local UIStroke = Instance.new("UIStroke", MainFrame)
-UIStroke.Color = Color3.fromRGB(60, 60, 75)
-UIStroke.Thickness = 1
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 6)
+local MainStroke = Instance.new("UIStroke", MainFrame)
+MainStroke.Color = Color3.fromRGB(60, 60, 75)
+MainStroke.Thickness = 1
 
 local TopBar = Instance.new("Frame")
-TopBar.Size = UDim2.new(1, 0, 0, 32)
+TopBar.Size = UDim2.new(1, 0, 0, 30)
 TopBar.BackgroundColor3 = Color3.fromRGB(26, 26, 32)
 TopBar.BorderSizePixel = 0
+TopBar.Active = true
 TopBar.Parent = MainFrame
 Instance.new("UICorner", TopBar).CornerRadius = UDim.new(0, 6)
 
 local TitleLabel = Instance.new("TextLabel")
-TitleLabel.Size = UDim2.new(1, -20, 1, 0)
+TitleLabel.Size = UDim2.new(1, -40, 1, 0)
 TitleLabel.Position = UDim2.new(0, 10, 0, 0)
 TitleLabel.BackgroundTransparency = 1
-TitleLabel.Text = "OLLIE BENCH // MULTI-SUITE [INSERT TO HIDE]"
+TitleLabel.Text = "OLLIE BENCH // [L-ALT OR ICON]"
 TitleLabel.TextColor3 = Color3.fromRGB(220, 220, 230)
 TitleLabel.Font = Enum.Font.Code
-TitleLabel.TextSize = 13
+TitleLabel.TextSize = 12
 TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
 TitleLabel.Parent = TopBar
 
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.new(0, 26, 0, 22)
+CloseBtn.Position = UDim2.new(1, -30, 0, 4)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+CloseBtn.Text = "-"
+CloseBtn.TextColor3 = Color3.fromRGB(220, 220, 230)
+CloseBtn.Font = Enum.Font.Code
+CloseBtn.TextSize = 14
+CloseBtn.Parent = TopBar
+Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 4)
+
+local function toggleMenu()
+    MainFrame.Visible = not MainFrame.Visible
+    StatusDot.BackgroundColor3 = MainFrame.Visible and Color3.fromRGB(65, 210, 105) or Color3.fromRGB(220, 80, 80)
+end
+
+CloseBtn.MouseButton1Click:Connect(toggleMenu)
+makeDraggable(TopBar, MainFrame, nil)
+makeDraggable(AppIcon, AppIcon, toggleMenu)
+
 local TabHolder = Instance.new("Frame")
-TabHolder.Size = UDim2.new(0, 110, 1, -42)
-TabHolder.Position = UDim2.new(0, 6, 0, 36)
+TabHolder.Size = UDim2.new(0, 100, 1, -40)
+TabHolder.Position = UDim2.new(0, 6, 0, 34)
 TabHolder.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
 TabHolder.BorderSizePixel = 0
 TabHolder.Parent = MainFrame
@@ -113,8 +210,8 @@ TabListLayout.Padding = UDim.new(0, 4)
 TabListLayout.SortOrder = Enum.SortOrder.LayoutOrder
 
 local ContentHolder = Instance.new("Frame")
-ContentHolder.Size = UDim2.new(1, -128, 1, -42)
-ContentHolder.Position = UDim2.new(0, 122, 0, 36)
+ContentHolder.Size = UDim2.new(1, -118, 1, -40)
+ContentHolder.Position = UDim2.new(0, 112, 0, 34)
 ContentHolder.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
 ContentHolder.BorderSizePixel = 0
 ContentHolder.Parent = MainFrame
@@ -123,13 +220,13 @@ Instance.new("UICorner", ContentHolder).CornerRadius = UDim.new(0, 4)
 local Pages = {}
 local function createTab(name)
     local TabBtn = Instance.new("TextButton")
-    TabBtn.Size = UDim2.new(1, 0, 0, 32)
+    TabBtn.Size = UDim2.new(1, 0, 0, 30)
     TabBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
     TabBtn.BorderSizePixel = 0
     TabBtn.Text = name
     TabBtn.TextColor3 = Color3.fromRGB(180, 180, 195)
     TabBtn.Font = Enum.Font.Code
-    TabBtn.TextSize = 13
+    TabBtn.TextSize = 12
     TabBtn.Parent = TabHolder
     Instance.new("UICorner", TabBtn).CornerRadius = UDim.new(0, 4)
 
@@ -137,14 +234,14 @@ local function createTab(name)
     Page.Size = UDim2.new(1, -12, 1, -12)
     Page.Position = UDim2.new(0, 6, 0, 6)
     Page.BackgroundTransparency = 1
-    Page.ScrollBarThickness = 2
+    Page.ScrollBarThickness = 3
     Page.Visible = false
     Page.CanvasSize = UDim2.new(0, 0, 0, 0)
     Page.AutomaticCanvasSize = Enum.AutomaticSize.Y
     Page.Parent = ContentHolder
 
     local Layout = Instance.new("UIListLayout", Page)
-    Layout.Padding = UDim.new(0, 6)
+    Layout.Padding = UDim2.new(0, 6).Y
     Layout.SortOrder = Enum.SortOrder.LayoutOrder
 
     TabBtn.MouseButton1Click:Connect(function()
@@ -214,10 +311,12 @@ local function addCycle(parent, label, options, defaultIndex, callback)
     return Btn
 end
 
+-- Touch & Mouse Compatible Slider
 local function addSlider(parent, label, minVal, maxVal, defaultVal, callback)
     local Holder = Instance.new("Frame")
-    Holder.Size = UDim2.new(1, 0, 0, 42)
+    Holder.Size = UDim2.new(1, 0, 0, 44)
     Holder.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+    Holder.Active = true
     Holder.Parent = parent
     Instance.new("UICorner", Holder).CornerRadius = UDim.new(0, 4)
 
@@ -233,18 +332,19 @@ local function addSlider(parent, label, minVal, maxVal, defaultVal, callback)
     TextLbl.Parent = Holder
 
     local BarBg = Instance.new("Frame")
-    BarBg.Size = UDim2.new(1, -16, 0, 8)
-    BarBg.Position = UDim2.new(0, 8, 0, 26)
+    BarBg.Size = UDim2.new(1, -16, 0, 12)
+    BarBg.Position = UDim2.new(0, 8, 0, 25)
     BarBg.BackgroundColor3 = Color3.fromRGB(16, 16, 20)
+    BarBg.Active = true
     BarBg.Parent = Holder
-    Instance.new("UICorner", BarBg).CornerRadius = UDim.new(0, 4)
+    Instance.new("UICorner", BarBg).CornerRadius = UDim.new(0, 6)
 
     local BarFill = Instance.new("Frame")
     local initPct = math.clamp((defaultVal - minVal) / (maxVal - minVal), 0, 1)
     BarFill.Size = UDim2.new(initPct, 0, 1, 0)
     BarFill.BackgroundColor3 = Color3.fromRGB(80, 140, 210)
     BarFill.Parent = BarBg
-    Instance.new("UICorner", BarFill).CornerRadius = UDim.new(0, 4)
+    Instance.new("UICorner", BarFill).CornerRadius = UDim.new(0, 6)
 
     local dragging = false
     local function updateSlide(input)
@@ -256,21 +356,21 @@ local function addSlider(parent, label, minVal, maxVal, defaultVal, callback)
     end
 
     BarBg.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
             updateSlide(input)
         end
     end)
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+    table.insert(State.Connections, UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             dragging = false
         end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+    end))
+    table.insert(State.Connections, UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
             updateSlide(input)
         end
-    end)
+    end))
 end
 
 -- // CREATE TABS
@@ -294,9 +394,7 @@ local function getHum(plr)
     return char and char:FindFirstChildOfClass("Humanoid")
 end
 
--- // 1. ANTI-RAGDOLL LOOPFLY IMPLEMENTATION
--- Creates a physical invisible part welded/snapped directly under the player's feet every frame
--- Forces Humanoid State away from Freefall/Ragdoll so server/client scripts think player is standing on ground.
+-- // 1. ANTI-RAGDOLL LOOPFLY PAD
 local function ensureFlyPad()
     if State.FlyPad and State.FlyPad.Parent then return State.FlyPad end
     local pad = Instance.new("Part")
@@ -317,7 +415,7 @@ local function clearFlyPad()
     end
 end
 
--- // 2. INVISIBLE IMPLEMENTATION (Seat / Root Desync Method)
+-- // 2. INVISIBLE IMPLEMENTATION (Seat / Root Desync)
 local function toggleInvisible(enable)
     local char = getChar()
     local root = getRoot()
@@ -336,7 +434,6 @@ local function toggleInvisible(enable)
         clone.Parent = Workspace
         clone.HumanoidRootPart.CFrame = State.OriginalCFrame
 
-        -- Send real character far below void height limit or safe zone while controlling proxy
         root.CFrame = State.OriginalCFrame * CFrame.new(0, 100000, 0)
         task.wait(0.1)
         local seat = Instance.new("Seat")
@@ -480,7 +577,7 @@ addSlider(TabTarget, "Target Range (Distance)", 1, 40, 8, function(v)
 end)
 
 -- // 5. POPULATE AIM & ESP TAB
-addToggle(TabCombat, "Camera Aimlock (Nearest to Cursor)", false, function(v)
+addToggle(TabCombat, "Camera Aimlock (Center/Cursor)", false, function(v)
     Config.AimlockEnabled = v
 end)
 
@@ -552,11 +649,13 @@ local function updateESP()
     end
 end
 
--- // NEAREST PLAYER FOR AIMLOCK
-local function getClosestPlayerToCursor()
+-- // NEAREST PLAYER FOR AIMLOCK (Supports Mobile Screen Center & PC Mouse)
+local function getClosestPlayerToAim()
     local closest = nil
     local shortestDist = math.huge
-    local mousePos = UserInputService:GetMouseLocation()
+    local refPos = UserInputService.TouchEnabled
+        and Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+        or UserInputService:GetMouseLocation()
 
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer and plr.Character then
@@ -565,7 +664,7 @@ local function getClosestPlayerToCursor()
             if part and hum and hum.Health > 0 then
                 local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
                 if onScreen then
-                    local dist = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
+                    local dist = (Vector2.new(screenPos.X, screenPos.Y) - refPos).Magnitude
                     if dist < shortestDist then
                         shortestDist = dist
                         closest = part
@@ -579,17 +678,15 @@ end
 
 -- // ZERO-DELAY CORE LOOPS (RenderStepped + Heartbeat)
 table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
-    local char = getChar()
     local root = getRoot()
     local hum = getHum()
 
-    -- 1. ZERO-DELAY AUTO TARGET (Overrides everything for instant sticking)
+    -- 1. ZERO-DELAY AUTO TARGET
     if Config.AutoTargetEnabled and root and hum then
         local targetPlr = Players:FindFirstChild(Config.SelectedPlayer or "")
         local tRoot = getRoot(targetPlr)
 
         if tRoot then
-            -- Disable ragdoll states on self while sticking
             hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
             hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
 
@@ -616,12 +713,10 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
                 finalCFrame = CFrame.lookAt(pos, targetPos)
             end
 
-            -- Direct CFrame write + zero velocity so physics never lags behind target
             root.CFrame = finalCFrame
             root.AssemblyLinearVelocity = Vector3.zero
             root.AssemblyAngularVelocity = Vector3.zero
 
-            -- Keep floor pad under feet even during AutoTarget to prevent server air-time ragdoll
             local pad = ensureFlyPad()
             pad.CFrame = CFrame.new(root.Position - Vector3.new(0, (hum.HipHeight + (root.Size.Y / 2) + 0.5), 0))
         end
@@ -629,20 +724,51 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
 
     -- 2. CAMERA AIMLOCK
     if Config.AimlockEnabled then
-        local aimPart = getClosestPlayerToCursor()
+        local aimPart = getClosestPlayerToAim()
         if aimPart then
             Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, aimPart.Position)
         end
     end
 end))
 
+-- // HYBRID MOBILE JOYSTICK + PC KEYBOARD FLIGHT VECTOR
+local function getFlightDirection(hum)
+    local moveDir = Vector3.zero
+    local camCF = Camera.CFrame
+
+    -- PC Keyboard check
+    if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveDir = moveDir + camCF.LookVector end
+    if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveDir = moveDir - camCF.LookVector end
+    if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveDir = moveDir + camCF.RightVector end
+    if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveDir = moveDir - camCF.RightVector end
+    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then moveDir = moveDir + Vector3.new(0, 1, 0) end
+    if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then moveDir = moveDir - Vector3.new(0, 1, 0) end
+
+    -- Mobile Thumbstick fallback: project Humanoid.MoveDirection along Camera pitch/yaw
+    if moveDir.Magnitude == 0 and hum.MoveDirection.Magnitude > 0 then
+        local flatLook = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z)
+        if flatLook.Magnitude > 0.01 then
+            flatLook = flatLook.Unit
+            local forwardDot = hum.MoveDirection:Dot(flatLook)
+            local rightVec = Vector3.new(camCF.RightVector.X, 0, camCF.RightVector.Z).Unit
+            local rightDot = hum.MoveDirection:Dot(rightVec)
+            moveDir = (camCF.LookVector * forwardDot) + (camCF.RightVector * rightDot)
+        else
+            moveDir = hum.MoveDirection
+        end
+    end
+
+    if moveDir.Magnitude > 0 then
+        return moveDir.Unit
+    end
+    return Vector3.zero
+end
+
 table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
-    local char = getChar()
     local root = getRoot()
     local hum = getHum()
 
     if root and hum then
-        -- Speed & Jump Boost
         if Config.SpeedEnabled then
             hum.WalkSpeed = Config.WalkSpeed
         end
@@ -651,26 +777,13 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             hum.JumpPower = Config.JumpPower
         end
 
-        -- LoopFly with Anti-Ragdoll FloorPad / Pulse
         if Config.FlyEnabled and not Config.AutoTargetEnabled then
             hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
             hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
 
-            local moveDir = Vector3.zero
-            local camCF = Camera.CFrame
-            if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveDir = moveDir + camCF.LookVector end
-            if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveDir = moveDir - camCF.LookVector end
-            if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveDir = moveDir + camCF.RightVector end
-            if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveDir = moveDir - camCF.RightVector end
-            if UserInputService:IsKeyDown(Enum.KeyCode.Space) then moveDir = moveDir + Vector3.new(0, 1, 0) end
-            if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then moveDir = moveDir - Vector3.new(0, 1, 0) end
-
-            if moveDir.Magnitude > 0 then
-                moveDir = moveDir.Unit
-            end
+            local moveDir = getFlightDirection(hum)
 
             if Config.FlyMode == "FloorPad" then
-                -- Moves CFrame cleanly while locking a physical collideable block underneath feet
                 root.CFrame = root.CFrame + (moveDir * Config.FlySpeed * dt)
                 root.AssemblyLinearVelocity = Vector3.new(0, 0.1, 0)
                 local pad = ensureFlyPad()
@@ -678,7 +791,6 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
                 pad.CFrame = CFrame.new(root.Position - Vector3.new(0, footOffset, 0))
                 hum:ChangeState(Enum.HumanoidStateType.Running)
             elseif Config.FlyMode == "LoopPulse" then
-                -- Alternates grounded state and velocity pulses + micro-pad touch every tick
                 local pad = ensureFlyPad()
                 local footOffset = hum.HipHeight + (root.Size.Y / 2) + (pad.Size.Y / 2)
                 pad.CFrame = CFrame.new(root.Position - Vector3.new(0, footOffset, 0))
@@ -693,7 +805,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
     updateESP()
 end))
 
--- // INFINITE JUMP & MENU TOGGLE
+-- // INFINITE JUMP & LEFT-ALT MENU HOTKEY
 table.insert(State.Connections, UserInputService.JumpRequest:Connect(function()
     if Config.InfJumpEnabled then
         local hum = getHum()
@@ -704,7 +816,7 @@ table.insert(State.Connections, UserInputService.JumpRequest:Connect(function()
 end))
 
 table.insert(State.Connections, UserInputService.InputBegan:Connect(function(input, gpe)
-    if not gpe and input.KeyCode == Enum.KeyCode.Insert then
-        MainFrame.Visible = not MainFrame.Visible
+    if not gpe and input.KeyCode == Enum.KeyCode.LeftAlt then
+        toggleMenu()
     end
 end))
