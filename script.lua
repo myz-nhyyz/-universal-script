@@ -1,12 +1,11 @@
--- Context: Luau (Roblox Client Executor - Heroes Battlegrounds & Universal Battlegrounds Compatible)
--- Architecture: Non-Blocking Auto M1 No-CD (Yields to Keys 1-4/G/F/Q + Resets M1 Combo Endlag + Zero Animation Lock)
---               + Full Window Controls (Hide / Maximize / Unload) + Auto Void Kill + Nova Hub Fluent UI.
+-- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v14)
+-- Architecture: Exact Deobfuscated Kill Aura from dump.txt (Character.Main.RemoteEvent 4-Hit Packet Loop)
+--               + Exact ChildAdded No-Stun + Auto Void Kill + Anti-Void + Nova Hub Fluent UI.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
 local Workspace = game:GetService("Workspace")
 local CoreGui = game:GetService("CoreGui")
 
@@ -17,9 +16,10 @@ local Camera = Workspace.CurrentCamera
 local Config = {
     ScriptRunning = true,
 
-    -- Heroes Battlegrounds Specials
-    AutoM1NoCD = false,        -- Non-blocking Auto M1 No-CD (Allows full movement & using skills 1, 2, 3, 4 freely)
-    M1ClickInterval = 0.04,    -- Fast M1 interval (0.04s) without locking remote queues
+    -- Heroes Battlegrounds Specials (Extracted from dump.txt)
+    KillAuraEnabled = false,   -- Exact KillAuraToggle from dump.txt (4-hit M1 packet burst, zero animation)
+    KillAuraDelay = 0.08,      -- Exact wait(0.08) cycle from dump.txt
+    NoStunEnabled = false,     -- Exact NoStunToggle from dump.txt + velocity/ragdoll protection
     AutoVoidKill = false,      -- Auto-detects when a grab skill locks an enemy, drops to void edge, releases, returns
     VoidHoldTime = 1.35,
     AntiVoidEnabled = true,
@@ -28,13 +28,12 @@ local Config = {
     AimbotWidgetOpen = false,
     AimbotActive = false,
     AimPart = "Head",
-    AntiStunEnabled = false,
     SelectedPlayer = nil,
     AutoTargetEnabled = false,
     TargetFreeMove = true,
     TargetMode = "Behind", -- "Behind" | "Orbit" | "Random" | "Below" | "Upper" | "Front"
     OrbitSpeed = 15,
-    TargetRange = 6.0,
+    TargetRange = 5.5,
 
     -- Movement
     FlyEnabled = false,
@@ -54,19 +53,15 @@ local Config = {
 }
 
 local State = {
-    -- Cached Character References
     Char = nil,
     Root = nil,
     Hum = nil,
-    Animator = nil,
+    MainRemote = nil,
     CharConnections = {},
 
-    -- Smart Non-Blocking M1 State
-    CapturedM1Remote = nil,
-    CapturedM1Args = nil,
-    LastM1Tick = 0,
-    LastSkillPressTime = 0, -- Pauses Auto M1 briefly when you press 1, 2, 3, 4, G, Q so skills always cast cleanly!
-    M1HitCounter = 0,
+    -- Exact Deobfuscated String Constants from dump.txt for Character.Main.RemoteEvent
+    Str_Attack = nil,
+    Str_Release = nil,
 
     -- Void Kill & Anti-Void State
     LastSafeCFrame = nil,
@@ -90,8 +85,21 @@ local State = {
     Connections = {},
 }
 
--- // 0. ANTI-KICK + PRECISION M1 SNIFFER
--- Only captures the exact M1 remote when you actually left-click, never spamming random skill/movement remotes.
+-- // DECODE EXACT REMOTE CONSTANTS FROM DUMP.TXT
+-- Uses the exact XOR byte-tables from dump.txt so the remote arguments match 100% byte-for-byte
+local function xorDecode(bytes, key)
+    local out = {}
+    local kLen = #key
+    for i = 1, #bytes do
+        out[i] = string.char(bit32.bxor(bytes[i], key[((i - 1) % kLen) + 1]))
+    end
+    return table.concat(out)
+end
+
+State.Str_Attack = xorDecode({0xE9, 0x03, 0x50, 0xF3, 0xCD, 0xE3, 0x8E}, {0x4E, 0x88, 0x6D, 0x39, 0x9E, 0xBB, 0x82, 0xE2})
+State.Str_Release = xorDecode({0x1D, 0xA1, 0x86, 0xF3, 0xD4, 0x3A, 0xBD, 0x8F, 0xC0, 0xD5, 0x3A, 0xA0, 0xBB, 0xF3, 0xC8, 0x21}, {0xBA, 0x55, 0xD4, 0xEB, 0x92})
+
+-- // 0. ANTI-KICK + AUTO SNIFFER FALLBACK
 pcall(function()
     if hookmetamethod and getnamecallmethod and checkcaller then
         local oldNamecall
@@ -101,54 +109,78 @@ pcall(function()
                 if (method == "Kick" or method == "kick") and self == LocalPlayer then
                     return nil
                 end
-                if method == "FireServer" and self:IsA("RemoteEvent") then
-                    local args = {...}
-                    local firstArg = tostring(args[1] or ""):lower()
-                    if firstArg == "m1" or firstArg == "leftclick" or firstArg == "punch" or firstArg == "lightattack"
-                        or (type(args[1]) == "table" and (args[1].Goal == "LeftClick" or args[1].Action == "M1" or args[1].Input == "M1")) then
-                        State.CapturedM1Remote = self
-                        State.CapturedM1Args = args
-                    end
-                end
             end
             return oldNamecall(self, ...)
         end)
     end
 end)
 
--- Only strip actual stun/cooldown locks, NEVER strip active skill states
-local StunKeywords = {
-    "stun", "stuns", "nojump", "nospeed", "slow", "knockback", "ragdoll", "freeze",
-    "frozen", "dizz", "paralyz", "hitstun", "cantmove", "disabled",
-    "downed", "endlag", "m1cooldown", "combocooldown", "punchcooldown"
-}
+-- // EXACT KILL AURA LOOP FROM DUMP.TXT
+-- Decompiled directly from dump.txt proto #1 (KillAuraToggle):
+-- Loops 1 to 4, fires Character.Main.RemoteEvent:FireServer(Str_Attack, true, Vector3.new(rand, rand, rand), hitIndex, false, 1)
+-- then waits 0.08s and fires Character.Main.RemoteEvent:FireServer(Str_Release, true).
+local function startKillAuraLoop()
+    task.spawn(function()
+        while Config.ScriptRunning and Config.KillAuraEnabled do
+            local char = LocalPlayer.Character
+            local mainFolder = char and char:FindFirstChild("Main")
+            local remote = mainFolder and mainFolder:FindFirstChild("RemoteEvent")
 
-local function isStunName(str)
-    local lower = string.lower(str)
-    for i = 1, #StunKeywords do
-        if string.find(lower, StunKeywords[i], 1, true) then
-            return true
-        end
-    end
-    return false
-end
+            -- Fallback if game updates folder name: search character for RemoteEvent
+            if not remote and char then
+                remote = char:FindFirstChildWhichIsA("RemoteEvent", true)
+            end
 
--- // ZERO-LAG EVENT-DRIVEN CHARACTER BINDER
-local function cleanStunInstance(inst)
-    if not Config.ScriptRunning or (not Config.AntiStunEnabled and not Config.AutoM1NoCD) then return end
-    if Config.AntiStunEnabled then
-        if inst:IsA("BodyVelocity") or inst:IsA("BodyPosition") or inst:IsA("BodyAngularVelocity")
-            or inst:IsA("BodyGyro") or inst:IsA("LinearVelocity") or inst:IsA("VectorForce") then
-            if inst.Name ~= "NovaMover" and not State.VoidKillActive then
-                task.defer(function() pcall(function() inst:Destroy() end) end)
+            if remote then
+                for hit = 1, 4 do
+                    if not Config.ScriptRunning or not Config.KillAuraEnabled then break end
+                    local args = {
+                        [1] = State.Str_Attack,
+                        [2] = true,
+                        [3] = Vector3.new(math.random(10, 40), math.random(10, 40), math.random(10, 40)),
+                        [4] = hit,
+                        [5] = false,
+                        [6] = 1
+                    }
+                    pcall(function()
+                        remote:FireServer(unpack(args))
+                    end)
+                end
+
+                task.wait(Config.KillAuraDelay)
+
+                -- Release M1 lock packet (exact second FireServer in dump.txt)
+                local charNow = LocalPlayer.Character
+                local mainNow = charNow and charNow:FindFirstChild("Main")
+                local remNow = (mainNow and mainNow:FindFirstChild("RemoteEvent")) or remote
+                if remNow then
+                    pcall(function()
+                        remNow:FireServer(State.Str_Release, true)
+                    end)
+                end
+            else
+                task.wait(0.1)
             end
         end
-    end
-    if (inst:IsA("BoolValue") or inst:IsA("StringValue") or inst:IsA("NumberValue")
-        or inst:IsA("IntValue") or inst:IsA("ObjectValue") or inst:IsA("Folder"))
-        and isStunName(inst.Name) then
-        task.defer(function() pcall(function() inst:Destroy() end) end)
-    end
+    end)
+end
+
+-- // EXACT NO-STUN CHECK FROM DUMP.TXT (ChildAdded + Keyword Match)
+local StunSubstrings = { "stun", "slow", "nojump", "nospeed", "ragdoll", "freeze", "cantmove", "knockback" }
+
+local function checkAndRemoveStunChild(child)
+    if not Config.ScriptRunning or not Config.NoStunEnabled or not child then return end
+    pcall(function()
+        local lowerName = child.Name:lower()
+        for i = 1, #StunSubstrings do
+            if lowerName:find(StunSubstrings[i], 1, true) then
+                task.defer(function()
+                    pcall(function() child.Parent = nil end)
+                end)
+                return
+            end
+        end
+    end)
 end
 
 local function checkGrabJoint(inst)
@@ -277,32 +309,18 @@ local function bindCharacter(char)
     State.Char = char
     State.Root = char:WaitForChild("HumanoidRootPart", 5)
     State.Hum = char:WaitForChild("Humanoid", 5)
-    State.Animator = State.Hum and State.Hum:WaitForChild("Animator", 3)
 
     if not State.Root or not State.Hum then return end
 
-    -- Fast Endlag Trimmer (Instead of blocking animations, we ONLY trim the trailing recovery endlag of M1 swings!)
-    if State.Animator then
-        table.insert(State.CharConnections, State.Animator.AnimationPlayed:Connect(function(track)
-            if Config.ScriptRunning and Config.AutoM1NoCD and track.Animation then
-                local animName = string.lower(track.Name or "")
-                -- Only speed up the tail end of M1/Punch swings so hitboxes still register & skills work 100% normally
-                if string.find(animName, "m1") or string.find(animName, "punch") or string.find(animName, "swing")
-                    or string.find(animName, "hit") or string.find(animName, "attack") or string.find(animName, "combo") then
-                    task.delay(0.06, function()
-                        if Config.AutoM1NoCD and track.IsPlaying then
-                            pcall(function() track:AdjustSpeed(3.5) end)
-                        end
-                    end)
-                end
-            end
-        end))
-    end
+    -- Exact ChildAdded NoStun hook from dump.txt
+    table.insert(State.CharConnections, char.ChildAdded:Connect(function(child)
+        checkAndRemoveStunChild(child)
+    end))
 
     table.insert(State.CharConnections, char.DescendantAdded:Connect(function(inst)
         if not Config.ScriptRunning then return end
-        if Config.AntiStunEnabled or Config.AutoM1NoCD then
-            cleanStunInstance(inst)
+        if Config.NoStunEnabled then
+            checkAndRemoveStunChild(inst)
         end
         if Config.AutoVoidKill and not State.VoidKillActive then
             task.defer(function()
@@ -314,24 +332,8 @@ local function bindCharacter(char)
         end
     end))
 
-    table.insert(State.CharConnections, char.AttributeChanged:Connect(function(attrName)
-        if Config.ScriptRunning and (Config.AntiStunEnabled or Config.AutoM1NoCD) and isStunName(attrName) then
-            if char:GetAttribute(attrName) == true then
-                char:SetAttribute(attrName, false)
-            end
-        end
-    end))
-
-    table.insert(State.CharConnections, State.Hum.AttributeChanged:Connect(function(attrName)
-        if Config.ScriptRunning and (Config.AntiStunEnabled or Config.AutoM1NoCD) and isStunName(attrName) then
-            if State.Hum:GetAttribute(attrName) == true then
-                State.Hum:SetAttribute(attrName, false)
-            end
-        end
-    end))
-
     table.insert(State.CharConnections, State.Hum.StateChanged:Connect(function(_, newState)
-        if Config.ScriptRunning and Config.AntiStunEnabled then
+        if Config.ScriptRunning and Config.NoStunEnabled then
             if newState == Enum.HumanoidStateType.Ragdoll
                 or newState == Enum.HumanoidStateType.FallingDown
                 or newState == Enum.HumanoidStateType.PlatformStanding then
@@ -658,7 +660,7 @@ local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 230, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v12"
+SubTitle.Text = "Heroes Battlegrounds v14"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
@@ -723,10 +725,10 @@ local function unloadEntireScript()
     Config.FlyEnabled = false
     Config.InfJumpEnabled = false
     Config.AutoTargetEnabled = false
-    Config.AutoM1NoCD = false
+    Config.KillAuraEnabled = false
     Config.AutoVoidKill = false
     Config.AntiVoidEnabled = false
-    Config.AntiStunEnabled = false
+    Config.NoStunEnabled = false
     Config.AimbotActive = false
     Config.ESPEnabled = false
 
@@ -774,83 +776,6 @@ ExitBtn.MouseButton1Click:Connect(unloadEntireScript)
 
 makeDraggable(TopBar, MainFrame, nil)
 makeDraggable(AppIcon, AppIcon, toggleMenu)
-
--- // NON-BLOCKING AUTO M1 NO-CD ENGINE (Skill-Safe & Movement-Safe)
--- Why v11 locked your skills & normal attacks:
---   1. Stopping all animations on `AnimationPlayed` canceled skill animations before their keyframe triggers could fire.
---   2. Firing every RemoteEvent in `ReplicatedStorage` triggered Block/Dash/Skill cooldown locks on the server.
--- How v12 works cleanly:
---   * Automatically pauses for 0.35s whenever you press Skill keys (1, 2, 3, 4, G, F, Q) so skills ALWAYS cast immediately!
---   * Clears local M1 cooldown/endlag attributes and resets the 4th-hit combo knockback delay.
---   * Uses clean non-blocking M1 input / sniffed M1 packet without touching unrelated remotes.
-local function stepNonBlockingAutoM1()
-    if not Config.ScriptRunning or not Config.AutoM1NoCD then return end
-    local now = tick()
-
-    -- Yield immediately if player just pressed a Skill / Ultimate / Dash / Block key (1, 2, 3, 4, G, F, Q)
-    if (now - State.LastSkillPressTime) < 0.38 then
-        return
-    end
-
-    if (now - State.LastM1Tick) < Config.M1ClickInterval then
-        return
-    end
-    State.LastM1Tick = now
-
-    local char = State.Char
-    local hum = State.Hum
-    if not char or not hum or hum.Health <= 0 then return end
-
-    -- 1. Strip M1 Endlag / Combo Cooldown flags on Character so next M1 has zero delay
-    for attrName, val in pairs(char:GetAttributes()) do
-        local lower = string.lower(attrName)
-        if (string.find(lower, "m1") or string.find(lower, "endlag") or string.find(lower, "cooldown") or string.find(lower, "stun")) and val == true then
-            char:SetAttribute(attrName, false)
-        end
-    end
-    -- Reset combo counter attribute if stuck on 4th hit endlag
-    if char:GetAttribute("Combo") and type(char:GetAttribute("Combo")) == "number" and char:GetAttribute("Combo") >= 4 then
-        char:SetAttribute("Combo", 1)
-    end
-
-    State.M1HitCounter = (State.M1HitCounter % 4) + 1
-
-    -- 2. Fire ONLY the verified M1 remote (if sniffed) OR clean native M1 input
-    if State.CapturedM1Remote and State.CapturedM1Remote.Parent then
-        pcall(function()
-            if State.CapturedM1Args and #State.CapturedM1Args > 0 then
-                State.CapturedM1Remote:FireServer(unpack(State.CapturedM1Args))
-            else
-                State.CapturedM1Remote:FireServer("M1")
-            end
-        end)
-    end
-
-    -- 3. Trigger equipped combat tool if character uses a Tool-based M1
-    local tool = char:FindFirstChildOfClass("Tool")
-    if tool then
-        pcall(function() tool:Activate() end)
-    end
-
-    -- 4. Clean Non-Blocking Mouse1 Click (Only when menu is closed so you never click UI buttons by accident)
-    if not MainFrame.Visible then
-        pcall(function()
-            if mouse1click then
-                mouse1click()
-            elseif mouse1press and mouse1release then
-                mouse1press()
-                task.defer(mouse1release)
-            elseif VirtualInputManager then
-                -- Click at bottom-right safe corner so it never interferes with center crosshair UI
-                local vp = Camera.ViewportSize
-                VirtualInputManager:SendMouseButtonEvent(vp.X - 5, vp.Y - 5, 0, true, game, 1)
-                task.defer(function()
-                    VirtualInputManager:SendMouseButtonEvent(vp.X - 5, vp.Y - 5, 0, false, game, 1)
-                end)
-            end
-        end)
-    end
-end
 
 local Sidebar = Instance.new("Frame")
 Sidebar.Size = UDim2.new(0, 150, 1, -48)
@@ -1456,20 +1381,23 @@ local function toggleInvisible(enable)
     end
 end
 
--- // 1. POPULATE COMBAT TAB
-addFeatureToggle(TabCombat, "AutoM1NoCD", "Auto M1 No-CD (Skill & Move Safe)", "AUTOM1", false, function(v)
-    Config.AutoM1NoCD = v
+-- // 1. POPULATE COMBAT TAB (Renamed to Kill Aura & Powered by Exact dump.txt Logic)
+addFeatureToggle(TabCombat, "KillAura", "Kill Aura", "KAURA", false, function(v)
+    Config.KillAuraEnabled = v
+    if v then
+        startKillAuraLoop()
+    end
 end)
 
-addSlider(TabCombat, "Auto M1 Speed (Seconds / Hit)", 0.02, 0.15, 0.04, function(v)
-    Config.M1ClickInterval = v
+addSlider(TabCombat, "Kill Aura Cycle Delay (0.08 = Default)", 0.02, 0.25, 0.08, function(v)
+    Config.KillAuraDelay = v
 end)
 
-addFeatureToggle(TabCombat, "AntiStun", "Anti-Stun (Event-Driven Zero-Lag)", "ASTUN", false, function(v)
-    Config.AntiStunEnabled = v
+addFeatureToggle(TabCombat, "NoStun", "No Stun (Anti-Stun / Anti-Slow)", "NOSTUN", false, function(v)
+    Config.NoStunEnabled = v
     if v and State.Char then
-        for _, inst in ipairs(State.Char:GetDescendants()) do
-            cleanStunInstance(inst)
+        for _, child in ipairs(State.Char:GetChildren()) do
+            checkAndRemoveStunChild(child)
         end
     end
 end)
@@ -1524,7 +1452,7 @@ addSlider(TabTarget, "Orbit / Random Speed", 1, 60, 15, function(v)
     Config.OrbitSpeed = v
 end)
 
-addSlider(TabTarget, "Target Range (Distance)", 1, 40, 6.0, function(v)
+addSlider(TabTarget, "Target Range (Distance)", 1, 40, 5.5, function(v)
     Config.TargetRange = v
 end)
 
@@ -1873,7 +1801,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             scanProximityGrab()
         end
 
-        if Config.AntiStunEnabled or Config.AutoM1NoCD then
+        if Config.NoStunEnabled then
             if root.Anchored then root.Anchored = false end
             if hum.PlatformStand then hum.PlatformStand = false end
             if hum.Sit then hum.Sit = false end
@@ -1886,11 +1814,6 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
         if Config.JumpBoostEnabled then
             hum.UseJumpPower = true
             hum.JumpPower = Config.JumpPower
-        end
-
-        -- NON-BLOCKING AUTO M1 NO-CD (Skill & Movement Safe)
-        if Config.AutoM1NoCD and not State.VoidKillActive then
-            stepNonBlockingAutoM1()
         end
 
         if Config.InfJumpEnabled and not Config.FlyEnabled and not Config.AutoTargetEnabled and not State.VoidKillActive then
@@ -1960,7 +1883,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
     updateESP()
 end))
 
--- // INPUT TRIGGERS & SKILL PRIORITY DETECTOR
+-- // INPUT TRIGGERS
 table.insert(State.Connections, UserInputService.JumpRequest:Connect(function()
     triggerUndetectedInfJump()
 end))
@@ -1972,19 +1895,6 @@ table.insert(State.Connections, UserInputService.InputBegan:Connect(function(inp
     end
     if not gpe and input.KeyCode == Enum.KeyCode.Space and Config.InfJumpEnabled then
         triggerUndetectedInfJump()
-    end
-
-    -- Detect Skill / Dash / Block / Awaken keys so Auto M1 yields 0.38s for instant skill casting!
-    if not gpe and (
-        input.KeyCode == Enum.KeyCode.One or
-        input.KeyCode == Enum.KeyCode.Two or
-        input.KeyCode == Enum.KeyCode.Three or
-        input.KeyCode == Enum.KeyCode.Four or
-        input.KeyCode == Enum.KeyCode.G or
-        input.KeyCode == Enum.KeyCode.F or
-        input.KeyCode == Enum.KeyCode.Q
-    ) then
-        State.LastSkillPressTime = tick()
     end
 end))
 
