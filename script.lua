@@ -1,6 +1,6 @@
 -- Context: Luau (Roblox Client Executor - Heroes Battlegrounds & Universal Battlegrounds Compatible)
--- Architecture: Event-Driven Zero-Lag Cache (No per-frame GetDescendants) + Auto Grab-Detect Void Kill
---               + Anti-Void Floor Safety + 0.1s 4-Hit M1 Burst (Endlag/Animation Cancel + Remote/Tool Trigger).
+-- Architecture: Silent No-Animation Instant 4-Hit M1 Packet Burst (Remote Sniffer + Animation Suppressor)
+--               + Auto Grab-Detect Void Kill + Anti-Void + Event-Driven Zero-Lag Engine + Nova Hub Fluent UI.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -14,28 +14,15 @@ local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
--- // 0. ANTI-KICK METATABLE GUARD
-pcall(function()
-    if hookmetamethod and getnamecallmethod and checkcaller then
-        local oldNamecall
-        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-            local method = getnamecallmethod()
-            if not checkcaller() and (method == "Kick" or method == "kick") and self == LocalPlayer then
-                return nil
-            end
-            return oldNamecall(self, ...)
-        end)
-    end
-end)
-
 -- // CONFIGURATION & STATE
 local Config = {
     -- Heroes Battlegrounds Specials
+    AutoKillM1 = false,        -- Silent No-Animation Instant 4-Hit M1 Burst
+    SuppressM1Anim = true,     -- Completely stops M1 swing animations so character hits silently without moving arms
+    M1BurstCycleDelay = 0.08,  -- Cooldown between each 4-hit instant burst (0.08s = ~50 hits/sec attempt)
     AutoVoidKill = false,      -- Auto-detects when a grab skill locks an enemy, drops to void edge, releases, returns
-    VoidHoldTime = 1.35,       -- Seconds to hold enemy at void boundary before returning (adjustable slider)
-    AntiVoidEnabled = true,    -- Prevents falling into void
-    RapidM1Enabled = false,    -- 4-hit M1 burst in 0.1s + Endlag cancel + M1 Reset
-    M1BurstInterval = 0.025,   -- 0.025s * 4 = 0.10s for 4 punches
+    VoidHoldTime = 1.35,
+    AntiVoidEnabled = true,
 
     -- Combat / Target
     AimbotWidgetOpen = false,
@@ -47,7 +34,7 @@ local Config = {
     TargetFreeMove = true,
     TargetMode = "Behind", -- "Behind" | "Orbit" | "Random" | "Below" | "Upper" | "Front"
     OrbitSpeed = 15,
-    TargetRange = 6.5,
+    TargetRange = 6.0,
 
     -- Movement
     FlyEnabled = false,
@@ -67,12 +54,18 @@ local Config = {
 }
 
 local State = {
-    -- Cached Character References (Eliminates per-frame FindFirstChild / GetDescendants lag!)
+    -- Cached Character References
     Char = nil,
     Root = nil,
     Hum = nil,
     Animator = nil,
     CharConnections = {},
+
+    -- Silent M1 Packet Sniffer & Remote Cache
+    CapturedM1Remote = nil,
+    CapturedM1Args = nil,
+    CombatRemotes = {},
+    LastM1Burst = 0,
 
     -- Void Kill & Anti-Void State
     LastSafeCFrame = nil,
@@ -85,8 +78,6 @@ local State = {
     InfJumpArcActive = false,
     InfJumpArcTimer = 0,
     LastJumpTime = 0,
-    LastM1Burst = 0,
-    CombatRemotes = {},
     OrbitAngle = 0,
     FreeMoveOffset = Vector3.zero,
     LockedAimbotPlayer = nil,
@@ -98,10 +89,42 @@ local State = {
     Connections = {},
 }
 
+-- // 0. ANTI-KICK + AUTO M1 PACKET SNIFFER HOOK
+-- Automatically captures the exact M1 RemoteEvent & arguments used by Heroes Battlegrounds the first time you punch
+-- so Auto Kill can replay all 4 hits in a single frame with zero animation!
+pcall(function()
+    if hookmetamethod and getnamecallmethod and checkcaller then
+        local oldNamecall
+        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            local method = getnamecallmethod()
+            if not checkcaller() then
+                if (method == "Kick" or method == "kick") and self == LocalPlayer then
+                    return nil
+                end
+                if method == "FireServer" and self:IsA("RemoteEvent") then
+                    local rName = string.lower(self.Name)
+                    local args = {...}
+                    -- Sniff M1 / Combat remote calls to clone their exact packet structure
+                    if string.find(rName, "combat") or string.find(rName, "m1") or string.find(rName, "punch")
+                        or string.find(rName, "attack") or string.find(rName, "hit") or string.find(rName, "input")
+                        or string.find(rName, "main") or string.find(rName, "remote") then
+                        local firstArg = tostring(args[1] or ""):lower()
+                        if not string.find(firstArg, "skill") and not string.find(firstArg, "dash") and not string.find(firstArg, "block") then
+                            State.CapturedM1Remote = self
+                            State.CapturedM1Args = args
+                        end
+                    end
+                end
+            end
+            return oldNamecall(self, ...)
+        end)
+    end
+end)
+
 local StunKeywords = {
     "stun", "stuns", "nojump", "nospeed", "slow", "knockback", "ragdoll", "freeze",
     "frozen", "dizz", "paralyz", "combo", "hitstun", "cantmove", "disabled",
-    "heavy", "slam", "downed", "endlag", "m1cooldown", "attacking"
+    "heavy", "slam", "downed", "endlag", "m1cooldown", "attacking", "swing"
 }
 
 local function isStunName(str)
@@ -114,7 +137,7 @@ local function isStunName(str)
     return false
 end
 
--- // SCAN & CACHE COMBAT REMOTES ONCE (For Heroes Battlegrounds / BG M1 firing)
+-- // SCAN & CACHE COMBAT REMOTES ONCE
 local function cacheCombatRemotes()
     State.CombatRemotes = {}
     local function scanFolder(folder)
@@ -123,8 +146,8 @@ local function cacheCombatRemotes()
             if v:IsA("RemoteEvent") then
                 local n = string.lower(v.Name)
                 if string.find(n, "combat") or string.find(n, "punch") or string.find(n, "m1")
-                    or string.find(n, "attack") or string.find(n, "hit") or string.find(n, "mainevent")
-                    or string.find(n, "remotes") or string.find(n, "input") then
+                    or string.find(n, "attack") or string.find(n, "hit") or string.find(n, "main")
+                    or string.find(n, "remote") or string.find(n, "input") then
                     table.insert(State.CombatRemotes, v)
                 end
             end
@@ -134,13 +157,12 @@ local function cacheCombatRemotes()
 end
 task.spawn(cacheCombatRemotes)
 
--- // ZERO-LAG EVENT-DRIVEN CHARACTER BINDER (Fixes Anti-Stun Bugs & Eliminates FPS Drops)
+-- // ZERO-LAG EVENT-DRIVEN CHARACTER BINDER + SILENT NO-ANIMATION HOOK
 local function cleanStunInstance(inst)
-    if not Config.AntiStunEnabled then return end
+    if not Config.AntiStunEnabled and not Config.AutoKillM1 then return end
     if inst:IsA("BodyVelocity") or inst:IsA("BodyPosition") or inst:IsA("BodyAngularVelocity")
         or inst:IsA("BodyGyro") or inst:IsA("LinearVelocity") or inst:IsA("VectorForce") or inst:IsA("AlignPosition") then
-        -- Keep our own movers or grab welds intact, strip enemy knockback/stun movers
-        if inst.Name ~= "OllieMover" and not State.VoidKillActive then
+        if inst.Name ~= "NovaMover" and not State.VoidKillActive then
             task.defer(function() pcall(function() inst:Destroy() end) end)
         end
     elseif (inst:IsA("BoolValue") or inst:IsA("StringValue") or inst:IsA("NumberValue")
@@ -150,13 +172,11 @@ local function cleanStunInstance(inst)
     end
 end
 
--- Detects if an object added to our character or enemy character is a Grab Weld/Constraint!
 local function checkGrabJoint(inst)
     local myChar = State.Char
     local myRoot = State.Root
     if not myChar or not myRoot then return nil end
 
-    -- 1. Check Weld / WeldConstraint / Motor6D / AlignPosition linking us and an enemy
     if inst:IsA("Weld") or inst:IsA("WeldConstraint") or inst:IsA("Motor6D") or inst:IsA("JointInstance") then
         local p0, p1 = inst.Part0, inst.Part1
         if p0 and p1 then
@@ -177,8 +197,6 @@ local function checkGrabJoint(inst)
 end
 
 -- // TRIGGER VOID KILL SEQUENCE
--- Instantly teleports down to safe hovering margin right above FallenPartsDestroyHeight,
--- waits for the grab skill animation/weld to release the enemy into the void, then teleports you back up!
 local function executeVoidKillSequence(enemyPlayer)
     if State.VoidKillActive or not Config.AutoVoidKill then return end
     local myRoot = State.Root
@@ -189,10 +207,6 @@ local function executeVoidKillSequence(enemyPlayer)
     State.GrabbedEnemy = enemyPlayer
     State.VoidReturnCFrame = State.LastSafeCFrame or myRoot.CFrame
 
-    -- Calculate exact Void Kill altitude:
-    -- Roblox destroys parts at Workspace.FallenPartsDestroyHeight (default -500).
-    -- We hover at (DestroyHeight + 38 studs) facing straight DOWN so the enemy welded in front/below us
-    -- is pushed directly into the kill zone or drops into it the millisecond the grab ends!
     local voidHeight = Workspace.FallenPartsDestroyHeight
     if voidHeight ~= voidHeight or voidHeight < -10000 or voidHeight > 500 then
         voidHeight = -500
@@ -209,17 +223,14 @@ local function executeVoidKillSequence(enemyPlayer)
             local eRoot = eChar and eChar:FindFirstChild("HumanoidRootPart")
             local eHum = eChar and eChar:FindFirstChildOfClass("Humanoid")
 
-            -- Angle character nose-down (-85 deg pitch) at the void boundary so the grabbed victim hangs below us into the void
             State.Root.CFrame = CFrame.new(dropXZ) * CFrame.Angles(math.rad(-85), 0, 0)
             State.Root.AssemblyLinearVelocity = Vector3.zero
             State.Root.AssemblyAngularVelocity = Vector3.zero
 
-            -- Check if enemy died or fell below destroy height or grab weld ended after minimum 0.35s
             if (tick() - startTime) > 0.35 then
                 if not eRoot or not eHum or eHum.Health <= 0 or eRoot.Position.Y <= (voidHeight + 8) then
                     break
                 end
-                -- If enemy is no longer close/welded to us (skill finished early), break immediately and return!
                 if (eRoot.Position - State.Root.Position).Magnitude > 22 then
                     break
                 end
@@ -228,7 +239,6 @@ local function executeVoidKillSequence(enemyPlayer)
             RunService.Heartbeat:Wait()
         end
 
-        -- Teleport LocalPlayer safely back to original arena spot
         if State.Root and State.VoidReturnCFrame then
             for i = 1, 5 do
                 State.Root.CFrame = State.VoidReturnCFrame + Vector3.new(0, 3, 0)
@@ -243,7 +253,6 @@ local function executeVoidKillSequence(enemyPlayer)
     end)
 end
 
--- Heuristic proximity grab detector (catches server-side CFrame grabs that don't use local Welds)
 local function scanProximityGrab()
     if not Config.AutoVoidKill or State.VoidKillActive then return end
     local myRoot = State.Root
@@ -256,8 +265,6 @@ local function scanProximityGrab()
             local eHum = plr.Character:FindFirstChildOfClass("Humanoid")
             if eRoot and eHum and eHum.Health > 0 then
                 local dist = (eRoot.Position - myRoot.Position).Magnitude
-                -- In Heroes Battlegrounds, when you land a grab move, the enemy is locked within < 5.5 studs
-                -- and put into PlatformStand / Ragdoll / Sit or has a weld attached to their RootPart/Torso
                 if dist <= 5.8 then
                     local isGrabbed = eHum.PlatformStand or (eHum:GetState() == Enum.HumanoidStateType.Physics)
                     if not isGrabbed then
@@ -281,6 +288,22 @@ local function scanProximityGrab()
     end
 end
 
+-- Helper to check if an AnimationTrack is a standard walk/run/idle/jump locomotion animation
+local function isCoreMovementAnimation(track)
+    if not track or not track.Animation then return false end
+    local name = string.lower(track.Name or "")
+    local parentName = track.Animation.Parent and string.lower(track.Animation.Parent.Name) or ""
+    if name == "walk" or name == "run" or name == "idle" or name == "jump" or name == "fall"
+        or string.find(name, "walk") or string.find(name, "run") or string.find(name, "idle")
+        or parentName == "walk" or parentName == "run" or parentName == "idle" then
+        return true
+    end
+    if track.Priority == Enum.AnimationPriority.Core or track.Priority == Enum.AnimationPriority.Idle or track.Priority == Enum.AnimationPriority.Movement then
+        return true
+    end
+    return false
+end
+
 local function bindCharacter(char)
     for _, c in ipairs(State.CharConnections) do
         pcall(function() c:Disconnect() end)
@@ -295,9 +318,23 @@ local function bindCharacter(char)
 
     if not State.Root or not State.Hum then return end
 
-    -- Event-based Anti-Stun & Grab Detection (Zero frame-drop overhead!)
+    -- SILENT NO-ANIMATION INTERCEPTOR:
+    -- Instantly cancels any M1 / Punch / Action animation the exact microsecond it tries to play!
+    if State.Animator then
+        table.insert(State.CharConnections, State.Animator.AnimationPlayed:Connect(function(track)
+            if Config.AutoKillM1 and Config.SuppressM1Anim then
+                if not isCoreMovementAnimation(track) then
+                    pcall(function()
+                        track:Stop(0)
+                        track:AdjustWeight(0)
+                    end)
+                end
+            end
+        end))
+    end
+
     table.insert(State.CharConnections, char.DescendantAdded:Connect(function(inst)
-        if Config.AntiStunEnabled then
+        if Config.AntiStunEnabled or Config.AutoKillM1 then
             cleanStunInstance(inst)
         end
         if Config.AutoVoidKill and not State.VoidKillActive then
@@ -311,7 +348,7 @@ local function bindCharacter(char)
     end))
 
     table.insert(State.CharConnections, char.AttributeChanged:Connect(function(attrName)
-        if Config.AntiStunEnabled and isStunName(attrName) then
+        if (Config.AntiStunEnabled or Config.AutoKillM1) and isStunName(attrName) then
             if char:GetAttribute(attrName) == true then
                 char:SetAttribute(attrName, false)
             end
@@ -319,7 +356,7 @@ local function bindCharacter(char)
     end))
 
     table.insert(State.CharConnections, State.Hum.AttributeChanged:Connect(function(attrName)
-        if Config.AntiStunEnabled and isStunName(attrName) then
+        if (Config.AntiStunEnabled or Config.AutoKillM1) and isStunName(attrName) then
             if State.Hum:GetAttribute(attrName) == true then
                 State.Hum:SetAttribute(attrName, false)
             end
@@ -342,80 +379,6 @@ if LocalPlayer.Character then
 end
 table.insert(State.Connections, LocalPlayer.CharacterAdded:Connect(bindCharacter))
 
--- // RAPID 4-M1 BURST ENGINE (0.1s 4-Hit Combo + Endlag Cancel)
--- Fires 4 rapid M1 inputs spaced by 0.025s (total 0.10s), speeds up M1 animation tracks to eliminate client endlag,
--- and fires both VirtualInput/mouse1click and cached combat remotes.
-local function performRapidM1Burst()
-    local now = tick()
-    if now - State.LastM1Burst < 0.11 then return end
-    State.LastM1Burst = now
-
-    local char = State.Char
-    local hum = State.Hum
-    if not char or not hum or hum.Health <= 0 then return end
-
-    task.spawn(function()
-        for comboHit = 1, 4 do
-            if not Config.RapidM1Enabled or not State.Char then break end
-
-            -- 1. Clear local M1 cooldown attributes/tags so client handler accepts next punch immediately
-            for attrName, val in pairs(char:GetAttributes()) do
-                local lower = string.lower(attrName)
-                if (string.find(lower, "m1") or string.find(lower, "combo") or string.find(lower, "swing") or string.find(lower, "attack") or string.find(lower, "stun")) and val == true then
-                    char:SetAttribute(attrName, false)
-                end
-            end
-
-            -- 2. Accelerate playing M1 animation tracks so keyframe hit markers fire in 0.025s without endlag
-            local animator = State.Animator or (hum and hum:FindFirstChildOfClass("Animator"))
-            if animator then
-                for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-                    if track.Speed < 6 then
-                        track:AdjustSpeed(8)
-                    end
-                end
-            end
-
-            -- 3. Trigger Equipped Tool if present
-            local tool = char:FindFirstChildOfClass("Tool")
-            if tool then
-                pcall(function() tool:Activate() end)
-            end
-
-            -- 4. Native Executor Mouse1Click OR VirtualInputManager Fallback (Without clicking UI)
-            if not MainFrame.Visible then
-                pcall(function()
-                    if mouse1press and mouse1release then
-                        mouse1press()
-                        task.wait(0.005)
-                        mouse1release()
-                    elseif VirtualInputManager then
-                        VirtualInputManager:SendMouseButtonEvent(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2, 0, true, game, 1)
-                        task.wait(0.005)
-                        VirtualInputManager:SendMouseButtonEvent(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2, 0, false, game, 1)
-                    end
-                end)
-            end
-
-            -- 5. Fire Character / ReplicatedStorage Combat Remotes directly for instant server hit registration
-            for _, rem in ipairs(char:GetDescendants()) do
-                if rem:IsA("RemoteEvent") then
-                    pcall(function() rem:FireServer("M1", comboHit) end)
-                    pcall(function() rem:FireServer({Action = "M1", Combo = comboHit}) end)
-                    pcall(function() rem:FireServer() end)
-                end
-            end
-            for i = 1, math.min(#State.CombatRemotes, 4) do
-                local rem = State.CombatRemotes[i]
-                pcall(function() rem:FireServer("M1", comboHit) end)
-                pcall(function() rem:FireServer("LeftClick") end)
-            end
-
-            task.wait(Config.M1BurstInterval)
-        end
-    end)
-end
-
 -- // SAFE GUI PARENTING
 local function getGuiParent()
     local success, res = pcall(function()
@@ -425,8 +388,10 @@ local function getGuiParent()
     return LocalPlayer:WaitForChild("PlayerGui")
 end
 
-local oldGui = getGuiParent():FindFirstChild("OllieFluentUI")
-if oldGui then oldGui:Destroy() end
+for _, name in ipairs({"OllieBenchUI", "OllieFluentUI", "NovaHubUI"}) do
+    local old = getGuiParent():FindFirstChild(name)
+    if old then old:Destroy() end
+end
 
 -- // DRAG ENGINE
 local function makeDraggable(dragHandle, targetFrame, onTapCallback)
@@ -502,34 +467,36 @@ end
 
 -- // UI ROOT
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "OllieFluentUI"
+ScreenGui.Name = "NovaHubUI"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.IgnoreGuiInset = true
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.Parent = getGuiParent()
 
--- // 1. FLOATING MINI APP ICON (38x38 px)
+-- // 1. FLOATING NOVA HUB "N" APP ICON
 local AppIcon = Instance.new("TextButton")
-AppIcon.Name = "FloatingAppIcon"
-AppIcon.Size = UDim2.new(0, 38, 0, 38)
+AppIcon.Name = "NovaFloatingIcon"
+AppIcon.Size = UDim2.new(0, 42, 0, 42)
 AppIcon.Position = UDim2.new(0, 20, 0.45, 0)
-AppIcon.BackgroundColor3 = Color3.fromRGB(20, 22, 26)
-AppIcon.BackgroundTransparency = 0.1
-AppIcon.Text = "O"
-AppIcon.TextColor3 = Color3.fromRGB(70, 175, 255)
-AppIcon.Font = Enum.Font.GothamBold
-AppIcon.TextSize = 16
+AppIcon.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+AppIcon.BackgroundTransparency = 0
+AppIcon.Text = "N"
+AppIcon.TextColor3 = Color3.fromRGB(255, 255, 255)
+AppIcon.Font = Enum.Font.GothamBlack
+AppIcon.TextSize = 22
 AppIcon.AutoButtonColor = false
 AppIcon.Parent = ScreenGui
-Instance.new("UICorner", AppIcon).CornerRadius = UDim.new(0, 10)
+
+local IconCorner = Instance.new("UICorner", AppIcon)
+IconCorner.CornerRadius = UDim.new(0, 10)
 
 local IconStroke = Instance.new("UIStroke", AppIcon)
-IconStroke.Color = Color3.fromRGB(65, 165, 255)
-IconStroke.Thickness = 1.5
+IconStroke.Color = Color3.fromRGB(45, 45, 50)
+IconStroke.Thickness = 1.2
 
 local StatusDot = Instance.new("Frame")
-StatusDot.Size = UDim2.new(0, 8, 0, 8)
-StatusDot.Position = UDim2.new(1, -9, 0, 2)
+StatusDot.Size = UDim2.new(0, 7, 0, 7)
+StatusDot.Position = UDim2.new(1, -9, 0, 3)
 StatusDot.BackgroundColor3 = Color3.fromRGB(65, 225, 120)
 StatusDot.BorderSizePixel = 0
 StatusDot.Parent = AppIcon
@@ -540,8 +507,8 @@ local AimbotPopup = Instance.new("Frame")
 AimbotPopup.Name = "AimbotStickyPopup"
 AimbotPopup.Size = UDim2.new(0, 155, 0, 58)
 AimbotPopup.Position = UDim2.new(0.82, -75, 0.35, 0)
-AimbotPopup.BackgroundColor3 = Color3.fromRGB(20, 22, 26)
-AimbotPopup.BackgroundTransparency = 0.12
+AimbotPopup.BackgroundColor3 = Color3.fromRGB(16, 17, 20)
+AimbotPopup.BackgroundTransparency = 0.1
 AimbotPopup.BorderSizePixel = 0
 AimbotPopup.Visible = false
 AimbotPopup.Active = true
@@ -608,7 +575,7 @@ makeDraggable(AimPopBtn, AimbotPopup, function()
     setAimbotActiveState(not Config.AimbotActive)
 end)
 
--- // 3. FLUENT ACRYLIC MAIN WINDOW
+-- // 3. FLUENT ACRYLIC MAIN WINDOW (NOVA HUB)
 local MainFrame = Instance.new("Frame")
 MainFrame.Size = UDim2.new(0, 560, 0, 360)
 MainFrame.Position = UDim2.new(0.5, -280, 0.5, -180)
@@ -630,33 +597,44 @@ TopBar.BackgroundTransparency = 1
 TopBar.Active = true
 TopBar.Parent = MainFrame
 
+local TopLogo = Instance.new("TextLabel")
+TopLogo.Size = UDim2.new(0, 22, 0, 22)
+TopLogo.Position = UDim2.new(0, 14, 0.5, -11)
+TopLogo.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+TopLogo.Text = "N"
+TopLogo.TextColor3 = Color3.fromRGB(255, 255, 255)
+TopLogo.Font = Enum.Font.GothamBlack
+TopLogo.TextSize = 13
+TopLogo.Parent = TopBar
+Instance.new("UICorner", TopLogo).CornerRadius = UDim.new(0, 5)
+
 local HubTitle = Instance.new("TextLabel")
 HubTitle.Size = UDim2.new(0, 75, 1, 0)
-HubTitle.Position = UDim2.new(0, 16, 0, 0)
+HubTitle.Position = UDim2.new(0, 42, 0, 0)
 HubTitle.BackgroundTransparency = 1
-HubTitle.Text = "Ollie Hub"
-HubTitle.TextColor3 = Color3.fromRGB(240, 244, 250)
+HubTitle.Text = "Nova Hub"
+HubTitle.TextColor3 = Color3.fromRGB(245, 247, 252)
 HubTitle.Font = Enum.Font.GothamBold
 HubTitle.TextSize = 13
 HubTitle.TextXAlignment = Enum.TextXAlignment.Left
 HubTitle.Parent = TopBar
 
 local GreenBadge = Instance.new("TextLabel")
-GreenBadge.Size = UDim2.new(0, 18, 0, 18)
-GreenBadge.Position = UDim2.new(0, 86, 0.5, -9)
+GreenBadge.Size = UDim2.new(0, 16, 0, 16)
+GreenBadge.Position = UDim2.new(0, 112, 0.5, -8)
 GreenBadge.BackgroundColor3 = Color3.fromRGB(45, 195, 100)
 GreenBadge.Text = "⚡"
 GreenBadge.TextColor3 = Color3.fromRGB(255, 255, 255)
 GreenBadge.Font = Enum.Font.GothamBold
-GreenBadge.TextSize = 10
+GreenBadge.TextSize = 9
 GreenBadge.Parent = TopBar
 Instance.new("UICorner", GreenBadge).CornerRadius = UDim.new(1, 0)
 
 local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 230, 1, 0)
-SubTitle.Position = UDim2.new(0, 110, 0, 0)
+SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v8"
+SubTitle.Text = "Heroes Battlegrounds v10"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
@@ -710,6 +688,94 @@ end)
 
 makeDraggable(TopBar, MainFrame, nil)
 makeDraggable(AppIcon, AppIcon, toggleMenu)
+
+-- // SILENT NO-ANIMATION 4-HIT INSTANT BURST ENGINE
+-- Does NOT speed up animations or character speed!
+-- Instead, it completely kills all swing animations (`Stop(0)`) and fires all 4 M1 hits in a single instantaneous batch.
+local function fireSilentNoAnimM1Burst()
+    local now = tick()
+    if now - State.LastM1Burst < Config.M1BurstCycleDelay then return end
+    State.LastM1Burst = now
+
+    local char = State.Char
+    local hum = State.Hum
+    if not char or not hum or hum.Health <= 0 then return end
+
+    -- 1. Suppress any active attack/swing animation tracks so character stands completely still while hitting
+    if Config.SuppressM1Anim then
+        local animator = State.Animator or hum:FindFirstChildOfClass("Animator")
+        if animator then
+            for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                if not isCoreMovementAnimation(track) then
+                    pcall(function()
+                        track:Stop(0)
+                        track:AdjustWeight(0)
+                    end)
+                end
+            end
+        end
+    end
+
+    -- 2. Reset local M1/Combo/Cooldown attributes so client scripts never block consecutive packets
+    for attrName, val in pairs(char:GetAttributes()) do
+        if isStunName(attrName) and val == true then
+            char:SetAttribute(attrName, false)
+        end
+    end
+
+    -- 3. INSTANT 4-HIT PACKET BURST IN ONE GO (No animation delay between hits 1..4)
+    -- A) If our hook captured the exact M1 remote from the game, replay it 4 times in one batch
+    if State.CapturedM1Remote and State.CapturedM1Remote.Parent then
+        local baseArgs = State.CapturedM1Args or {}
+        for hit = 1, 4 do
+            pcall(function()
+                if #baseArgs > 0 then
+                    State.CapturedM1Remote:FireServer(unpack(baseArgs))
+                else
+                    State.CapturedM1Remote:FireServer("M1", hit)
+                end
+            end)
+        end
+    end
+
+    -- B) Fire Character & Backpack RemoteEvents / Tools (4-Hit Batch)
+    for _, inst in ipairs(char:GetDescendants()) do
+        if inst:IsA("RemoteEvent") then
+            for hit = 1, 4 do
+                pcall(function() inst:FireServer("M1", hit) end)
+                pcall(function() inst:FireServer({Action = "M1", Combo = hit, Hit = hit}) end)
+                pcall(function() inst:FireServer("LeftClick", true) end)
+                pcall(function() inst:FireServer() end)
+            end
+        elseif inst:IsA("Tool") then
+            for hit = 1, 4 do
+                pcall(function() inst:Activate() end)
+            end
+        end
+    end
+
+    -- C) Fire Cached ReplicatedStorage Combat Remotes (4-Hit Batch)
+    for i = 1, math.min(#State.CombatRemotes, 5) do
+        local rem = State.CombatRemotes[i]
+        if rem and rem.Parent then
+            for hit = 1, 4 do
+                pcall(function() rem:FireServer("M1", hit) end)
+                pcall(function() rem:FireServer({Goal = "LeftClick", Mobile = true}) end)
+                pcall(function() rem:FireServer("LeftClick") end)
+            end
+        end
+    end
+
+    -- D) Instant Silent Input Pulse (Fallback for games binding ContextActionService without Remote args)
+    if not MainFrame.Visible then
+        pcall(function()
+            if VirtualInputManager then
+                VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
+                VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+            end
+        end)
+    end
+end
 
 local Sidebar = Instance.new("Frame")
 Sidebar.Size = UDim2.new(0, 150, 1, -48)
@@ -909,7 +975,7 @@ local function addFeatureToggle(parent, id, label, shortName, defaultState, call
 
         local floatBtn = State.PinnedButtons[id]
         if floatBtn then
-            floatBtn.BackgroundColor3 = state and Color3.fromRGB(45, 145, 225) or Color3.fromRGB(22, 24, 30)
+            floatBtn.BackgroundColor3 = state and Color3.fromRGB(45, 145, 225) or Color3.fromRGB(16, 17, 22)
             floatBtn.Text = shortName .. "\n" .. (state and "ON" or "OFF")
         end
     end
@@ -936,7 +1002,7 @@ local function addFeatureToggle(parent, id, label, shortName, defaultState, call
             FloatBtn.Name = "Pin_" .. id
             FloatBtn.Size = UDim2.new(0, 52, 0, 36)
             FloatBtn.Position = UDim2.new(0, 68, 0.22, pinCount * 42)
-            FloatBtn.BackgroundColor3 = state and Color3.fromRGB(45, 145, 225) or Color3.fromRGB(22, 24, 30)
+            FloatBtn.BackgroundColor3 = state and Color3.fromRGB(45, 145, 225) or Color3.fromRGB(16, 17, 22)
             FloatBtn.BackgroundTransparency = 0.1
             FloatBtn.Text = shortName .. "\n" .. (state and "ON" or "OFF")
             FloatBtn.TextColor3 = Color3.fromRGB(240, 245, 255)
@@ -1267,7 +1333,7 @@ local function triggerUndetectedInfJump()
     State.InfJumpArcTimer = now
 end
 
--- // 3-MODE INVISIBLE ENGINE (Cached Parts - Zero Per-Frame Lag)
+-- // 3-MODE INVISIBLE ENGINE
 local function getRootMotor(char)
     local lowerTorso = char:FindFirstChild("LowerTorso")
     if lowerTorso and lowerTorso:FindFirstChild("Root") then
@@ -1370,14 +1436,18 @@ local function toggleInvisible(enable)
     end
 end
 
--- // 1. POPULATE COMBAT TAB (Rapid M1 Auto-Kill, Anti-Stun, Sticky Aimbot)
-addFeatureToggle(TabCombat, "RapidM1", "Auto Kill (4x M1 in 0.1s No-Endlag)", "M1KILL", false, function(v)
-    Config.RapidM1Enabled = v
+-- // 1. POPULATE COMBAT TAB
+addFeatureToggle(TabCombat, "AutoKillM1", "Auto Kill (Silent 4-Hit No-Anim)", "AKILL", false, function(v)
+    Config.AutoKillM1 = v
     if v then cacheCombatRemotes() end
 end)
 
-addSlider(TabCombat, "M1 Burst Step Delay (0.025 = 4x in 0.1s)", 0.015, 0.08, 0.025, function(v)
-    Config.M1BurstInterval = v
+addFeatureToggle(TabCombat, "SuppressM1Anim", "Remove M1 Animation (Silent Hit)", "NOANIM", true, function(v)
+    Config.SuppressM1Anim = v
+end)
+
+addSlider(TabCombat, "4-Hit Batch Cycle Delay (Seconds)", 0.02, 0.25, 0.08, function(v)
+    Config.M1BurstCycleDelay = v
 end)
 
 addFeatureToggle(TabCombat, "AntiStun", "Anti-Stun (Event-Driven Zero-Lag)", "ASTUN", false, function(v)
@@ -1439,7 +1509,7 @@ addSlider(TabTarget, "Orbit / Random Speed", 1, 60, 15, function(v)
     Config.OrbitSpeed = v
 end)
 
-addSlider(TabTarget, "Target Range (Distance)", 1, 40, 6.5, function(v)
+addSlider(TabTarget, "Target Range (Distance)", 1, 40, 6.0, function(v)
     Config.TargetRange = v
 end)
 
@@ -1460,7 +1530,7 @@ addFeatureToggle(TabTarget, "TeleportPlayer", "Instant Teleport To Player", "TP"
     end
 end)
 
--- // 3. POPULATE VOID & SAFETY TAB (Heroes Battlegrounds Void Kill + Anti-Void)
+-- // 3. POPULATE VOID & SAFETY TAB
 addFeatureToggle(TabVoid, "AutoVoidKill", "Auto Void Kill (Detect Grab Skill)", "VOIDK", false, function(v)
     Config.AutoVoidKill = v
     if not v then
@@ -1579,7 +1649,7 @@ Players.PlayerRemoving:Connect(function(leavingPlr)
     PlayerDropdown.Refresh(getPlayerNames())
 end)
 
--- // THROTTLED ESP MANAGER (Updates 8 times/sec instead of 60 times/sec to prevent FPS lag)
+-- // THROTTLED ESP MANAGER
 local function updateESP()
     if not Config.ESPEnabled then return end
     local now = tick()
@@ -1670,7 +1740,6 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
     local root = State.Root
     local hum = State.Hum
 
-    -- Maintain Noclip on cached hidden parts when Invisible is active (No GetDescendants loop!)
     if Config.InvisibleEnabled then
         for i = 1, #State.InvisData.HiddenParts do
             local p = State.InvisData.HiddenParts[i]
@@ -1678,7 +1747,6 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
         end
     end
 
-    -- Pause AutoTarget CFrame lock while executing a Void Kill drop so Void Kill has priority
     if Config.AutoTargetEnabled and root and hum and not State.VoidKillActive then
         local targetPlr = Players:FindFirstChild(Config.SelectedPlayer or "")
         local tRoot = targetPlr and targetPlr.Character and targetPlr.Character:FindFirstChild("HumanoidRootPart")
@@ -1746,7 +1814,6 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
         end
     end
 
-    -- Sticky Aimbot Camera Lock
     if Config.AimbotActive and State.LockedAimbotPlayer then
         local tChar = State.LockedAimbotPlayer.Character
         local aimPart = tChar and (tChar:FindFirstChild(Config.AimPart) or tChar:FindFirstChild("HumanoidRootPart"))
@@ -1762,7 +1829,6 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
     local hum = State.Hum
 
     if root and hum and hum.Health > 0 then
-        -- 1. RECORD SAFE GROUND POSITION & ENFORCE ANTI-VOID
         local voidY = Workspace.FallenPartsDestroyHeight
         if voidY ~= voidY or voidY < -10000 or voidY > 500 then voidY = -500 end
 
@@ -1771,7 +1837,6 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
                 State.LastSafeCFrame = root.CFrame
             end
 
-            -- Anti-Void Rescue: If falling near the void (and not intentionally doing a Void Kill), teleport back or bounce up!
             if Config.AntiVoidEnabled and root.Position.Y < (voidY + 65) then
                 if State.LastSafeCFrame then
                     root.CFrame = State.LastSafeCFrame + Vector3.new(0, 5, 0)
@@ -1782,13 +1847,11 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             end
         end
 
-        -- 2. PROXIMITY GRAB CHECK FOR VOID KILL
         if Config.AutoVoidKill and not State.VoidKillActive then
             scanProximityGrab()
         end
 
-        -- 3. LIGHTWEIGHT ANTI-STUN PROPERTY GUARD (Zero table allocation!)
-        if Config.AntiStunEnabled then
+        if Config.AntiStunEnabled or Config.AutoKillM1 then
             if root.Anchored then root.Anchored = false end
             if hum.PlatformStand then hum.PlatformStand = false end
             if hum.Sit then hum.Sit = false end
@@ -1803,12 +1866,11 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             hum.JumpPower = Config.JumpPower
         end
 
-        -- 4. RAPID 4x M1 BURST IN 0.1s (No-Endlag Auto Kill)
-        if Config.RapidM1Enabled and not State.VoidKillActive then
-            performRapidM1Burst()
+        -- SILENT NO-ANIMATION 4-HIT INSTANT BURST
+        if Config.AutoKillM1 and not State.VoidKillActive then
+            fireSilentNoAnimM1Burst()
         end
 
-        -- 5. UNDETECTED FLYPAD-STEP INFINITE JUMP
         if Config.InfJumpEnabled and not Config.FlyEnabled and not Config.AutoTargetEnabled and not State.VoidKillActive then
             hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
             hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
@@ -1851,7 +1913,6 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             end
         end
 
-        -- 6. LOOPFLY ENGINE
         if Config.FlyEnabled and not Config.AutoTargetEnabled and not State.VoidKillActive then
             hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
             hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
@@ -1897,8 +1958,8 @@ task.spawn(function()
         local touchGui = pGui and pGui:FindFirstChild("TouchGui")
         local frame = touchGui and touchGui:FindFirstChild("TouchControlFrame")
         local jumpBtn = frame and frame:FindFirstChild("JumpButton")
-        if jumpBtn and not jumpBtn:GetAttribute("OllieHooked") then
-            jumpBtn:SetAttribute("OllieHooked", true)
+        if jumpBtn and not jumpBtn:GetAttribute("NovaHooked") then
+            jumpBtn:SetAttribute("NovaHooked", true)
             jumpBtn.InputBegan:Connect(function(input)
                 if input.UserInputType == Enum.UserInputType.Touch and Config.InfJumpEnabled then
                     triggerUndetectedInfJump()
