@@ -1,6 +1,6 @@
 -- Context: Luau (Roblox Client Executor - Heroes Battlegrounds & Universal Battlegrounds Compatible)
--- Architecture: Silent No-Animation Instant 4-Hit M1 Packet Burst (Remote Sniffer + Animation Suppressor)
---               + Auto Grab-Detect Void Kill + Anti-Void + Event-Driven Zero-Lag Engine + Nova Hub Fluent UI.
+-- Architecture: Full Window Control Lifecycle (Minimize = Hide, Maximize = Enlarge Window, Close X = Full Script Unload & Cleanup)
+--               + Silent No-Animation Instant 4-Hit M1 Burst + Auto Void Kill + Anti-Void + Nova Hub Fluent UI.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -16,10 +16,12 @@ local Camera = Workspace.CurrentCamera
 
 -- // CONFIGURATION & STATE
 local Config = {
+    ScriptRunning = true,      -- Master flag; set to false when clicking 'X' to unload everything
+
     -- Heroes Battlegrounds Specials
     AutoKillM1 = false,        -- Silent No-Animation Instant 4-Hit M1 Burst
-    SuppressM1Anim = true,     -- Completely stops M1 swing animations so character hits silently without moving arms
-    M1BurstCycleDelay = 0.08,  -- Cooldown between each 4-hit instant burst (0.08s = ~50 hits/sec attempt)
+    SuppressM1Anim = true,     -- Stops M1 swing animations so character hits silently without moving arms
+    M1BurstCycleDelay = 0.08,  -- Cooldown between each 4-hit instant burst
     AutoVoidKill = false,      -- Auto-detects when a grab skill locks an enemy, drops to void edge, releases, returns
     VoidHoldTime = 1.35,
     AntiVoidEnabled = true,
@@ -90,21 +92,18 @@ local State = {
 }
 
 -- // 0. ANTI-KICK + AUTO M1 PACKET SNIFFER HOOK
--- Automatically captures the exact M1 RemoteEvent & arguments used by Heroes Battlegrounds the first time you punch
--- so Auto Kill can replay all 4 hits in a single frame with zero animation!
 pcall(function()
     if hookmetamethod and getnamecallmethod and checkcaller then
         local oldNamecall
         oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-            local method = getnamecallmethod()
-            if not checkcaller() then
+            if Config.ScriptRunning and not checkcaller() then
+                local method = getnamecallmethod()
                 if (method == "Kick" or method == "kick") and self == LocalPlayer then
                     return nil
                 end
                 if method == "FireServer" and self:IsA("RemoteEvent") then
                     local rName = string.lower(self.Name)
                     local args = {...}
-                    -- Sniff M1 / Combat remote calls to clone their exact packet structure
                     if string.find(rName, "combat") or string.find(rName, "m1") or string.find(rName, "punch")
                         or string.find(rName, "attack") or string.find(rName, "hit") or string.find(rName, "input")
                         or string.find(rName, "main") or string.find(rName, "remote") then
@@ -157,9 +156,9 @@ local function cacheCombatRemotes()
 end
 task.spawn(cacheCombatRemotes)
 
--- // ZERO-LAG EVENT-DRIVEN CHARACTER BINDER + SILENT NO-ANIMATION HOOK
+-- // ZERO-LAG EVENT-DRIVEN CHARACTER BINDER
 local function cleanStunInstance(inst)
-    if not Config.AntiStunEnabled and not Config.AutoKillM1 then return end
+    if not Config.ScriptRunning or (not Config.AntiStunEnabled and not Config.AutoKillM1) then return end
     if inst:IsA("BodyVelocity") or inst:IsA("BodyPosition") or inst:IsA("BodyAngularVelocity")
         or inst:IsA("BodyGyro") or inst:IsA("LinearVelocity") or inst:IsA("VectorForce") or inst:IsA("AlignPosition") then
         if inst.Name ~= "NovaMover" and not State.VoidKillActive then
@@ -198,7 +197,7 @@ end
 
 -- // TRIGGER VOID KILL SEQUENCE
 local function executeVoidKillSequence(enemyPlayer)
-    if State.VoidKillActive or not Config.AutoVoidKill then return end
+    if not Config.ScriptRunning or State.VoidKillActive or not Config.AutoVoidKill then return end
     local myRoot = State.Root
     local myHum = State.Hum
     if not myRoot or not myHum or myHum.Health <= 0 then return end
@@ -218,7 +217,7 @@ local function executeVoidKillSequence(enemyPlayer)
         local startTime = tick()
         local maxDuration = Config.VoidHoldTime
 
-        while (tick() - startTime) < maxDuration and Config.AutoVoidKill and State.Root and State.Hum and State.Hum.Health > 0 do
+        while (tick() - startTime) < maxDuration and Config.ScriptRunning and Config.AutoVoidKill and State.Root and State.Hum and State.Hum.Health > 0 do
             local eChar = enemyPlayer and enemyPlayer.Character
             local eRoot = eChar and eChar:FindFirstChild("HumanoidRootPart")
             local eHum = eChar and eChar:FindFirstChildOfClass("Humanoid")
@@ -254,7 +253,7 @@ local function executeVoidKillSequence(enemyPlayer)
 end
 
 local function scanProximityGrab()
-    if not Config.AutoVoidKill or State.VoidKillActive then return end
+    if not Config.ScriptRunning or not Config.AutoVoidKill or State.VoidKillActive then return end
     local myRoot = State.Root
     local myHum = State.Hum
     if not myRoot or not myHum then return end
@@ -288,7 +287,6 @@ local function scanProximityGrab()
     end
 end
 
--- Helper to check if an AnimationTrack is a standard walk/run/idle/jump locomotion animation
 local function isCoreMovementAnimation(track)
     if not track or not track.Animation then return false end
     local name = string.lower(track.Name or "")
@@ -310,7 +308,7 @@ local function bindCharacter(char)
     end
     State.CharConnections = {}
 
-    if not char then return end
+    if not char or not Config.ScriptRunning then return end
     State.Char = char
     State.Root = char:WaitForChild("HumanoidRootPart", 5)
     State.Hum = char:WaitForChild("Humanoid", 5)
@@ -318,11 +316,9 @@ local function bindCharacter(char)
 
     if not State.Root or not State.Hum then return end
 
-    -- SILENT NO-ANIMATION INTERCEPTOR:
-    -- Instantly cancels any M1 / Punch / Action animation the exact microsecond it tries to play!
     if State.Animator then
         table.insert(State.CharConnections, State.Animator.AnimationPlayed:Connect(function(track)
-            if Config.AutoKillM1 and Config.SuppressM1Anim then
+            if Config.ScriptRunning and Config.AutoKillM1 and Config.SuppressM1Anim then
                 if not isCoreMovementAnimation(track) then
                     pcall(function()
                         track:Stop(0)
@@ -334,6 +330,7 @@ local function bindCharacter(char)
     end
 
     table.insert(State.CharConnections, char.DescendantAdded:Connect(function(inst)
+        if not Config.ScriptRunning then return end
         if Config.AntiStunEnabled or Config.AutoKillM1 then
             cleanStunInstance(inst)
         end
@@ -348,7 +345,7 @@ local function bindCharacter(char)
     end))
 
     table.insert(State.CharConnections, char.AttributeChanged:Connect(function(attrName)
-        if (Config.AntiStunEnabled or Config.AutoKillM1) and isStunName(attrName) then
+        if Config.ScriptRunning and (Config.AntiStunEnabled or Config.AutoKillM1) and isStunName(attrName) then
             if char:GetAttribute(attrName) == true then
                 char:SetAttribute(attrName, false)
             end
@@ -356,7 +353,7 @@ local function bindCharacter(char)
     end))
 
     table.insert(State.CharConnections, State.Hum.AttributeChanged:Connect(function(attrName)
-        if (Config.AntiStunEnabled or Config.AutoKillM1) and isStunName(attrName) then
+        if Config.ScriptRunning and (Config.AntiStunEnabled or Config.AutoKillM1) and isStunName(attrName) then
             if State.Hum:GetAttribute(attrName) == true then
                 State.Hum:SetAttribute(attrName, false)
             end
@@ -364,7 +361,7 @@ local function bindCharacter(char)
     end))
 
     table.insert(State.CharConnections, State.Hum.StateChanged:Connect(function(_, newState)
-        if Config.AntiStunEnabled then
+        if Config.ScriptRunning and Config.AntiStunEnabled then
             if newState == Enum.HumanoidStateType.Ragdoll
                 or newState == Enum.HumanoidStateType.FallingDown
                 or newState == Enum.HumanoidStateType.PlatformStanding then
@@ -463,6 +460,61 @@ local function findNearestValidPlayer()
         end
     end
     return closestPlayer
+end
+
+-- // SHARED CAMERA FLOOR PAD & INVISIBLE CLEANUP HELPERS
+local function ensureFlyPad()
+    if State.FlyPad and State.FlyPad.Parent then return State.FlyPad end
+    local pad = Instance.new("Part")
+    pad.Name = "CameraOcclusionPart"
+    pad.Size = Vector3.new(6.5, 1.2, 6.5)
+    pad.Transparency = 1
+    pad.Anchored = true
+    pad.CanCollide = true
+    pad.Parent = Camera
+    State.FlyPad = pad
+    return pad
+end
+
+local function clearFlyPad()
+    if State.FlyPad then
+        State.FlyPad:Destroy()
+        State.FlyPad = nil
+    end
+end
+
+local function getRootMotor(char)
+    local lowerTorso = char:FindFirstChild("LowerTorso")
+    if lowerTorso and lowerTorso:FindFirstChild("Root") then
+        return lowerTorso.Root
+    end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp and hrp:FindFirstChild("RootJoint") then
+        return hrp.RootJoint
+    end
+    return nil
+end
+
+local function cleanupInvisible()
+    local char = State.Char
+    if State.InvisData.Seat then
+        State.InvisData.Seat:Destroy()
+        State.InvisData.Seat = nil
+    end
+    if char then
+        local motor = getRootMotor(char)
+        if motor and State.InvisData.SavedC0 then
+            motor.C0 = State.InvisData.SavedC0
+            State.InvisData.SavedC0 = nil
+        end
+        for _, v in ipairs(State.InvisData.HiddenParts) do
+            if v and v.Parent then
+                v.LocalTransparencyModifier = 0
+                v.CanCollide = true
+            end
+        end
+    end
+    State.InvisData.HiddenParts = {}
 end
 
 -- // UI ROOT
@@ -576,8 +628,11 @@ makeDraggable(AimPopBtn, AimbotPopup, function()
 end)
 
 -- // 3. FLUENT ACRYLIC MAIN WINDOW (NOVA HUB)
+local NormalSize = UDim2.new(0, 560, 0, 360)
+local MaximizedSize = UDim2.new(0, 720, 0, 460)
+
 local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 560, 0, 360)
+MainFrame.Size = NormalSize
 MainFrame.Position = UDim2.new(0.5, -280, 0.5, -180)
 MainFrame.BackgroundColor3 = Color3.fromRGB(20, 21, 25)
 MainFrame.BackgroundTransparency = 0.08
@@ -634,13 +689,14 @@ local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 230, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v10"
+SubTitle.Text = "Heroes Battlegrounds v11"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
 SubTitle.TextXAlignment = Enum.TextXAlignment.Left
 SubTitle.Parent = TopBar
 
+-- // 3 TOP-RIGHT WINDOW BUTTONS: [—] Hide Menu | [□] Maximize/Enlarge Menu | [×] Completely Unload & Destroy Script
 local MinBtn = Instance.new("TextButton")
 MinBtn.Size = UDim2.new(0, 34, 0, 28)
 MinBtn.Position = UDim2.new(1, -108, 0, 5)
@@ -666,33 +722,101 @@ ExitBtn.Size = UDim2.new(0, 34, 0, 28)
 ExitBtn.Position = UDim2.new(1, -36, 0, 5)
 ExitBtn.BackgroundTransparency = 1
 ExitBtn.Text = "×"
-ExitBtn.TextColor3 = Color3.fromRGB(185, 190, 200)
-ExitBtn.Font = Enum.Font.Gotham
+ExitBtn.TextColor3 = Color3.fromRGB(235, 95, 95)
+ExitBtn.Font = Enum.Font.GothamBold
 ExitBtn.TextSize = 18
 ExitBtn.Parent = TopBar
 
-local isCompact = false
+local isMaximized = false
+
+-- 1. Button [—] : Hides / Minimizes the Menu (Can be reopened via "N" Icon or LeftAlt)
 local function toggleMenu()
+    if not Config.ScriptRunning then return end
     MainFrame.Visible = not MainFrame.Visible
     StatusDot.BackgroundColor3 = MainFrame.Visible and Color3.fromRGB(65, 225, 120) or Color3.fromRGB(230, 75, 75)
 end
 
-MinBtn.MouseButton1Click:Connect(toggleMenu)
-ExitBtn.MouseButton1Click:Connect(toggleMenu)
-MaxBtn.MouseButton1Click:Connect(function()
-    isCompact = not isCompact
-    TweenService:Create(MainFrame, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-        Size = isCompact and UDim2.new(0, 480, 0, 310) or UDim2.new(0, 560, 0, 360)
+-- 2. Button [□] : Enlarges / Maximizes the Menu Window (Toggles between 560x360 and 720x460 centered)
+local function toggleMaximizeMenu()
+    if not Config.ScriptRunning then return end
+    isMaximized = not isMaximized
+    local vp = Camera.ViewportSize
+    local targetW = isMaximized and math.min(720, vp.X - 30) or 560
+    local targetH = isMaximized and math.min(460, vp.Y - 30) or 360
+
+    TweenService:Create(MainFrame, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        Size = UDim2.new(0, targetW, 0, targetH),
+        Position = UDim2.new(0.5, -math.floor(targetW / 2), 0.5, -math.floor(targetH / 2))
     }):Play()
-end)
+    MaxBtn.TextColor3 = isMaximized and Color3.fromRGB(70, 180, 255) or Color3.fromRGB(185, 190, 200)
+end
+
+-- 3. Button [×] : Completely Terminates Script, Restores Character, Disconnects Loops & Removes UI
+local function unloadEntireScript()
+    Config.ScriptRunning = false
+    Config.FlyEnabled = false
+    Config.InfJumpEnabled = false
+    Config.AutoTargetEnabled = false
+    Config.AutoKillM1 = false
+    Config.AutoVoidKill = false
+    Config.AntiVoidEnabled = false
+    Config.AntiStunEnabled = false
+    Config.AimbotActive = false
+    Config.ESPEnabled = false
+
+    -- Restore Invisible & FlyPads
+    pcall(cleanupInvisible)
+    pcall(clearFlyPad)
+
+    -- Restore normal WalkSpeed & JumpPower
+    if State.Hum then
+        pcall(function()
+            State.Hum.WalkSpeed = 16
+            State.Hum.JumpPower = 50
+            State.Hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+            State.Hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+        end)
+    end
+    if State.Root then
+        pcall(function()
+            State.Root.AssemblyLinearVelocity = Vector3.zero
+        end)
+    end
+
+    -- Disconnect all Character & Global RunService/Input connections
+    for _, c in ipairs(State.CharConnections) do
+        pcall(function() c:Disconnect() end)
+    end
+    State.CharConnections = {}
+
+    for _, c in ipairs(State.Connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    State.Connections = {}
+
+    -- Destroy ESP objects
+    for _, obj in pairs(State.ESPObjects) do
+        pcall(function() if obj.Highlight then obj.Highlight:Destroy() end end)
+        pcall(function() if obj.Billboard then obj.Billboard:Destroy() end end)
+    end
+    State.ESPObjects = {}
+
+    -- Destroy entire NovaHubUI (Main Menu, "N" Floating Icon, Pinned Buttons, Aimbot Pop-Up)
+    if ScreenGui and ScreenGui.Parent then
+        ScreenGui:Destroy()
+    end
+end
+
+MinBtn.MouseButton1Click:Connect(toggleMenu)
+MaxBtn.MouseButton1Click:Connect(toggleMaximizeMenu)
+ExitBtn.MouseButton1Click:Connect(unloadEntireScript)
 
 makeDraggable(TopBar, MainFrame, nil)
 makeDraggable(AppIcon, AppIcon, toggleMenu)
 
 -- // SILENT NO-ANIMATION 4-HIT INSTANT BURST ENGINE
--- Does NOT speed up animations or character speed!
--- Instead, it completely kills all swing animations (`Stop(0)`) and fires all 4 M1 hits in a single instantaneous batch.
 local function fireSilentNoAnimM1Burst()
+    if not Config.ScriptRunning then return end
     local now = tick()
     if now - State.LastM1Burst < Config.M1BurstCycleDelay then return end
     State.LastM1Burst = now
@@ -701,7 +825,6 @@ local function fireSilentNoAnimM1Burst()
     local hum = State.Hum
     if not char or not hum or hum.Health <= 0 then return end
 
-    -- 1. Suppress any active attack/swing animation tracks so character stands completely still while hitting
     if Config.SuppressM1Anim then
         local animator = State.Animator or hum:FindFirstChildOfClass("Animator")
         if animator then
@@ -716,15 +839,12 @@ local function fireSilentNoAnimM1Burst()
         end
     end
 
-    -- 2. Reset local M1/Combo/Cooldown attributes so client scripts never block consecutive packets
     for attrName, val in pairs(char:GetAttributes()) do
         if isStunName(attrName) and val == true then
             char:SetAttribute(attrName, false)
         end
     end
 
-    -- 3. INSTANT 4-HIT PACKET BURST IN ONE GO (No animation delay between hits 1..4)
-    -- A) If our hook captured the exact M1 remote from the game, replay it 4 times in one batch
     if State.CapturedM1Remote and State.CapturedM1Remote.Parent then
         local baseArgs = State.CapturedM1Args or {}
         for hit = 1, 4 do
@@ -738,7 +858,6 @@ local function fireSilentNoAnimM1Burst()
         end
     end
 
-    -- B) Fire Character & Backpack RemoteEvents / Tools (4-Hit Batch)
     for _, inst in ipairs(char:GetDescendants()) do
         if inst:IsA("RemoteEvent") then
             for hit = 1, 4 do
@@ -754,7 +873,6 @@ local function fireSilentNoAnimM1Burst()
         end
     end
 
-    -- C) Fire Cached ReplicatedStorage Combat Remotes (4-Hit Batch)
     for i = 1, math.min(#State.CombatRemotes, 5) do
         local rem = State.CombatRemotes[i]
         if rem and rem.Parent then
@@ -766,7 +884,6 @@ local function fireSilentNoAnimM1Burst()
         end
     end
 
-    -- D) Instant Silent Input Pulse (Fallback for games binding ContextActionService without Remote args)
     if not MainFrame.Visible then
         pcall(function()
             if VirtualInputManager then
@@ -1295,29 +1412,8 @@ local TabVoid   = createTab("Void & Safety", "🌀")
 local TabMove   = createTab("LocalPlayer", "👤")
 local TabVisual = createTab("Settings", "⚙")
 
--- // SHARED CAMERA FLOOR PAD
-local function ensureFlyPad()
-    if State.FlyPad and State.FlyPad.Parent then return State.FlyPad end
-    local pad = Instance.new("Part")
-    pad.Name = "CameraOcclusionPart"
-    pad.Size = Vector3.new(6.5, 1.2, 6.5)
-    pad.Transparency = 1
-    pad.Anchored = true
-    pad.CanCollide = true
-    pad.Parent = Camera
-    State.FlyPad = pad
-    return pad
-end
-
-local function clearFlyPad()
-    if State.FlyPad then
-        State.FlyPad:Destroy()
-        State.FlyPad = nil
-    end
-end
-
 local function triggerUndetectedInfJump()
-    if not Config.InfJumpEnabled then return end
+    if not Config.ScriptRunning or not Config.InfJumpEnabled then return end
     local now = tick()
     if now - State.LastJumpTime < 0.14 then return end
     State.LastJumpTime = now
@@ -1334,43 +1430,9 @@ local function triggerUndetectedInfJump()
 end
 
 -- // 3-MODE INVISIBLE ENGINE
-local function getRootMotor(char)
-    local lowerTorso = char:FindFirstChild("LowerTorso")
-    if lowerTorso and lowerTorso:FindFirstChild("Root") then
-        return lowerTorso.Root
-    end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if hrp and hrp:FindFirstChild("RootJoint") then
-        return hrp.RootJoint
-    end
-    return nil
-end
-
-local function cleanupInvisible()
-    local char = State.Char
-    if State.InvisData.Seat then
-        State.InvisData.Seat:Destroy()
-        State.InvisData.Seat = nil
-    end
-    if char then
-        local motor = getRootMotor(char)
-        if motor and State.InvisData.SavedC0 then
-            motor.C0 = State.InvisData.SavedC0
-            State.InvisData.SavedC0 = nil
-        end
-        for _, v in ipairs(State.InvisData.HiddenParts) do
-            if v and v.Parent then
-                v.LocalTransparencyModifier = 0
-                v.CanCollide = true
-            end
-        end
-    end
-    State.InvisData.HiddenParts = {}
-end
-
 local function toggleInvisible(enable)
     cleanupInvisible()
-    if not enable then return end
+    if not enable or not Config.ScriptRunning then return end
 
     local char = State.Char
     local root = State.Root
@@ -1631,12 +1693,17 @@ addButton(TabVisual, "Refresh Player Dropdown", function()
     PlayerDropdown.Refresh(getPlayerNames())
 end)
 
-Players.PlayerAdded:Connect(function()
-    task.wait(0.2)
-    PlayerDropdown.Refresh(getPlayerNames())
+addButton(TabVisual, "Unload & Remove Script (Same as × Button)", function()
+    unloadEntireScript()
 end)
 
-Players.PlayerRemoving:Connect(function(leavingPlr)
+table.insert(State.Connections, Players.PlayerAdded:Connect(function()
+    task.wait(0.2)
+    if Config.ScriptRunning then PlayerDropdown.Refresh(getPlayerNames()) end
+end))
+
+table.insert(State.Connections, Players.PlayerRemoving:Connect(function(leavingPlr)
+    if not Config.ScriptRunning then return end
     if State.LockedAimbotPlayer == leavingPlr then
         setAimbotActiveState(false)
     end
@@ -1647,11 +1714,11 @@ Players.PlayerRemoving:Connect(function(leavingPlr)
     end
     task.wait(0.2)
     PlayerDropdown.Refresh(getPlayerNames())
-end)
+end))
 
 -- // THROTTLED ESP MANAGER
 local function updateESP()
-    if not Config.ESPEnabled then return end
+    if not Config.ScriptRunning or not Config.ESPEnabled then return end
     local now = tick()
     if now - State.LastESPRefresh < 0.12 then return end
     State.LastESPRefresh = now
@@ -1737,6 +1804,7 @@ end
 
 -- // ZERO-LAG CORE RENDERSTEPPED LOOP
 table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
+    if not Config.ScriptRunning then return end
     local root = State.Root
     local hum = State.Hum
 
@@ -1825,6 +1893,7 @@ end))
 
 -- // ZERO-LAG CORE HEARTBEAT LOOP
 table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
+    if not Config.ScriptRunning then return end
     local root = State.Root
     local hum = State.Hum
 
@@ -1866,7 +1935,6 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             hum.JumpPower = Config.JumpPower
         end
 
-        -- SILENT NO-ANIMATION 4-HIT INSTANT BURST
         if Config.AutoKillM1 and not State.VoidKillActive then
             fireSilentNoAnimM1Burst()
         end
@@ -1944,6 +2012,7 @@ table.insert(State.Connections, UserInputService.JumpRequest:Connect(function()
 end))
 
 table.insert(State.Connections, UserInputService.InputBegan:Connect(function(input, gpe)
+    if not Config.ScriptRunning then return end
     if not gpe and input.KeyCode == Enum.KeyCode.LeftAlt then
         toggleMenu()
     end
@@ -1953,18 +2022,18 @@ table.insert(State.Connections, UserInputService.InputBegan:Connect(function(inp
 end))
 
 task.spawn(function()
-    while ScreenGui and ScreenGui.Parent do
+    while Config.ScriptRunning and ScreenGui and ScreenGui.Parent do
         local pGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
         local touchGui = pGui and pGui:FindFirstChild("TouchGui")
         local frame = touchGui and touchGui:FindFirstChild("TouchControlFrame")
         local jumpBtn = frame and frame:FindFirstChild("JumpButton")
         if jumpBtn and not jumpBtn:GetAttribute("NovaHooked") then
             jumpBtn:SetAttribute("NovaHooked", true)
-            jumpBtn.InputBegan:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.Touch and Config.InfJumpEnabled then
+            table.insert(State.Connections, jumpBtn.InputBegan:Connect(function(input)
+                if Config.ScriptRunning and input.UserInputType == Enum.UserInputType.Touch and Config.InfJumpEnabled then
                     triggerUndetectedInfJump()
                 end
-            end)
+            end))
         end
         task.wait(2)
     end
