@@ -1,6 +1,6 @@
--- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v17)
--- Architecture: 100% Exact Decompiled Kill Aura from dump.txt ("LeftClick" & "LeftClickRelease" via Character.Main.RemoteEvent)
---               + Top-Of-Tab & Floating M1 Sniffer Copy Button + Full v8 Anti-Stun + Auto Void Kill + Nova Hub Fluent UI.
+-- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v17 - FIXED)
+-- Architecture: Fixed 4-M1 Sequential Kill Aura + Range Check + Non-Interrupting Void Kill
+--               + Anti-Void OFF by default + Guarded Toggle Init + Nova Hub Fluent UI.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -8,21 +8,24 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
 local CoreGui = game:GetService("CoreGui")
+local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
--- // CONFIGURATION & STATE
+-- // CONFIGURATION & STATE (ALL COMBAT / VOID / MOVEMENT TOGGLES DEFAULT TO FALSE)
 local Config = {
     ScriptRunning = true,
+    UIInitialized = false,     -- Chặn tuyệt đối việc tự kích hoạt tính năng khi vừa execute script
 
-    -- Heroes Battlegrounds Specials (100% Exact from dump.txt)
+    -- Heroes Battlegrounds Specials (FIXED)
     KillAuraEnabled = false,
-    KillAuraDelay = 0.08,      -- Exact wait(0.08) from dump.txt
+    KillAuraRange = 16,        -- Chỉ đánh khi có địch trong tầm (không tự vung tay khóa M1 khi đứng không)
+    KillAuraDelay = 0.24,      -- Nhịp đánh chuẩn giữa từng đòn M1 (1 -> 2 -> 3 -> 4)
     AntiStunEnabled = false,   -- Full Multi-Layer Anti-Stun (v8 Immunity Engine)
-    AutoVoidKill = false,      -- Auto-detects when a grab skill locks an enemy, drops to void edge, releases, returns
+    AutoVoidKill = false,      -- Chỉ kéo xuống Void khi thực sự có khớp Grab Weld nối với địch
     VoidHoldTime = 1.35,
-    AntiVoidEnabled = true,
+    AntiVoidEnabled = true,   -- Đã tắt mặc định khi mới execute script (trước đây để true)
 
     -- Combat / Target
     AimbotWidgetOpen = false,
@@ -30,14 +33,14 @@ local Config = {
     AimPart = "Head",
     SelectedPlayer = nil,
     AutoTargetEnabled = false,
-    TargetFreeMove = true,
-    TargetMode = "Behind", -- "Behind" | "Orbit" | "Random" | "Below" | "Upper" | "Front"
+    TargetFreeMove = false,    -- Đã tắt mặc định
+    TargetMode = "Behind",     -- "Behind" | "Orbit" | "Random" | "Below" | "Upper" | "Front"
     OrbitSpeed = 15,
     TargetRange = 5.5,
 
     -- Movement
     FlyEnabled = false,
-    FlyMode = "FloorPad", -- "FloorPad" | "LoopPulse"
+    FlyMode = "FloorPad",      -- "FloorPad" | "LoopPulse"
     FlySpeed = 65,
     InfJumpEnabled = false,
     InfJumpMode = "FlyPadStep", -- "FlyPadStep" | "ParabolicCFrame" | "MicroBounce"
@@ -58,6 +61,11 @@ local State = {
     Hum = nil,
     CharConnections = {},
 
+    -- Kill Aura Combo State
+    KillAuraLoopRunning = false,
+    ComboStage = 1,
+    LastHitTick = 0,
+
     -- Live Sniffed M1 Log (Captures any RemoteEvent / RemoteFunction call when you punch manually)
     SniffedLogs = {},
     LastSniffedText = "Chưa có log. Hãy đánh thường (M1) 1-2 cái rồi bấm nút Copy này!",
@@ -67,6 +75,7 @@ local State = {
     VoidKillActive = false,
     VoidReturnCFrame = nil,
     GrabbedEnemy = nil,
+    LastSkillCastTick = 0,
 
     -- Combat / Movement State
     FlyPad = nil,
@@ -84,7 +93,15 @@ local State = {
     Connections = {},
 }
 
--- // 0. ANTI-KICK + FULL REMOTE SNIFFER HOOK
+-- Animation ID cho chuỗi 4 đòn M1 chuẩn của Hero Battlegrounds (từ hook.lua)
+local M1ComboAnims = {
+    [1] = "rbxassetid://11605699401",
+    [2] = "rbxassetid://11605701169",
+    [3] = "rbxassetid://11605702519",
+    [4] = "rbxassetid://11605703871",
+}
+
+-- // 0. ANTI-KICK + PASSIVE REMOTE SNIFFER HOOK (KHÔNG CHẶN HAY SỬA ARGS CỦA SKILL)
 pcall(function()
     if hookmetamethod and getnamecallmethod and checkcaller then
         local oldNamecall
@@ -98,6 +115,12 @@ pcall(function()
                     local rName = string.lower(self.Name)
                     if not string.find(rName, "sound") and not string.find(rName, "camera") and not string.find(rName, "footstep") then
                         local args = {...}
+                        local firstArg = tostring(args[1] or "")
+                        -- Ghi nhận thời điểm người chơi bấm tung chiêu (Skill 1, 2, 3, 4) để Void Kill / Kill Aura nhường nhịp
+                        if firstArg ~= "LeftClick" and firstArg ~= "LeftClickRelease" and firstArg ~= "animval" then
+                            State.LastSkillCastTick = tick()
+                        end
+
                         local parts = {}
                         for i = 1, select("#", ...) do
                             local v = args[i]
@@ -138,64 +161,152 @@ local function releaseM1State()
     end)
 end
 
--- // EXACT DECOMPILED KILL AURA FROM DUMP.TXT (100% Byte-for-Byte Match)
--- Here is the exact decompiled Lua code from dump.txt proto #1:
---   while KillAuraToggle do
---       for v6 = 1, 4 do
---           local v7 = {
---               [1] = "LeftClick",
---               [2] = true,
---               [3] = Vector3.new(math.random(10, 40), math.random(10, 40), math.random(10, 40)),
---               [4] = v6,
---               [5] = false,
---               [6] = 1
---           }
---           game:GetService("Players").LocalPlayer.Character.Main.RemoteEvent:FireServer(unpack(v7))
---       end
---       wait(0.08)
---       if game:GetService("Players").LocalPlayer.Character:FindFirstChild("Main") then
---           game:GetService("Players").LocalPlayer.Character.Main.RemoteEvent:FireServer("LeftClickRelease", true)
---       end
---   end
-local function startKillAuraLoop()
-    task.spawn(function()
-        while Config.ScriptRunning and Config.KillAuraEnabled do
-            pcall(function()
-                local char = LocalPlayer.Character
-                local main = char and char:FindFirstChild("Main")
-                local remote = main and main:FindFirstChild("RemoteEvent")
+-- // HELPER: TÌM MỤC TIÊU GẦN NHẤT TRONG TẦM KILL AURA (BAO GỒM CẢ PLAYER VÀ NPC TRONG WORKSPACE.LIVE)
+local function getClosestEnemyForAura(maxDist)
+    local myChar = State.Char or LocalPlayer.Character
+    local myRoot = State.Root or (myChar and myChar:FindFirstChild("HumanoidRootPart"))
+    if not myChar or not myRoot then return nil, nil end
 
-                if remote then
-                    for v6 = 1, 4 do
-                        if not Config.ScriptRunning or not Config.KillAuraEnabled then break end
-                        local v7 = {
-                            [1] = "LeftClick",
-                            [2] = true,
-                            [3] = Vector3.new(math.random(10, 40), math.random(10, 40), math.random(10, 40)),
-                            [4] = v6,
-                            [5] = false,
-                            [6] = 1
-                        }
-                        remote:FireServer(unpack(v7))
+    local bestModel, bestRoot = nil, nil
+    local shortest = maxDist
+
+    local liveFolder = Workspace:FindFirstChild("Live")
+    if liveFolder then
+        for _, model in ipairs(liveFolder:GetChildren()) do
+            if model ~= myChar and model:IsA("Model") then
+                local eRoot = model:FindFirstChild("HumanoidRootPart")
+                local eHum = model:FindFirstChildOfClass("Humanoid")
+                if eRoot and eHum and eHum.Health > 0 then
+                    local d = (eRoot.Position - myRoot.Position).Magnitude
+                    if d <= shortest then
+                        shortest = d
+                        bestModel = model
+                        bestRoot = eRoot
                     end
                 end
-            end)
-
-            task.wait(Config.KillAuraDelay)
-
-            pcall(function()
-                local char = LocalPlayer.Character
-                if char and char:FindFirstChild("Main") and char.Main:FindFirstChild("RemoteEvent") then
-                    char.Main.RemoteEvent:FireServer("LeftClickRelease", true)
-                end
-            end)
+            end
         end
-        -- Guarantee state restoration when Kill Aura is turned OFF
+    end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local eRoot = plr.Character:FindFirstChild("HumanoidRootPart")
+            local eHum = plr.Character:FindFirstChildOfClass("Humanoid")
+            if eRoot and eHum and eHum.Health > 0 then
+                local d = (eRoot.Position - myRoot.Position).Magnitude
+                if d <= shortest then
+                    shortest = d
+                    bestModel = plr.Character
+                    bestRoot = eRoot
+                end
+            end
+        end
+    end
+
+    return bestModel, bestRoot
+end
+
+-- // KIỂM TRA NHÂN VẬT ĐANG DÙNG SKILL (TRÁNH KILL AURA & VOID KILL NGẮT CHIÊU)
+local function isCharacterUsingSkill(char)
+    if not char then return false end
+    if (tick() - State.LastSkillCastTick) < 0.45 then
+        return true
+    end
+    for _, child in ipairs(char:GetChildren()) do
+        local n = string.lower(child.Name)
+        if n == "usingmove" or n == "skill" or n == "casting" or n == "action" or n == "move" then
+            return true
+        end
+    end
+    if char:GetAttribute("UsingMove") == true or char:GetAttribute("InSkill") == true then
+        return true
+    end
+    return false
+end
+
+-- // FIXED KILL AURA LOOP (ĐÁNH ĐỦ 4 ĐÒN M1 TUẦN TỰ + GÂY DAME THẬT + KHÔNG TỰ ĐÁNH KHI KHÔNG CÓ ĐỊCH)
+-- Nguyên nhân bản cũ bị kẹt M1 lần 1 và không gây dame:
+--   1. Bản cũ chạy `for v6 = 1, 4 do remote:FireServer("LeftClick", ..., v6, ...) end` trong cùng 1 frame (0 giây)
+--      rồi lập tức bắn `"LeftClickRelease"` sau 0.08s. Server nhận LeftClickRelease liên tục nên ép nhân vật
+--      reset về đòn M1 số 1 mãi mãi, không bao giờ sang được đòn 2, 3, 4.
+--   2. Bản cũ truyền Vector3.new(math.random(10,40)...) làm hướng đánh bị lệch hoàn toàn khỏi vị trí địch nên mất hitbox.
+--   3. Bản cũ bắn remote liên tục kể cả khi không có địch xung quanh, làm bạn bấm chuột trái tự đánh cũng bị kẹt ở M1 đầu.
+local function startKillAuraLoop()
+    if State.KillAuraLoopRunning then return end
+    State.KillAuraLoopRunning = true
+
+    task.spawn(function()
+        while Config.ScriptRunning and Config.KillAuraEnabled do
+            local char = LocalPlayer.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            local main = char and char:FindFirstChild("Main")
+            local remote = main and main:FindFirstChild("RemoteEvent")
+
+            if char and root and hum and hum.Health > 0 and remote and not State.VoidKillActive and not isCharacterUsingSkill(char) then
+                local enemyModel, enemyRoot = getClosestEnemyForAura(Config.KillAuraRange)
+
+                if enemyModel and enemyRoot then
+                    -- Nếu quá 1.4s chưa đánh tiếp thì quay lại đòn M1 số 1
+                    local now = tick()
+                    if (now - State.LastHitTick) > 1.4 then
+                        State.ComboStage = 1
+                    end
+                    State.LastHitTick = now
+
+                    local stage = State.ComboStage
+                    local aimPos = enemyRoot.Position
+                    local aimCF = CFrame.new(root.Position, Vector3.new(aimPos.X, root.Position.Y, aimPos.Z))
+
+                    -- Tự xoay ngang mặt về phía mục tiêu nếu không bật AutoTarget để hitbox M1 trúng 100%
+                    if not Config.AutoTargetEnabled and (Vector3.new(aimPos.X, root.Position.Y, aimPos.Z) - root.Position).Magnitude > 0.1 then
+                        root.CFrame = aimCF
+                    end
+
+                    pcall(function()
+                        -- 1. Gửi gói LeftClick đúng thứ tự đòn hiện tại (1 -> 2 -> 3 -> 4) và tọa độ thực của mục tiêu
+                        remote:FireServer("LeftClick", true, aimPos, stage, false, 1)
+
+                        -- 2. Đồng bộ gói animval chuẩn của Hero Battlegrounds để server tính hitbox & sát thương
+                        local animArgs = {
+                            [1] = "animval",
+                            [2] = M1ComboAnims[stage] or M1ComboAnims[1],
+                            [3] = 0.1,
+                            [4] = stage,
+                            [6] = CFrame.new(root.Position, aimPos),
+                            [9] = false
+                        }
+                        remote:FireServer(unpack(animArgs))
+                    end)
+
+                    -- Chuyển sang đòn tiếp theo trong chuỗi 4 M1: 1 -> 2 -> 3 -> 4
+                    State.ComboStage = (stage % 4) + 1
+
+                    if stage == 4 then
+                        -- Chỉ nhả LeftClickRelease sau khi đã hoàn tất đòn M1 thứ 4!
+                        task.wait(0.12)
+                        pcall(function()
+                            remote:FireServer("LeftClickRelease", true)
+                        end)
+                        task.wait(math.max(Config.KillAuraDelay + 0.14, 0.35))
+                    else
+                        task.wait(math.max(Config.KillAuraDelay, 0.18))
+                    end
+                else
+                    -- Không có mục tiêu trong tầm: không spam remote để người chơi tự đánh/tung skill bình thường
+                    task.wait(0.06)
+                end
+            else
+                task.wait(0.06)
+            end
+        end
+
+        State.KillAuraLoopRunning = false
         releaseM1State()
     end)
 end
 
--- // FULL ANTI-STUN ENGINE (v8 Immunity Engine - Protects Character.Main!)
+-- // FULL ANTI-STUN ENGINE (v8 Immunity Engine - Protects Character.Main & Active Skills!)
 local StunKeywords = {
     "stun", "stuns", "nojump", "nospeed", "slow", "knockback", "ragdoll", "freeze",
     "frozen", "dizz", "paralyz", "hitstun", "cantmove", "disabled",
@@ -220,9 +331,10 @@ local function cleanStunInstance(inst)
     if inst.Name == "Main" or inst:IsA("RemoteEvent") or inst:IsA("LocalScript") or inst:IsA("Script") or inst:IsA("Folder") then
         return
     end
+    -- Chỉ xóa BodyMover nếu tên của nó là tên hiệu ứng khống chế/knockback để không làm hỏng các chiêu lướt/bay của bạn
     if inst:IsA("BodyVelocity") or inst:IsA("BodyPosition") or inst:IsA("BodyAngularVelocity")
         or inst:IsA("BodyGyro") or inst:IsA("LinearVelocity") or inst:IsA("VectorForce") or inst:IsA("AlignPosition") then
-        if inst.Name ~= "NovaMover" and not State.VoidKillActive then
+        if inst.Name ~= "NovaMover" and not State.VoidKillActive and isStunName(inst.Name) then
             task.defer(function() pcall(function() inst:Destroy() end) end)
         end
     elseif (inst:IsA("BoolValue") or inst:IsA("StringValue") or inst:IsA("NumberValue")
@@ -235,9 +347,9 @@ end
 local function enforceOldFullAntiStun(char, root, hum)
     if not char or not root or not hum then return end
 
-    if root.Anchored then root.Anchored = false end
+    if root.Anchored and not isCharacterUsingSkill(char) then root.Anchored = false end
     for _, part in ipairs(char:GetChildren()) do
-        if part:IsA("BasePart") and part.Anchored then
+        if part:IsA("BasePart") and part.Anchored and not isCharacterUsingSkill(char) then
             part.Anchored = false
         end
     end
@@ -286,25 +398,44 @@ local function enforceOldFullAntiStun(char, root, hum)
     end
 end
 
+-- // FIXED GRAB DETECTION CHO VOID KILL (KHÔNG BẮT NHẦM KHI ĐANG TUNG SKILL THƯỜNG)
+-- Nguyên nhân bản cũ bật Void Kill lên là không xài được skill:
+--   Hàm `scanProximityGrab()` cũ có dòng: `local isGrabbed = eHum.PlatformStand or (eHum:GetState() == Enum.HumanoidStateType.Physics)`
+--   Chỉ cần có bất kỳ kẻ địch nào đứng gần <= 5.8 studs đang bị choáng/ngã (PlatformStand), bản cũ tưởng nhầm là đã Grab
+--   nên lập tức dịch chuyển bạn xuống đáy vực (-500), làm hủy toàn bộ các skill bạn vừa bấm!
+--   Sửa lại: Chỉ kích hoạt Void Kill khi thực sự có khớp nối vật lý (Weld / WeldConstraint / Motor6D / ObjectValue Grab)
+--   nối trực tiếp giữa nhân vật của bạn và nhân vật địch.
 local function checkGrabJoint(inst)
     local myChar = State.Char
     local myRoot = State.Root
     if not myChar or not myRoot then return nil end
 
     if inst:IsA("Weld") or inst:IsA("WeldConstraint") or inst:IsA("Motor6D") or inst:IsA("JointInstance") then
+        if not inst.Enabled then return nil end
         local p0, p1 = inst.Part0, inst.Part1
         if p0 and p1 then
             if p0:IsDescendantOf(myChar) and not p1:IsDescendantOf(myChar) then
-                return Players:GetPlayerFromCharacter(p1:FindFirstAncestorOfClass("Model"))
+                local model = p1:FindFirstAncestorOfClass("Model")
+                local plr = model and Players:GetPlayerFromCharacter(model)
+                if plr and plr ~= LocalPlayer then
+                    return plr
+                end
             elseif p1:IsDescendantOf(myChar) and not p0:IsDescendantOf(myChar) then
-                return Players:GetPlayerFromCharacter(p0:FindFirstAncestorOfClass("Model"))
+                local model = p0:FindFirstAncestorOfClass("Model")
+                local plr = model and Players:GetPlayerFromCharacter(model)
+                if plr and plr ~= LocalPlayer then
+                    return plr
+                end
             end
         end
-    elseif inst:IsA("ObjectValue") and (string.find(string.lower(inst.Name), "grab") or string.find(string.lower(inst.Name), "target") or string.find(string.lower(inst.Name), "victim")) then
-        if inst.Value and inst.Value:IsA("Model") then
-            return Players:GetPlayerFromCharacter(inst.Value)
-        elseif inst.Value and inst.Value:IsA("Player") then
-            return inst.Value
+    elseif inst:IsA("ObjectValue") then
+        local lowerName = string.lower(inst.Name)
+        if string.find(lowerName, "grab") or string.find(lowerName, "victim") then
+            if inst.Value and inst.Value:IsA("Model") then
+                return Players:GetPlayerFromCharacter(inst.Value)
+            elseif inst.Value and inst.Value:IsA("Player") then
+                return inst.Value
+            end
         end
     end
     return nil
@@ -313,6 +444,7 @@ end
 -- // TRIGGER VOID KILL SEQUENCE
 local function executeVoidKillSequence(enemyPlayer)
     if not Config.ScriptRunning or State.VoidKillActive or not Config.AutoVoidKill then return end
+    if not enemyPlayer or not enemyPlayer.Character then return end
     local myRoot = State.Root
     local myHum = State.Hum
     if not myRoot or not myHum or myHum.Health <= 0 then return end
@@ -329,6 +461,9 @@ local function executeVoidKillSequence(enemyPlayer)
     local dropXZ = Vector3.new(myRoot.Position.X, safeHoverY, myRoot.Position.Z)
 
     task.spawn(function()
+        -- Chờ 0.12s để animation bắt/chụp của skill khóa chặt mục tiêu trước khi kéo xuống vực
+        task.wait(0.12)
+
         local startTime = tick()
         local maxDuration = Config.VoidHoldTime
 
@@ -369,30 +504,41 @@ end
 
 local function scanProximityGrab()
     if not Config.ScriptRunning or not Config.AutoVoidKill or State.VoidKillActive then return end
+    local myChar = State.Char
     local myRoot = State.Root
     local myHum = State.Hum
-    if not myRoot or not myHum then return end
+    if not myChar or not myRoot or not myHum then return end
 
+    -- Quét các khớp Weld thực tế nối giữa nhân vật mình và nhân vật địch trong phạm vi gần
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer and plr.Character then
             local eRoot = plr.Character:FindFirstChild("HumanoidRootPart")
             local eHum = plr.Character:FindFirstChildOfClass("Humanoid")
             if eRoot and eHum and eHum.Health > 0 then
                 local dist = (eRoot.Position - myRoot.Position).Magnitude
-                if dist <= 5.8 then
-                    local isGrabbed = eHum.PlatformStand or (eHum:GetState() == Enum.HumanoidStateType.Physics)
-                    if not isGrabbed then
-                        for _, child in ipairs(plr.Character:GetDescendants()) do
-                            if child:IsA("Weld") or child:IsA("WeldConstraint") or child:IsA("Motor6D") then
+                if dist <= 7.5 then
+                    local hasRealGrabWeld = false
+                    for _, child in ipairs(plr.Character:GetDescendants()) do
+                        if (child:IsA("Weld") or child:IsA("WeldConstraint") or child:IsA("Motor6D")) and child.Enabled then
+                            local p0, p1 = child.Part0, child.Part1
+                            if (p0 and p0:IsDescendantOf(myChar)) or (p1 and p1:IsDescendantOf(myChar)) then
+                                hasRealGrabWeld = true
+                                break
+                            end
+                        end
+                    end
+                    if not hasRealGrabWeld then
+                        for _, child in ipairs(myChar:GetDescendants()) do
+                            if (child:IsA("Weld") or child:IsA("WeldConstraint") or child:IsA("Motor6D")) and child.Enabled then
                                 local p0, p1 = child.Part0, child.Part1
-                                if (p0 and p0:IsDescendantOf(State.Char)) or (p1 and p1:IsDescendantOf(State.Char)) then
-                                    isGrabbed = true
+                                if (p0 and p0:IsDescendantOf(plr.Character)) or (p1 and p1:IsDescendantOf(plr.Character)) then
+                                    hasRealGrabWeld = true
                                     break
                                 end
                             end
                         end
                     end
-                    if isGrabbed then
+                    if hasRealGrabWeld then
                         executeVoidKillSequence(plr)
                         return
                     end
@@ -775,7 +921,7 @@ local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 230, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v17"
+SubTitle.Text = "Heroes Battlegrounds v17 (Fixed)"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
@@ -1011,6 +1157,7 @@ end
 -- // FLUENT CARD ROW + PILL SWITCH TOGGLE + PIN SHORTCUT
 local pinCount = 0
 local function addFeatureToggle(parent, id, label, shortName, defaultState, callback)
+    defaultState = (defaultState == true)
     local Card = Instance.new("Frame")
     Card.Size = UDim2.new(1, 0, 0, 42)
     Card.BackgroundColor3 = Color3.fromRGB(32, 34, 40)
@@ -1097,7 +1244,8 @@ local function addFeatureToggle(parent, id, label, shortName, defaultState, call
     end
 
     local function setFeatureState(newState)
-        state = newState
+        if not Config.UIInitialized then return end
+        state = (newState == true)
         syncVisuals()
         callback(state)
     end
@@ -1499,14 +1647,23 @@ local function toggleInvisible(enable)
     end
 end
 
--- // 1. POPULATE COMBAT TAB (With Prominent Blue Copy Button right at the top!)
-addFeatureToggle(TabCombat, "KillAura", "Kill Aura (Exact dump.txt M1)", "KAURA", false, function(v)
+-- // 1. POPULATE COMBAT TAB
+addFeatureToggle(TabCombat, "KillAura", "Kill Aura (Fixed 4-M1 Combo + Hitbox)", "KAURA", false, function(v)
     Config.KillAuraEnabled = v
     if v then
+        State.ComboStage = 1
         startKillAuraLoop()
     else
         releaseM1State()
     end
+end)
+
+addSlider(TabCombat, "Kill Aura Range (Studs)", 6, 30, 16, function(v)
+    Config.KillAuraRange = v
+end)
+
+addSlider(TabCombat, "Kill Aura M1 Cadence (0.24 = Default)", 0.12, 0.45, 0.24, function(v)
+    Config.KillAuraDelay = v
 end)
 
 addButton(TabCombat, "📋 COPY LOG THÔNG SỐ M1 (Bấm sau khi đánh thường 1 cái)", function(btn)
@@ -1549,10 +1706,6 @@ addButton(TabCombat, "📋 COPY LOG THÔNG SỐ M1 (Bấm sau khi đánh thườ
     end)
 end)
 
-addSlider(TabCombat, "Kill Aura Cycle Delay (0.08 = Default)", 0.02, 0.25, 0.08, function(v)
-    Config.KillAuraDelay = v
-end)
-
 addFeatureToggle(TabCombat, "AntiStun", "Anti-Stun (Full Immunity v8)", "ASTUN", false, function(v)
     Config.AntiStunEnabled = v
     if v and State.Char and State.Root and State.Hum then
@@ -1591,7 +1744,7 @@ addFeatureToggle(TabTarget, "AutoTarget", "AutoFarm Player (Zero-Delay Lock)", "
     end
 end)
 
-addFeatureToggle(TabTarget, "TargetFreeMove", "Free Move While Targeting", "TMOVE", true, function(v)
+addFeatureToggle(TabTarget, "TargetFreeMove", "Free Move While Targeting", "TMOVE", false, function(v)
     Config.TargetFreeMove = v
     if not v then State.FreeMoveOffset = Vector3.zero end
 end)
@@ -1631,8 +1784,8 @@ addFeatureToggle(TabTarget, "TeleportPlayer", "Instant Teleport To Player", "TP"
     end
 end)
 
--- // 3. POPULATE VOID & SAFETY TAB
-addFeatureToggle(TabVoid, "AutoVoidKill", "Auto Void Kill (Detect Grab Skill)", "VOIDK", false, function(v)
+-- // 3. POPULATE VOID & SAFETY TAB (ANTI-VOID DEFAULT OFF!)
+addFeatureToggle(TabVoid, "AutoVoidKill", "Auto Void Kill (Skill-Safe Grab Detect)", "VOIDK", false, function(v)
     Config.AutoVoidKill = v
     if not v then
         State.VoidKillActive = false
@@ -1650,7 +1803,7 @@ addButton(TabVoid, "Manual Trigger Void Drop (Test / Instant)", function()
     Config.AutoVoidKill = wasEnabled
 end)
 
-addFeatureToggle(TabVoid, "AntiVoid", "Anti-Void (Auto Rescue & Bounce)", "AVOID", true, function(v)
+addFeatureToggle(TabVoid, "AntiVoid", "Anti-Void (Auto Rescue & Bounce)", "AVOID", false, function(v)
     Config.AntiVoidEnabled = v
 end)
 
@@ -1735,6 +1888,12 @@ end)
 addButton(TabVisual, "Unload & Remove Script (Same as × Button)", function()
     unloadEntireScript()
 end)
+
+-- Mở khóa UI sau khi đã tạo xong toàn bộ nút (đảm bảo 100% không có tính năng nào tự bật khi vừa execute)
+Config.KillAuraEnabled = false
+Config.AutoVoidKill = false
+Config.AntiVoidEnabled = false
+Config.UIInitialized = true
 
 table.insert(State.Connections, Players.PlayerAdded:Connect(function()
     task.wait(0.2)
