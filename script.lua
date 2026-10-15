@@ -1803,7 +1803,7 @@ addButton(TabVoid, "Manual Trigger Void Drop (Test / Instant)", function()
     Config.AutoVoidKill = wasEnabled
 end)
 
-addFeatureToggle(TabVoid, "AntiVoid", "Anti-Void (Auto Rescue & Bounce)", "AVOID", false, function(v)
+addFeatureToggle(TabVoid, "AntiVoid", "Anti-Void (Auto Rescue & Bounce)", "AVOID", true, function(v)
     Config.AntiVoidEnabled = v
 end)
 
@@ -1892,7 +1892,7 @@ end)
 -- Mở khóa UI sau khi đã tạo xong toàn bộ nút (đảm bảo 100% không có tính năng nào tự bật khi vừa execute)
 Config.KillAuraEnabled = false
 Config.AutoVoidKill = false
-Config.AntiVoidEnabled = false
+Config.AntiVoidEnabled = true
 Config.UIInitialized = true
 
 table.insert(State.Connections, Players.PlayerAdded:Connect(function()
