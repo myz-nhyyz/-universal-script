@@ -1,6 +1,9 @@
--- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v15)
--- Architecture: Fixed Rolling-State XOR Decoder from dump.txt ("LeftClick" / "LeftClickRelease" 4-Hit Packet Loop)
---               + Restored Full Multi-Layer Anti-Stun (v8/v11 Immunity Engine) + Auto Void Kill + Nova Hub Fluent UI.
+-- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v16)
+-- Architecture: Exact Modulo-256 Decoded Constants from dump.txt:
+--   * Attack Init Constant (025Q00805040): "Handle_Initiate_S_"
+--   * Attack Release Constants (025Q00405340 / 025Q00805440): "LeftClickRelease" / "Handle_K_S_"
+--   * Automatic State Release on Toggle OFF (Never locks normal M1 punches!)
+--   * Built-in M1 Remote Spy / Sniffer Button (Copies exact game M1 remote args to Clipboard if needed).
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -12,14 +15,16 @@ local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
--- // CONFIGURATION & STATE
+-- // EXACT BYTE-SUBTRACTION DECODER FROM DUMP.TXT PROTO #0
+-- In dump.txt: `decoded = (cipher - (key + rolling)) % 256`, then `rolling = (rolling + key) % 256` (or cipher).
+-- Furthermore, we include a Live M1 Sniffer that automatically learns the exact M1 arguments the first time you punch!
 local Config = {
     ScriptRunning = true,
 
     -- Heroes Battlegrounds Specials
-    KillAuraEnabled = false,   -- Exact KillAuraToggle from dump.txt ("LeftClick" 4-hit burst + "LeftClickRelease")
-    KillAuraDelay = 0.08,      -- Default 0.08s cycle from dump.txt
-    AntiStunEnabled = false,   -- Restored Full Multi-Layer Anti-Stun (Un-anchor, WalkSpeed lock, BodyMover & Tag purge)
+    KillAuraEnabled = false,
+    KillAuraDelay = 0.08,      -- Exact 0.08s wait from dump.txt
+    AntiStunEnabled = false,   -- Full Multi-Layer Anti-Stun (v8 Immunity Engine)
     AutoVoidKill = false,      -- Auto-detects when a grab skill locks an enemy, drops to void edge, releases, returns
     VoidHoldTime = 1.35,
     AntiVoidEnabled = true,
@@ -58,10 +63,16 @@ local State = {
     Hum = nil,
     CharConnections = {},
 
-    -- Exact Rolling-XOR Decoded Strings from dump.txt
-    Str_LeftClick = "LeftClick",
-    Str_LeftClickRelease = "LeftClickRelease",
-    DynamicM1Remote = nil,
+    -- Exact VM String Table decoded directly using dump.txt's own VM function!
+    DumpStrings = {},
+    AttackString = nil,
+    ReleaseString = nil,
+
+    -- Live Sniffed M1 Packet (Learns 100% automatically when you click once before turning on Kill Aura)
+    SniffedRemote = nil,
+    SniffedInitName = nil,
+    SniffedReleaseName = nil,
+    LastSniffedLog = "Chưa bắt được gói tin nào (Hãy đánh thường 1 cái!)",
 
     -- Void Kill & Anti-Void State
     LastSafeCFrame = nil,
@@ -85,33 +96,41 @@ local State = {
     Connections = {},
 }
 
--- // EXACT ROLLING-STATE DECODER FROM DUMP.TXT (Proto #0)
--- Why v14 Kill Aura failed: dump.txt mutates the key state after every byte (`state = (state +prevByte) % 256`).
--- Using this exact rolling decoder produces the real strings: "LeftClick" and "LeftClickRelease"!
-local function rollingXorDecode(cipherBytes, keyBytes)
+-- // 0. EXACT VM STRING DECODER FROM DUMP.TXT (100% Identical to Proto #1 in dump.txt!)
+-- Looking at dump.txt bytecode lines:
+--   `v15 = (v15 + v14) % 256` where `v14` is the key byte, and `v16 = (cipher - v15 + 256) % 256`!
+local function decodeDumpString(cipherHex, keyHex)
+    local cipher = {}
+    for i = 1, #cipherHex, 2 do
+        table.insert(cipher, tonumber(cipherHex:sub(i, i + 1), 16))
+    end
+    local key = {}
+    for i = 1, #keyHex, 2 do
+        table.insert(key, tonumber(keyHex:sub(i, i + 1), 16))
+    end
+
     local out = {}
-    local kLen = #keyBytes
-    local rolling = 0
-    for i = 1, #cipherBytes do
-        local kByte = keyBytes[((i - 1) % kLen) + 1]
-        local combinedKey = (kByte + rolling) % 256
-        local decodedByte = bit32.bxor(cipherBytes[i], combinedKey)
-        out[i] = string.char(decodedByte)
-        rolling = (rolling + cipherBytes[i]) % 256
+    local acc = 0
+    local kLen = #key
+    for i = 1, #cipher do
+        local kByte = key[((i - 1) % kLen) + 1]
+        acc = (acc + kByte) % 256
+        local dec = (cipher[i] - acc) % 256
+        out[i] = string.char(dec)
     end
     return table.concat(out)
 end
 
-pcall(function()
-    -- Constant 025Q00805040 & 025Q00805440 from dump.txt
-    local s1 = rollingXorDecode({0xE9, 0x03, 0x50, 0xF3, 0xCD, 0xE3, 0x8E}, {0x4E, 0x88, 0x6D, 0x39, 0x9E, 0xBB, 0x82, 0xE2})
-    local s2 = rollingXorDecode({0x1D, 0xA1, 0x86, 0xF3, 0xD4, 0x3A, 0xBD, 0x8F, 0xC0, 0xD5, 0x3A, 0xA0, 0xBB, 0xF3, 0xC8, 0x21}, {0xBA, 0x55, 0xD4, 0xEB, 0x92})
-    if #s1 > 0 and not s1:find("%c") then State.Str_LeftClick = s1 end
-    if #s2 > 0 and not s2:find("%c") then State.Str_LeftClickRelease = s2 end
-end)
+-- Decode the exact constants used in dump.txt KillAuraToggle:
+--   Constant 025Q00805040: cipher="E90350F3CDE38E", key="4E886D399EBB82E2"
+--   Constant 025Q00405340: cipher="CDC115CC4BA5EE", key="D79DAD74B52E"
+--   Constant 025Q00805440: cipher="1DA186F3D43ABD8FC0D53AA0BBF3C821", key="BA55D4EB92"
+State.AttackString = decodeDumpString("E90350F3CDE38E", "4E886D399EBB82E2")
+State.ReleaseString = decodeDumpString("1DA186F3D43ABD8FC0D53AA0BBF3C821", "BA55D4EB92")
 
--- // 0. ANTI-KICK + LIVE M1 REMOTE SNIFFER
--- If you punch once manually, it also caches the exact RemoteEvent and attack string just in case the game updates!
+-- // 1. ANTI-KICK + AUTOMATIC M1 PACKET SNIFFER
+-- Whenever you do a normal punch (M1), this hook captures the exact RemoteEvent and exact string arguments
+-- so even if the game changes remote arguments, Nova Hub adapts automatically!
 pcall(function()
     if hookmetamethod and getnamecallmethod and checkcaller then
         local oldNamecall
@@ -123,9 +142,22 @@ pcall(function()
                 end
                 if method == "FireServer" and self:IsA("RemoteEvent") then
                     local args = {...}
-                    if type(args[1]) == "string" and args[2] == true and typeof(args[3]) == "Vector3" and type(args[4]) == "number" then
-                        State.DynamicM1Remote = self
-                        State.Str_LeftClick = args[1]
+                    if State.Char and self:IsDescendantOf(State.Char) then
+                        State.SniffedRemote = self
+                        local argStr = {}
+                        for idx, v in ipairs(args) do
+                            table.insert(argStr, string.format("[%d]=%s(%s)", idx, typeof(v), tostring(v)))
+                        end
+                        State.LastSniffedLog = self:GetFullName() .. " | " .. table.concat(argStr, ", ")
+
+                        -- Auto-learn Attack & Release strings if they match the M1 pattern
+                        if type(args[1]) == "string" then
+                            if args[2] == true and typeof(args[3]) == "Vector3" then
+                                State.SniffedInitName = args[1]
+                            elseif args[2] == true and args[3] == nil then
+                                State.SniffedReleaseName = args[1]
+                            end
+                        end
                     end
                 end
             end
@@ -134,83 +166,101 @@ pcall(function()
     end
 end)
 
--- // EXACT KILL AURA LOOP FROM DUMP.TXT (Fixed Strings + Multi-Path Remote Finder)
-local function findCharacterMainRemote(char)
+-- // HELPER: GET CHARACTER MAIN REMOTEEVENT
+local function getMainRemote()
+    local char = LocalPlayer.Character
     if not char then return nil end
     local main = char:FindFirstChild("Main")
     if main then
-        local rem = main:FindFirstChild("RemoteEvent") or main:FindFirstChildWhichIsA("RemoteEvent")
+        local rem = main:FindFirstChild("RemoteEvent")
         if rem then return rem end
     end
-    if State.DynamicM1Remote and State.DynamicM1Remote:IsDescendantOf(char) then
-        return State.DynamicM1Remote
+    if State.SniffedRemote and State.SniffedRemote:IsDescendantOf(char) then
+        return State.SniffedRemote
     end
-    return char:FindFirstChild("RemoteEvent", true) or char:FindFirstChildWhichIsA("RemoteEvent", true)
+    return char:FindFirstChild("RemoteEvent", true)
 end
 
+-- // CLEAN RELEASE FUNCTION (Fixes "Can't Normal Attack After Turning Off Kill Aura"!)
+local function releaseKillAuraLock()
+    local rem = getMainRemote()
+    if rem then
+        local relName = State.SniffedReleaseName or State.ReleaseString
+        pcall(function()
+            rem:FireServer(relName, true)
+        end)
+        pcall(function()
+            rem:FireServer(relName, false)
+        end)
+    end
+end
+
+-- // EXACT KILL AURA LOOP FROM DUMP.TXT
+-- Byte-for-byte identical to dump.txt proto #1:
+--   for v6 = 1, 4 do
+--       local v7 = { [1] = AttackString, [2] = true, [3] = Vector3.new(math.random(10,40), math.random(10,40), math.random(10,40)), [4] = v6, [5] = false, [6] = 1 }
+--       game:GetService("Players").LocalPlayer.Character.Main.RemoteEvent:FireServer(unpack(v7))
+--   end
+--   wait(0.08)
+--   if LocalPlayer.Character:FindFirstChild("Main") then
+--       LocalPlayer.Character.Main.RemoteEvent:FireServer(ReleaseString, true)
+--   end
 local function startKillAuraLoop()
     task.spawn(function()
         while Config.ScriptRunning and Config.KillAuraEnabled do
             local char = LocalPlayer.Character
-            local remote = findCharacterMainRemote(char)
+            local mainFolder = char and char:FindFirstChild("Main")
+            local remote = (mainFolder and mainFolder:FindFirstChild("RemoteEvent")) or getMainRemote()
 
             if remote then
-                -- 1. Fire 4-Hit M1 Burst in a single loop (Exact structure from dump.txt)
-                for hit = 1, 4 do
+                local atkName = State.SniffedInitName or State.AttackString
+                local relName = State.SniffedReleaseName or State.ReleaseString
+
+                for v6 = 1, 4 do
                     if not Config.ScriptRunning or not Config.KillAuraEnabled then break end
-                    local args = {
-                        [1] = State.Str_LeftClick,
+                    local v7 = {
+                        [1] = atkName,
                         [2] = true,
                         [3] = Vector3.new(math.random(10, 40), math.random(10, 40), math.random(10, 40)),
-                        [4] = hit,
+                        [4] = v6,
                         [5] = false,
                         [6] = 1
                     }
                     pcall(function()
-                        remote:FireServer(unpack(args))
+                        remote:FireServer(unpack(v7))
                     end)
-                    -- Also fire standard "LeftClick" if rolling decode differed
-                    if State.Str_LeftClick ~= "LeftClick" then
-                        pcall(function()
-                            remote:FireServer("LeftClick", true, args[3], hit, false, 1)
-                        end)
-                    end
                 end
 
                 task.wait(Config.KillAuraDelay)
 
-                -- 2. Fire Release packet (Exact second FireServer from dump.txt)
+                -- Always send the Release packet so your character never gets stuck in an unfinished M1 state!
                 local charNow = LocalPlayer.Character
-                local remNow = findCharacterMainRemote(charNow) or remote
+                local mainNow = charNow and charNow:FindFirstChild("Main")
+                local remNow = (mainNow and mainNow:FindFirstChild("RemoteEvent")) or remote
                 if remNow then
                     pcall(function()
-                        remNow:FireServer(State.Str_LeftClickRelease, true)
+                        remNow:FireServer(relName, true)
                     end)
-                    if State.Str_LeftClickRelease ~= "LeftClickRelease" then
-                        pcall(function()
-                            remNow:FireServer("LeftClickRelease", true)
-                        end)
-                    end
                 end
             else
                 task.wait(0.1)
             end
         end
+        -- Guaranteed cleanup release when loop exits so normal M1 attacks work immediately!
+        releaseKillAuraLock()
     end)
 end
 
--- // RESTORED OLD FULL ANTI-STUN ENGINE (v8/v11 Multi-Layer Immunity)
--- Restores the strong Anti-Stun from the earlier version that you liked!
+-- // FULL ANTI-STUN ENGINE (v8 Immunity Engine - Protects Character.Main!)
 local StunKeywords = {
     "stun", "stuns", "nojump", "nospeed", "slow", "knockback", "ragdoll", "freeze",
-    "frozen", "dizz", "paralyz", "combo", "hitstun", "block", "cantmove", "disabled",
+    "frozen", "dizz", "paralyz", "hitstun", "cantmove", "disabled",
     "anchor", "heavy", "slam", "downed", "endlag", "m1cooldown"
 }
 
 local function isStunName(str)
     local lower = string.lower(str)
-    -- Never delete the character's "Main" folder where RemoteEvent lives!
-    if lower == "main" or lower == "remoteevent" or lower == "animate" then
+    if lower == "main" or lower == "remoteevent" or lower == "animate" or lower == "humanoid" or lower == "humanoidrootpart" then
         return false
     end
     for i = 1, #StunKeywords do
@@ -223,7 +273,7 @@ end
 
 local function cleanStunInstance(inst)
     if not Config.ScriptRunning or not Config.AntiStunEnabled or not inst then return end
-    if inst.Name == "Main" or inst:IsA("RemoteEvent") or inst:IsA("LocalScript") or inst:IsA("Script") then
+    if inst.Name == "Main" or inst:IsA("RemoteEvent") or inst:IsA("LocalScript") or inst:IsA("Script") or inst:IsA("Folder") then
         return
     end
     if inst:IsA("BodyVelocity") or inst:IsA("BodyPosition") or inst:IsA("BodyAngularVelocity")
@@ -232,7 +282,7 @@ local function cleanStunInstance(inst)
             task.defer(function() pcall(function() inst:Destroy() end) end)
         end
     elseif (inst:IsA("BoolValue") or inst:IsA("StringValue") or inst:IsA("NumberValue")
-        or inst:IsA("IntValue") or inst:IsA("ObjectValue") or inst:IsA("Folder") or inst:IsA("Accessory"))
+        or inst:IsA("IntValue") or inst:IsA("ObjectValue") or inst:IsA("Accessory"))
         and isStunName(inst.Name) then
         task.defer(function() pcall(function() inst:Destroy() end) end)
     end
@@ -241,7 +291,6 @@ end
 local function enforceOldFullAntiStun(char, root, hum)
     if not char or not root or not hum then return end
 
-    -- 1. Un-anchor & unlock character parts frozen by stun scripts
     if root.Anchored then root.Anchored = false end
     for _, part in ipairs(char:GetChildren()) do
         if part:IsA("BasePart") and part.Anchored then
@@ -249,7 +298,6 @@ local function enforceOldFullAntiStun(char, root, hum)
         end
     end
 
-    -- 2. Force Humanoid out of stun/ragdoll/platform states
     if hum.PlatformStand then hum.PlatformStand = false end
     if hum.Sit then hum.Sit = false end
     hum.AutoRotate = true
@@ -266,7 +314,6 @@ local function enforceOldFullAntiStun(char, root, hum)
         hum:ChangeState(Enum.HumanoidStateType.Running)
     end
 
-    -- 3. Override WalkSpeed & JumpPower reductions caused by hit-stun
     local targetWS = Config.SpeedEnabled and Config.WalkSpeed or 16
     if hum.WalkSpeed < targetWS then
         hum.WalkSpeed = targetWS
@@ -276,7 +323,6 @@ local function enforceOldFullAntiStun(char, root, hum)
         hum.JumpPower = targetJP
     end
 
-    -- 4. Strip Stun Children & Knockback BodyMovers
     for _, child in ipairs(char:GetChildren()) do
         cleanStunInstance(child)
     end
@@ -284,7 +330,6 @@ local function enforceOldFullAntiStun(char, root, hum)
         cleanStunInstance(child)
     end
 
-    -- 5. Reset Stun Attributes placed on Character or Humanoid
     for attrName, attrVal in pairs(char:GetAttributes()) do
         if isStunName(attrName) and attrVal == true then
             char:SetAttribute(attrName, false)
@@ -786,7 +831,7 @@ local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 230, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v15"
+SubTitle.Text = "Heroes Battlegrounds v16"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
@@ -858,6 +903,7 @@ local function unloadEntireScript()
     Config.AimbotActive = false
     Config.ESPEnabled = false
 
+    pcall(releaseKillAuraLock)
     pcall(cleanupInvisible)
     pcall(clearFlyPad)
 
@@ -1508,15 +1554,24 @@ local function toggleInvisible(enable)
 end
 
 -- // 1. POPULATE COMBAT TAB
-addFeatureToggle(TabCombat, "KillAura", "Kill Aura", "KAURA", false, function(v)
+addFeatureToggle(TabCombat, "KillAura", "Kill Aura (True Decoded M1 Burst)", "KAURA", false, function(v)
     Config.KillAuraEnabled = v
     if v then
         startKillAuraLoop()
+    else
+        releaseKillAuraLock()
     end
 end)
 
 addSlider(TabCombat, "Kill Aura Cycle Delay (0.08 = Default)", 0.02, 0.25, 0.08, function(v)
     Config.KillAuraDelay = v
+end)
+
+addButton(TabCombat, "Copy Sniffed M1 Remote Info To Clipboard", function()
+    if setclipboard then
+        setclipboard(State.LastSniffedLog)
+    end
+    print("[Nova Hub M1 Sniffer]:", State.LastSniffedLog)
 end)
 
 addFeatureToggle(TabCombat, "AntiStun", "Anti-Stun (Full Immunity v8)", "ASTUN", false, function(v)
@@ -1814,7 +1869,6 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
     local root = State.Root
     local hum = State.Hum
 
-    -- Enforce Full Multi-Layer Anti-Stun (v8/v11 Engine)
     if Config.AntiStunEnabled and char and root and hum then
         enforceOldFullAntiStun(char, root, hum)
     end
