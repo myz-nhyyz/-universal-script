@@ -1,12 +1,10 @@
--- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v18 - NATIVE FIRESERVER FIX)
--- Architecture:
---   1. Removed __namecall metamethod hook completely to prevent L->namecall register corruption
---      that broke Character.Main:FireServer() for M1 and Skills (1, 2, 3, 4, Q, G, F).
---   2. Native M1 Kill Aura using Workspace.Live[Name].Main.RemoteEvent with 3 selectable modes:
---      - TapLeftClick:  FireServer("LeftClick", nil) -> combo -> FireServer("LeftClick", nil, true)
---      - HoldLeftClick: Holds ("LeftClick", nil) while enemy is in range, releases ("LeftClick", nil, true) on exit/skill
---      - LeftClick+AnimVal: Pairs ("LeftClick", nil) with ("animval", animId, 0.047, os.clock(), nil, root.CFrame, nil, nil, 0)
---   3. Animator.AnimationPlayed tracker + Skill Keybind Pause so Kill Aura never interrupts your skills.
+-- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v20)
+-- Features:
+--   1. Removed Kill Aura completely.
+--   2. Skill 1->4 Name & Duration Logger + 1-Click Copy Log Button.
+--   3. Upgraded Void Kill: Auto flies down to Void on Grab/Skill cast & automatically flies back
+--      to the original safe spot as soon as the skill ends.
+--   4. Anti-Void is ALWAYS ON by default upon script execution.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -23,18 +21,28 @@ local Config = {
     ScriptRunning = true,
     UIInitialized = false,
 
-    -- Heroes Battlegrounds Specials
-    KillAuraEnabled = false,
-    KillAuraMode = "TapLeftClick", -- "TapLeftClick" | "HoldLeftClick" | "LeftClick+AnimVal"
-    KillAuraRange = 16,
-    KillAuraDelay = 0.08,
-    KillAuraFaceTarget = true,
-    AntiStunEnabled = false,
+    -- Void Kill & Skill Logger
+    SkillLoggerEnabled = true,
     AutoVoidKill = false,
-    VoidHoldTime = 1.35,
-    AntiVoidEnabled = true,
+    VoidTriggerMode = "GrabOrSelectedKeys", -- "GrabOrSelectedKeys" | "SelectedKeysOnly" | "GrabOnly"
+    VoidSkillKeys = {
+        ["1"] = false,
+        ["2"] = false,
+        ["3"] = false,
+        ["4"] = false,
+    },
+    VoidStartupDelay = 0.20,   -- Thời gian chờ chiêu tóm trúng người trước khi bay xuống Void (giây)
+    VoidMaxHoldTime = 1.65,    -- Thời gian tối đa ở dưới Void nếu skill chưa tự ngắt (giây)
+    VoidDepthOffset = 38,      -- Độ cao an toàn cách đáy FallenPartsDestroyHeight
+    AntiVoidEnabled = true,    -- LUÔN BẬT SẴN MỖI KHI EXECUTE SCRIPT
 
-    -- Combat / Target
+    -- Danh sách tên Skill kéo (sẽ được cập nhật thêm sau khi bạn gửi log)
+    KnownGrabSkillNames = {
+        -- Bạn gửi log tên skill xong mình sẽ điền chính xác tên các chiêu vào bảng này
+    },
+
+    -- Combat / Protection
+    AntiStunEnabled = false,
     AimbotWidgetOpen = false,
     AimbotActive = false,
     AimPart = "Head",
@@ -69,19 +77,28 @@ local State = {
     Animator = nil,
     CharConnections = {},
 
-    -- Kill Aura State
-    KillAuraLoopRunning = false,
-    IsHoldingM1 = false,
-    LastDetectedM1Anim = "rbxassetid://15322492552",
+    -- Skill 1->4 Logger State
+    DetectedSlotNames = {
+        ["1"] = "Chưa quét",
+        ["2"] = "Chưa quét",
+        ["3"] = "Chưa quét",
+        ["4"] = "Chưa quét",
+    },
+    SkillHistoryLogs = {},
+    LastKeyPressed = nil,
+    LastSkillName = "None",
     LastSkillCastTick = 0,
+    CurrentSkillAnimTrack = nil,
+    CopyBtnRef = nil,
+    SlotStatusLabel = nil,
 
     -- Void Kill & Anti-Void State
     LastSafeCFrame = nil,
     VoidKillActive = false,
+    VoidDropTargetCF = nil,
     VoidReturnCFrame = nil,
-    GrabbedEnemy = nil,
 
-    -- Combat / Movement State
+    -- Movement / Visual State
     FlyPad = nil,
     InfJumpArcActive = false,
     InfJumpArcTimer = 0,
@@ -97,216 +114,377 @@ local State = {
     Connections = {},
 }
 
--- // HELPER: RESOLVE CHARACTER MAIN REMOTEEVENT (BOTH WORKSPACE.LIVE & LOCALPLAYER.CHARACTER)
-local function getCharacterMainRemote()
+-- // HELPER: LÀM SẠCH CHUỖI & KIỂM TRA TÊN SKILL HỢP LỆ
+local function trimString(s)
+    if typeof(s) ~= "string" then return "" end
+    return string.gsub(s, "^%s*(.-)%s*$", "%1")
+end
+
+local function isValidSkillLabelText(txt, slotStr)
+    if #txt < 2 or #txt > 45 then return false end
+    if txt == slotStr or txt == "[" .. slotStr .. "]" then return false end
+    if tonumber(txt) ~= nil then return false end
+    local lower = string.lower(txt)
+    if string.match(lower, "^%d+%.?%d*s$") then return false end -- Bỏ qua số giây hồi chiêu như "12.5s"
+    if lower == "cooldown" or lower == "ready" or lower == "locked" then return false end
+    return true
+end
+
+-- // QUÉT TỰ ĐỘNG TÊN SKILL TỪ 1 -> 4 TRÊN HOTBAR / BACKPACK / CHARACTER
+local function scanHotbarSkills1To4()
+    local found = {
+        ["1"] = nil,
+        ["2"] = nil,
+        ["3"] = nil,
+        ["4"] = nil,
+    }
+
+    -- Cách 1: Quét từ Backpack + Tool đang cầm trên Character
+    local tools = {}
     local char = LocalPlayer.Character or State.Char
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+
+    if backpack then
+        for _, item in ipairs(backpack:GetChildren()) do
+            if item:IsA("Tool") then
+                table.insert(tools, item)
+            end
+        end
+    end
     if char then
-        local main = char:FindFirstChild("Main")
-        local rem = main and main:FindFirstChild("RemoteEvent")
-        if rem and rem:IsA("RemoteEvent") then
-            return rem
+        for _, item in ipairs(char:GetChildren()) do
+            if item:IsA("Tool") then
+                table.insert(tools, item)
+            end
         end
     end
 
-    local live = Workspace:FindFirstChild("Live")
-    local liveChar = live and live:FindFirstChild(LocalPlayer.Name)
-    if liveChar then
-        local main = liveChar:FindFirstChild("Main")
-        local rem = main and main:FindFirstChild("RemoteEvent")
-        if rem and rem:IsA("RemoteEvent") then
-            return rem
+    for idx, tool in ipairs(tools) do
+        local slotAttr = tool:GetAttribute("Slot") or tool:GetAttribute("Key") or tool:GetAttribute("Index")
+        local keyStr = slotAttr and tostring(slotAttr) or tostring(idx)
+        if found[keyStr] == nil and (keyStr == "1" or keyStr == "2" or keyStr == "3" or keyStr == "4") then
+            found[keyStr] = trimString(tool.Name)
         end
     end
 
-    return nil
-end
+    -- Cách 2: Quét sâu trong PlayerGui (Hotbar UI của Heroes Battlegrounds)
+    local pGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if pGui then
+        for _, inst in ipairs(pGui:GetDescendants()) do
+            -- Kiểm tra nếu Frame tên là "1", "2", "3", "4" hoặc "Slot1".."Slot4" / "Move1".."Move4"
+            local instName = trimString(inst.Name)
+            local matchedSlot = string.match(instName, "^[Ss]?[ll]?[oo]?[tt]?([1-4])$") or string.match(instName, "^Move([1-4])$")
 
--- // CLEAN RELEASE FUNCTION (FireServer("LeftClick", nil, true))
-local function releaseM1State()
-    if not State.IsHoldingM1 then return end
-    State.IsHoldingM1 = false
-    pcall(function()
-        local rem = getCharacterMainRemote()
-        if rem then
-            rem:FireServer("LeftClick", nil, true)
-        end
-    end)
-end
+            if matchedSlot and (inst:IsA("Frame") or inst:IsA("ImageButton") or inst:IsA("TextButton") or inst:IsA("ImageLabel")) then
+                for _, child in ipairs(inst:GetDescendants()) do
+                    if child:IsA("TextLabel") or child:IsA("TextButton") then
+                        local t = trimString(child.Text)
+                        if isValidSkillLabelText(t, matchedSlot) then
+                            found[matchedSlot] = found[matchedSlot] or t
+                        end
+                    end
+                end
+            end
 
--- // TÌM MỤC TIÊU GẦN NHẤT TRONG TẦM KILL AURA
-local function getClosestEnemyForAura(maxDist)
-    local myChar = LocalPlayer.Character or State.Char
-    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart") or State.Root
-    if not myChar or not myRoot then return nil, nil end
-
-    local bestModel, bestRoot = nil, nil
-    local shortest = maxDist
-
-    local liveFolder = Workspace:FindFirstChild("Live")
-    if liveFolder then
-        for _, model in ipairs(liveFolder:GetChildren()) do
-            if model ~= myChar and model.Name ~= LocalPlayer.Name and model:IsA("Model") then
-                local eRoot = model:FindFirstChild("HumanoidRootPart")
-                local eHum = model:FindFirstChildOfClass("Humanoid")
-                if eRoot and eHum and eHum.Health > 0 then
-                    local d = (eRoot.Position - myRoot.Position).Magnitude
-                    if d <= shortest then
-                        shortest = d
-                        bestModel = model
-                        bestRoot = eRoot
+            -- Kiểm tra nếu TextLabel hiển thị phím "1", "2", "3", "4" thì lấy TextLabel tên chiêu nằm cùng khung
+            if inst:IsA("TextLabel") or inst:IsA("TextButton") then
+                local txt = trimString(inst.Text)
+                local keyMatch = string.match(txt, "^%[?([1-4])%]?$")
+                if keyMatch and inst.Parent then
+                    local container = inst.Parent
+                    for _, sib in ipairs(container:GetDescendants()) do
+                        if (sib:IsA("TextLabel") or sib:IsA("TextButton")) and sib ~= inst then
+                            local sTxt = trimString(sib.Text)
+                            if isValidSkillLabelText(sTxt, keyMatch) then
+                                found[keyMatch] = found[keyMatch] or sTxt
+                            end
+                        end
+                    end
+                    if not found[keyMatch] and container.Parent and container.Parent:IsA("GuiObject") then
+                        for _, sib in ipairs(container.Parent:GetDescendants()) do
+                            if (sib:IsA("TextLabel") or sib:IsA("TextButton")) and sib ~= inst then
+                                local sTxt = trimString(sib.Text)
+                                if isValidSkillLabelText(sTxt, keyMatch) then
+                                    found[keyMatch] = found[keyMatch] or sTxt
+                                end
+                            end
+                        end
                     end
                 end
             end
         end
     end
 
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer and plr.Character then
-            local eRoot = plr.Character:FindFirstChild("HumanoidRootPart")
-            local eHum = plr.Character:FindFirstChildOfClass("Humanoid")
-            if eRoot and eHum and eHum.Health > 0 then
-                local d = (eRoot.Position - myRoot.Position).Magnitude
-                if d <= shortest then
-                    shortest = d
-                    bestModel = plr.Character
-                    bestRoot = eRoot
-                end
-            end
+    for k = 1, 4 do
+        local sKey = tostring(k)
+        if found[sKey] and #found[sKey] > 0 then
+            State.DetectedSlotNames[sKey] = found[sKey]
         end
     end
 
-    return bestModel, bestRoot
+    if State.SlotStatusLabel and State.SlotStatusLabel.Parent then
+        State.SlotStatusLabel.Text = string.format(
+            "[1]: %s  |  [2]: %s\n[3]: %s  |  [4]: %s",
+            State.DetectedSlotNames["1"],
+            State.DetectedSlotNames["2"],
+            State.DetectedSlotNames["3"],
+            State.DetectedSlotNames["4"]
+        )
+    end
+
+    return State.DetectedSlotNames
 end
 
-local function isCharacterUsingSkill(char)
-    if not char then return false end
-    if (tick() - State.LastSkillCastTick) < 0.45 then
-        return true
+local function getHeroIdentifier()
+    local char = LocalPlayer.Character or State.Char
+    if not char then return "UnknownHero" end
+    local parts = {}
+    for k, v in pairs(char:GetAttributes()) do
+        local lk = string.lower(k)
+        if string.find(lk, "hero") or string.find(lk, "char") or string.find(lk, "class") or string.find(lk, "moveset") then
+            table.insert(parts, k .. "=" .. tostring(v))
+        end
     end
+    if #parts > 0 then
+        return table.concat(parts, ", ")
+    end
+    return char.Name
+end
+
+local function updateCopyButtonCounter()
+    if State.CopyBtnRef and State.CopyBtnRef.Parent then
+        State.CopyBtnRef.Text = string.format("📋 COPY LOG TÊN SKILL 1->4 (Đã lưu: %d dòng)", #State.SkillHistoryLogs)
+    end
+end
+
+local function addSkillLogEntry(slotStr, skillName, extraInfo)
+    if not Config.ScriptRunning or not Config.SkillLoggerEnabled then return end
+    local heroInfo = getHeroIdentifier()
+    local entry = string.format(
+        "[Hero: %s] [Phím %s] Tên Skill: \"%s\" | %s",
+        heroInfo,
+        tostring(slotStr),
+        tostring(skillName),
+        tostring(extraInfo or "")
+    )
+    if State.SkillHistoryLogs[#State.SkillHistoryLogs] == entry then return end
+    table.insert(State.SkillHistoryLogs, entry)
+    updateCopyButtonCounter()
+end
+
+-- // KIỂM TRA NHÂN VẬT ĐANG TRONG HOẠT ẢNH DÙNG SKILL HAY ĐÃ HẾT SKILL
+local function isCharacterStillInSkill(char)
+    if not char then return false end
+
+    -- 1. Kiểm tra Child / Attribute báo hiệu đang tung chiêu của game
     for _, child in ipairs(char:GetChildren()) do
         local n = string.lower(child.Name)
-        if n == "usingmove" or n == "skill" or n == "casting" or n == "action" or n == "move" or n == "inmove" then
+        if n == "usingmove" or n == "skill" or n == "casting" or n == "action" or n == "move" or n == "inmove" or n == "attacking" then
             return true
         end
     end
     if char:GetAttribute("UsingMove") == true or char:GetAttribute("InSkill") == true or char:GetAttribute("Attacking") == true then
         return true
     end
+
+    -- 2. Kiểm tra AnimationTrack của skill vừa tung còn đang chạy không
+    local track = State.CurrentSkillAnimTrack
+    if track and track.IsPlaying then
+        return true
+    end
+
     return false
 end
 
--- // KILL AURA LOOP (ZERO NAMECALL INTERFERENCE - 3 SELECTABLE MODES)
-local function startKillAuraLoop()
-    if State.KillAuraLoopRunning then return end
-    State.KillAuraLoopRunning = true
+-- // KIỂM TRA KHỚP KÉO (GRAB WELD / MOTOR6D / ALIGNPOSITION) VỚI NGƯỜI CHƠI KHÁC
+local function resolveModelFromPart(part)
+    if not part then return nil end
+    local live = Workspace:FindFirstChild("Live")
+    if live and part:IsDescendantOf(live) then
+        local cur = part
+        while cur and cur.Parent ~= live do
+            cur = cur.Parent
+        end
+        if cur and cur:IsA("Model") then
+            return cur
+        end
+    end
+    return part:FindFirstAncestorOfClass("Model")
+end
+
+local function checkGrabJointModel(inst)
+    local myChar = LocalPlayer.Character or State.Char
+    if not myChar then return nil end
+
+    if inst:IsA("Weld") or inst:IsA("WeldConstraint") or inst:IsA("Motor6D") or inst:IsA("JointInstance") or inst:IsA("RigidConstraint") then
+        if inst:IsA("JointInstance") or inst:IsA("WeldConstraint") or inst:IsA("RigidConstraint") then
+            if inst.Enabled == false then return nil end
+        end
+        local p0, p1 = inst.Part0, inst.Part1
+        if p0 and p1 then
+            if p0:IsDescendantOf(myChar) and not p1:IsDescendantOf(myChar) then
+                local enemyModel = resolveModelFromPart(p1)
+                if enemyModel and enemyModel ~= myChar and enemyModel:FindFirstChildOfClass("Humanoid") then
+                    return enemyModel
+                end
+            elseif p1:IsDescendantOf(myChar) and not p0:IsDescendantOf(myChar) then
+                local enemyModel = resolveModelFromPart(p0)
+                if enemyModel and enemyModel ~= myChar and enemyModel:FindFirstChildOfClass("Humanoid") then
+                    return enemyModel
+                end
+            end
+        end
+    elseif inst:IsA("AlignPosition") then
+        local a0, a1 = inst.Attachment0, inst.Attachment1
+        if a0 and a1 then
+            if a0:IsDescendantOf(myChar) and not a1:IsDescendantOf(myChar) then
+                local enemyModel = resolveModelFromPart(a1)
+                if enemyModel and enemyModel ~= myChar and enemyModel:FindFirstChildOfClass("Humanoid") then
+                    return enemyModel
+                end
+            elseif a1:IsDescendantOf(myChar) and not a0:IsDescendantOf(myChar) then
+                local enemyModel = resolveModelFromPart(a0)
+                if enemyModel and enemyModel ~= myChar and enemyModel:FindFirstChildOfClass("Humanoid") then
+                    return enemyModel
+                end
+            end
+        end
+    elseif inst:IsA("ObjectValue") then
+        local lowerName = string.lower(inst.Name)
+        if string.find(lowerName, "grab") or string.find(lowerName, "victim") or string.find(lowerName, "target") or string.find(lowerName, "weld") then
+            if inst.Value and inst.Value:IsA("Model") and inst.Value ~= myChar then
+                return inst.Value
+            elseif inst.Value and inst.Value:IsA("BasePart") and not inst.Value:IsDescendantOf(myChar) then
+                return resolveModelFromPart(inst.Value)
+            elseif inst.Value and inst.Value:IsA("Player") and inst.Value ~= LocalPlayer then
+                return inst.Value.Character
+            end
+        end
+    end
+    return nil
+end
+
+-- // CƠ CHẾ VOID KILL CHÍNH: TỰ BAY XUỐNG VOID & TỰ BAY LẠI VỊ TRÍ CŨ KHI HẾT SKILL
+local function executeVoidKillTrip(reasonText, startupDelayOverride)
+    if not Config.ScriptRunning or State.VoidKillActive or not Config.AutoVoidKill then return end
+    local myChar = LocalPlayer.Character or State.Char
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart") or State.Root
+    local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid") or State.Hum
+    if not myChar or not myRoot or not myHum or myHum.Health <= 0 then return end
+
+    State.VoidKillActive = true
+    -- Lưu ngay tọa độ an toàn trước khi bay xuống Void để bay về
+    State.VoidReturnCFrame = State.LastSafeCFrame or myRoot.CFrame
+
+    local waitBeforeDrop = startupDelayOverride or Config.VoidStartupDelay
 
     task.spawn(function()
-        local clickCount = 0
-        while Config.ScriptRunning and Config.KillAuraEnabled do
-            local char = LocalPlayer.Character or State.Char
-            local root = char and char:FindFirstChild("HumanoidRootPart")
-            local hum = char and char:FindFirstChildOfClass("Humanoid")
-            local remote = getCharacterMainRemote()
+        -- Đợi nhịp ngắn để chiêu kịp tóm dính người chơi
+        if waitBeforeDrop > 0 then
+            task.wait(waitBeforeDrop)
+        end
 
-            if char and root and hum and hum.Health > 0 and remote and not State.VoidKillActive and not isCharacterUsingSkill(char) then
-                local enemyModel, enemyRoot = getClosestEnemyForAura(Config.KillAuraRange)
+        if not Config.ScriptRunning or not Config.AutoVoidKill or not State.Root or not State.Hum or State.Hum.Health <= 0 then
+            State.VoidKillActive = false
+            State.VoidDropTargetCF = nil
+            return
+        end
 
-                if enemyModel and enemyRoot then
-                    if Config.KillAuraFaceTarget and not Config.AutoTargetEnabled then
-                        local aimPos = enemyRoot.Position
-                        local flatLook = Vector3.new(aimPos.X, root.Position.Y, aimPos.Z)
-                        if (flatLook - root.Position).Magnitude > 0.1 then
-                            root.CFrame = CFrame.new(root.Position, flatLook)
-                        end
-                    end
+        local voidHeight = Workspace.FallenPartsDestroyHeight
+        if voidHeight ~= voidHeight or voidHeight < -10000 or voidHeight > 500 then
+            voidHeight = -500
+        end
+        local safeVoidY = voidHeight + Config.VoidDepthOffset
+        local basePos = State.VoidReturnCFrame.Position
+        State.VoidDropTargetCF = CFrame.new(basePos.X, safeVoidY, basePos.Z)
 
-                    if Config.KillAuraMode == "HoldLeftClick" then
-                        if not State.IsHoldingM1 then
-                            State.IsHoldingM1 = true
-                            pcall(function()
-                                remote:FireServer("LeftClick", nil)
-                            end)
-                        end
-                        task.wait(0.08)
+        local dropStartTick = tick()
+        local minStayInVoid = 0.40 -- Giữ tối thiểu 0.4s ở dưới Void để địch kịp rơi/chết
 
-                    elseif Config.KillAuraMode == "TapLeftClick" then
-                        State.IsHoldingM1 = true
-                        clickCount = clickCount + 1
+        while Config.ScriptRunning and Config.AutoVoidKill and State.Root and State.Hum and State.Hum.Health > 0 do
+            local elapsed = tick() - dropStartTick
+            if elapsed >= Config.VoidMaxHoldTime then
+                break
+            end
 
-                        pcall(function()
-                            remote:FireServer("LeftClick", nil)
-                        end)
+            if State.Root.Anchored then
+                State.Root.Anchored = false
+            end
+            State.Root.CFrame = State.VoidDropTargetCF
+            State.Root.AssemblyLinearVelocity = Vector3.zero
+            State.Root.AssemblyAngularVelocity = Vector3.zero
 
-                        if clickCount >= 4 then
-                            clickCount = 0
-                            task.wait(0.04)
-                            pcall(function()
-                                remote:FireServer("LeftClick", nil, true)
-                            end)
-                            State.IsHoldingM1 = false
-                        end
+            -- Khi đã qua thời gian tối thiểu và Skill đã kết thúc -> Thoát vòng lặp để bay về mặt đất ngay!
+            if elapsed >= minStayInVoid and not isCharacterStillInSkill(State.Char) then
+                break
+            end
 
-                        task.wait(Config.KillAuraDelay)
+            RunService.Heartbeat:Wait()
+        end
 
-                    elseif Config.KillAuraMode == "LeftClick+AnimVal" then
-                        State.IsHoldingM1 = true
-                        clickCount = clickCount + 1
+        State.VoidDropTargetCF = nil
 
-                        pcall(function()
-                            remote:FireServer("LeftClick", nil)
-                        end)
-
-                        task.wait(0.045)
-
-                        pcall(function()
-                            if root and root.Parent then
-                                remote:FireServer(
-                                    "animval",
-                                    State.LastDetectedM1Anim,
-                                    0.04699999839067459,
-                                    os.clock(),
-                                    nil,
-                                    root.CFrame,
-                                    nil,
-                                    nil,
-                                    0
-                                )
-                            end
-                        end)
-
-                        if clickCount >= 4 then
-                            clickCount = 0
-                            task.wait(0.035)
-                            pcall(function()
-                                remote:FireServer("LeftClick", nil, true)
-                            end)
-                            State.IsHoldingM1 = false
-                        end
-
-                        task.wait(math.max(0.03, Config.KillAuraDelay - 0.045))
-                    end
-                else
-                    if State.IsHoldingM1 then
-                        releaseM1State()
-                        clickCount = 0
-                    end
-                    task.wait(0.06)
+        -- Tự động bay ngược về vị trí cũ khi skill đã hết
+        if State.Root and State.VoidReturnCFrame then
+            for _ = 1, 10 do
+                if State.Root.Anchored then
+                    State.Root.Anchored = false
                 end
-            else
-                if State.IsHoldingM1 then
-                    releaseM1State()
-                    clickCount = 0
-                end
-                task.wait(0.06)
+                State.Root.CFrame = State.VoidReturnCFrame + Vector3.new(0, 3.5, 0)
+                State.Root.AssemblyLinearVelocity = Vector3.zero
+                State.Root.AssemblyAngularVelocity = Vector3.zero
+                RunService.RenderStepped:Wait()
             end
         end
 
-        State.KillAuraLoopRunning = false
-        releaseM1State()
+        State.VoidKillActive = false
     end)
 end
 
--- // FULL ANTI-STUN ENGINE (Protects Character.Main & Skills)
+-- // KIỂM TRA XEM TÊN SKILL CÓ NẰM TRONG DANH SÁCH SKILL KÉO KHÔNG
+local function isMatchedGrabSkillName(skillName)
+    if typeof(skillName) ~= "string" or #skillName == 0 then return false end
+    local lower = string.lower(skillName)
+    for _, targetName in ipairs(Config.KnownGrabSkillNames) do
+        if string.find(lower, string.lower(targetName), 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+-- // XỬ LÝ KHI NGƯỜI CHƠI BẤM PHÍM SKILL 1 -> 4
+local KeyMap1To4 = {
+    [Enum.KeyCode.One]   = "1",
+    [Enum.KeyCode.Two]   = "2",
+    [Enum.KeyCode.Three] = "3",
+    [Enum.KeyCode.Four]  = "4",
+}
+
+local function onSkillSlotTriggered(slotStr)
+    State.LastKeyPressed = slotStr
+    State.LastSkillCastTick = tick()
+
+    local slots = scanHotbarSkills1To4()
+    local skillName = slots[slotStr] or ("Skill_" .. slotStr)
+    State.LastSkillName = skillName
+
+    addSkillLogEntry(slotStr, skillName, "Triggered via Key " .. slotStr)
+
+    -- Nếu bật Auto Void Kill và phím này được tích chọn (hoặc tên skill nằm trong KnownGrabSkillNames)
+    if Config.AutoVoidKill and not State.VoidKillActive then
+        local keyEnabled = (Config.VoidSkillKeys[slotStr] == true)
+        local nameMatched = isMatchedGrabSkillName(skillName)
+
+        if Config.VoidTriggerMode == "SelectedKeysOnly" or Config.VoidTriggerMode == "GrabOrSelectedKeys" then
+            if keyEnabled or nameMatched then
+                executeVoidKillTrip("Skill Key " .. slotStr .. " (" .. skillName .. ")", Config.VoidStartupDelay)
+            end
+        end
+    end
+end
+
+-- // FULL ANTI-STUN ENGINE
 local StunKeywords = {
     "stun", "stuns", "nojump", "nospeed", "slow", "knockback", "ragdoll", "freeze",
     "frozen", "dizz", "paralyz", "hitstun", "cantmove", "disabled",
@@ -346,9 +524,9 @@ end
 local function enforceOldFullAntiStun(char, root, hum)
     if not char or not root or not hum then return end
 
-    if root.Anchored and not isCharacterUsingSkill(char) then root.Anchored = false end
+    if root.Anchored and not isCharacterStillInSkill(char) then root.Anchored = false end
     for _, part in ipairs(char:GetChildren()) do
-        if part:IsA("BasePart") and part.Anchored and not isCharacterUsingSkill(char) then
+        if part:IsA("BasePart") and part.Anchored and not isCharacterStillInSkill(char) then
             part.Anchored = false
         end
     end
@@ -397,141 +575,41 @@ local function enforceOldFullAntiStun(char, root, hum)
     end
 end
 
--- // GRAB DETECTION CHO VOID KILL
-local function checkGrabJoint(inst)
-    local myChar = State.Char
-    local myRoot = State.Root
-    if not myChar or not myRoot then return nil end
-
-    if inst:IsA("Weld") or inst:IsA("WeldConstraint") or inst:IsA("Motor6D") or inst:IsA("JointInstance") then
-        if not inst.Enabled then return nil end
-        local p0, p1 = inst.Part0, inst.Part1
-        if p0 and p1 then
-            if p0:IsDescendantOf(myChar) and not p1:IsDescendantOf(myChar) then
-                local model = p1:FindFirstAncestorOfClass("Model")
-                local plr = model and Players:GetPlayerFromCharacter(model)
-                if plr and plr ~= LocalPlayer then
-                    return plr
-                end
-            elseif p1:IsDescendantOf(myChar) and not p0:IsDescendantOf(myChar) then
-                local model = p0:FindFirstAncestorOfClass("Model")
-                local plr = model and Players:GetPlayerFromCharacter(model)
-                if plr and plr ~= LocalPlayer then
-                    return plr
-                end
-            end
-        end
-    elseif inst:IsA("ObjectValue") then
-        local lowerName = string.lower(inst.Name)
-        if string.find(lowerName, "grab") or string.find(lowerName, "victim") then
-            if inst.Value and inst.Value:IsA("Model") then
-                return Players:GetPlayerFromCharacter(inst.Value)
-            elseif inst.Value and inst.Value:IsA("Player") then
-                return inst.Value
-            end
-        end
-    end
-    return nil
-end
-
--- // TRIGGER VOID KILL SEQUENCE
-local function executeVoidKillSequence(enemyPlayer)
-    if not Config.ScriptRunning or State.VoidKillActive or not Config.AutoVoidKill then return end
-    if not enemyPlayer or not enemyPlayer.Character then return end
-    local myRoot = State.Root
-    local myHum = State.Hum
-    if not myRoot or not myHum or myHum.Health <= 0 then return end
-
-    State.VoidKillActive = true
-    State.GrabbedEnemy = enemyPlayer
-    State.VoidReturnCFrame = State.LastSafeCFrame or myRoot.CFrame
-
-    local voidHeight = Workspace.FallenPartsDestroyHeight
-    if voidHeight ~= voidHeight or voidHeight < -10000 or voidHeight > 500 then
-        voidHeight = -500
-    end
-    local safeHoverY = voidHeight + 42
-    local dropXZ = Vector3.new(myRoot.Position.X, safeHoverY, myRoot.Position.Z)
-
-    task.spawn(function()
-        task.wait(0.12)
-
-        local startTime = tick()
-        local maxDuration = Config.VoidHoldTime
-
-        while (tick() - startTime) < maxDuration and Config.ScriptRunning and Config.AutoVoidKill and State.Root and State.Hum and State.Hum.Health > 0 do
-            local eChar = enemyPlayer and enemyPlayer.Character
-            local eRoot = eChar and eChar:FindFirstChild("HumanoidRootPart")
-            local eHum = eChar and eChar:FindFirstChildOfClass("Humanoid")
-
-            State.Root.CFrame = CFrame.new(dropXZ) * CFrame.Angles(math.rad(-85), 0, 0)
-            State.Root.AssemblyLinearVelocity = Vector3.zero
-            State.Root.AssemblyAngularVelocity = Vector3.zero
-
-            if (tick() - startTime) > 0.35 then
-                if not eRoot or not eHum or eHum.Health <= 0 or eRoot.Position.Y <= (voidHeight + 8) then
-                    break
-                end
-                if (eRoot.Position - State.Root.Position).Magnitude > 22 then
-                    break
-                end
-            end
-
-            RunService.Heartbeat:Wait()
-        end
-
-        if State.Root and State.VoidReturnCFrame then
-            for i = 1, 5 do
-                State.Root.CFrame = State.VoidReturnCFrame + Vector3.new(0, 3, 0)
-                State.Root.AssemblyLinearVelocity = Vector3.zero
-                State.Root.AssemblyAngularVelocity = Vector3.zero
-                RunService.RenderStepped:Wait()
-            end
-        end
-
-        State.GrabbedEnemy = nil
-        State.VoidKillActive = false
-    end)
-end
-
+-- // QUÉT KHỚP KÉO XUNG QUANH CHO CHẾ ĐỘ GRAB DETECT
 local function scanProximityGrab()
     if not Config.ScriptRunning or not Config.AutoVoidKill or State.VoidKillActive then return end
-    local myChar = State.Char
-    local myRoot = State.Root
-    local myHum = State.Hum
-    if not myChar or not myRoot or not myHum then return end
+    if Config.VoidTriggerMode == "SelectedKeysOnly" then return end
 
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer and plr.Character then
-            local eRoot = plr.Character:FindFirstChild("HumanoidRootPart")
-            local eHum = plr.Character:FindFirstChildOfClass("Humanoid")
-            if eRoot and eHum and eHum.Health > 0 then
-                local dist = (eRoot.Position - myRoot.Position).Magnitude
-                if dist <= 7.5 then
-                    local hasRealGrabWeld = false
-                    for _, child in ipairs(plr.Character:GetDescendants()) do
-                        if (child:IsA("Weld") or child:IsA("WeldConstraint") or child:IsA("Motor6D")) and child.Enabled then
-                            local p0, p1 = child.Part0, child.Part1
-                            if (p0 and p0:IsDescendantOf(myChar)) or (p1 and p1:IsDescendantOf(myChar)) then
-                                hasRealGrabWeld = true
-                                break
+    local myChar = LocalPlayer.Character or State.Char
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart") or State.Root
+    if not myChar or not myRoot then return end
+
+    for _, desc in ipairs(myChar:GetDescendants()) do
+        local victimModel = checkGrabJointModel(desc)
+        if victimModel then
+            if State.LastKeyPressed then
+                addSkillLogEntry(State.LastKeyPressed, State.LastSkillName, "PHÁT HIỆN KHỚP KÉO (GRAB WELD) -> Target: " .. tostring(victimModel.Name))
+            end
+            executeVoidKillTrip("Grab Joint Detected", 0.05)
+            return
+        end
+    end
+
+    local liveFolder = Workspace:FindFirstChild("Live")
+    if liveFolder then
+        for _, enemyModel in ipairs(liveFolder:GetChildren()) do
+            if enemyModel ~= myChar and enemyModel.Name ~= LocalPlayer.Name and enemyModel:IsA("Model") then
+                local eRoot = enemyModel:FindFirstChild("HumanoidRootPart")
+                local eHum = enemyModel:FindFirstChildOfClass("Humanoid")
+                if eRoot and eHum and eHum.Health > 0 and (eRoot.Position - myRoot.Position).Magnitude <= 10.5 then
+                    for _, desc in ipairs(enemyModel:GetDescendants()) do
+                        if checkGrabJointModel(desc) then
+                            if State.LastKeyPressed then
+                                addSkillLogEntry(State.LastKeyPressed, State.LastSkillName, "PHÁT HIỆN KHỚP KÉO TRÊN ĐỊCH -> Target: " .. tostring(enemyModel.Name))
                             end
+                            executeVoidKillTrip("Enemy Grab Joint", 0.05)
+                            return
                         end
-                    end
-                    if not hasRealGrabWeld then
-                        for _, child in ipairs(myChar:GetDescendants()) do
-                            if (child:IsA("Weld") or child:IsA("WeldConstraint") or child:IsA("Motor6D")) and child.Enabled then
-                                local p0, p1 = child.Part0, child.Part1
-                                if (p0 and p0:IsDescendantOf(plr.Character)) or (p1 and p1:IsDescendantOf(plr.Character)) then
-                                    hasRealGrabWeld = true
-                                    break
-                                end
-                            end
-                        end
-                    end
-                    if hasRealGrabWeld then
-                        executeVoidKillSequence(plr)
-                        return
                     end
                 end
             end
@@ -552,17 +630,28 @@ local function bindCharacter(char)
 
     if not State.Root or not State.Hum then return end
 
-    -- Track M1 animation IDs safely via Animator signal (no metamethod hooks!)
+    task.delay(0.6, function()
+        if Config.ScriptRunning then
+            scanHotbarSkills1To4()
+        end
+    end)
+
+    -- Theo dõi Animation của Skill từ 1->4 để biết chính xác khi nào Skill kết thúc
     task.spawn(function()
         local animator = State.Hum:WaitForChild("Animator", 5)
         if animator and Config.ScriptRunning then
             State.Animator = animator
             table.insert(State.CharConnections, animator.AnimationPlayed:Connect(function(track)
                 pcall(function()
-                    local anim = track and track.Animation
-                    local id = anim and anim.AnimationId
-                    if typeof(id) == "string" and #id > 0 and track.Priority == Enum.AnimationPriority.Action then
-                        State.LastDetectedM1Anim = id
+                    if (tick() - State.LastSkillCastTick) <= 1.5 and State.LastKeyPressed then
+                        State.CurrentSkillAnimTrack = track
+                        local animId = track.Animation and track.Animation.AnimationId or "nil"
+                        local len = track.Length or 0
+                        addSkillLogEntry(
+                            State.LastKeyPressed,
+                            State.LastSkillName,
+                            string.format("AnimID=%s | Duration=%.2fs", tostring(animId), len)
+                        )
                     end
                 end)
             end))
@@ -571,14 +660,36 @@ local function bindCharacter(char)
 
     table.insert(State.CharConnections, char.DescendantAdded:Connect(function(inst)
         if not Config.ScriptRunning then return end
+
+        -- Nếu game dùng cơ chế gắn Tool vào Character khi bấm 1->4
+        if inst:IsA("Tool") then
+            local slotKey = State.LastKeyPressed or "?"
+            State.LastSkillName = inst.Name
+            State.LastSkillCastTick = tick()
+            addSkillLogEntry(slotKey, inst.Name, "Equipped Skill Tool")
+        end
+
+        -- Ghi nhận nếu có Weld/Motor6D nối vào địch trong lúc dùng skill
+        if (tick() - State.LastSkillCastTick) <= 4.0 and State.LastKeyPressed then
+            if inst:IsA("Weld") or inst:IsA("WeldConstraint") or inst:IsA("Motor6D") then
+                task.defer(function()
+                    local victim = checkGrabJointModel(inst)
+                    if victim then
+                        addSkillLogEntry(State.LastKeyPressed, State.LastSkillName, string.format("KHỚP KÉO (%s) dính vào %s", inst.Name, victim.Name))
+                    end
+                end)
+            end
+        end
+
         if Config.AntiStunEnabled then
             cleanStunInstance(inst)
         end
-        if Config.AutoVoidKill and not State.VoidKillActive then
+
+        if Config.AutoVoidKill and not State.VoidKillActive and Config.VoidTriggerMode ~= "SelectedKeysOnly" then
             task.defer(function()
-                local victim = checkGrabJoint(inst)
+                local victim = checkGrabJointModel(inst)
                 if victim then
-                    executeVoidKillSequence(victim)
+                    executeVoidKillTrip("Instant Descendant Grab", 0.05)
                 end
             end)
         end
@@ -868,7 +979,7 @@ makeDraggable(AimPopBtn, AimbotPopup, function()
     setAimbotActiveState(not Config.AimbotActive)
 end)
 
--- // 3. FLUENT ACRYLIC MAIN WINDOW (NOVA HUB v18)
+-- // 3. FLUENT ACRYLIC MAIN WINDOW (NOVA HUB v20)
 local NormalSize = UDim2.new(0, 560, 0, 360)
 
 local MainFrame = Instance.new("Frame")
@@ -926,10 +1037,10 @@ GreenBadge.Parent = TopBar
 Instance.new("UICorner", GreenBadge).CornerRadius = UDim.new(1, 0)
 
 local SubTitle = Instance.new("TextLabel")
-SubTitle.Size = UDim2.new(0, 250, 1, 0)
+SubTitle.Size = UDim2.new(0, 270, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v18 (M1 & Skill Fixed)"
+SubTitle.Text = "Heroes Battlegrounds v20 (Skill 1-4 Log & Void)"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
@@ -993,14 +1104,12 @@ local function unloadEntireScript()
     Config.FlyEnabled = false
     Config.InfJumpEnabled = false
     Config.AutoTargetEnabled = false
-    Config.KillAuraEnabled = false
     Config.AutoVoidKill = false
     Config.AntiVoidEnabled = false
     Config.AntiStunEnabled = false
     Config.AimbotActive = false
     Config.ESPEnabled = false
 
-    pcall(releaseM1State)
     pcall(cleanupInvisible)
     pcall(clearFlyPad)
 
@@ -1066,10 +1175,10 @@ local SectionHeader = Instance.new("TextLabel")
 SectionHeader.Size = UDim2.new(1, 0, 0, 32)
 SectionHeader.Position = UDim2.new(0, 4, 0, 0)
 SectionHeader.BackgroundTransparency = 1
-SectionHeader.Text = "Combat"
+SectionHeader.Text = "Void Kill & Skill Log"
 SectionHeader.TextColor3 = Color3.fromRGB(245, 247, 252)
 SectionHeader.Font = Enum.Font.GothamBold
-SectionHeader.TextSize = 22
+SectionHeader.TextSize = 20
 SectionHeader.TextXAlignment = Enum.TextXAlignment.Left
 SectionHeader.Parent = ContentArea
 
@@ -1471,10 +1580,10 @@ local function addDropdown(parent, label, options, defaultIndex, callback)
     }
 end
 
-local function addButton(parent, text, callback)
+local function addButton(parent, text, bgColor, callback)
     local Btn = Instance.new("TextButton")
     Btn.Size = UDim2.new(1, 0, 0, 38)
-    Btn.BackgroundColor3 = Color3.fromRGB(45, 95, 165)
+    Btn.BackgroundColor3 = bgColor or Color3.fromRGB(45, 95, 165)
     Btn.BackgroundTransparency = 0.1
     Btn.Text = text
     Btn.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -1562,9 +1671,9 @@ local function addSlider(parent, label, minVal, maxVal, defaultVal, callback)
 end
 
 -- // CREATE SIDEBAR TABS
+local TabVoid   = createTab("Void Kill & Log", "🌀")
 local TabCombat = createTab("Combat", "⚔")
 local TabTarget = createTab("AutoFarm", "◇")
-local TabVoid   = createTab("Void & Safety", "🌀")
 local TabMove   = createTab("LocalPlayer", "👤")
 local TabVisual = createTab("Settings", "⚙")
 
@@ -1654,33 +1763,152 @@ local function toggleInvisible(enable)
     end
 end
 
--- // 1. POPULATE COMBAT TAB
-addFeatureToggle(TabCombat, "KillAura", "Kill Aura (Native M1 - Safe for Skills)", "KAURA", false, function(v)
-    Config.KillAuraEnabled = v
-    if v then
-        startKillAuraLoop()
+-- // 1. POPULATE VOID KILL & SKILL LOG TAB
+local SlotPreviewCard = Instance.new("Frame")
+SlotPreviewCard.Size = UDim2.new(1, 0, 0, 48)
+SlotPreviewCard.BackgroundColor3 = Color3.fromRGB(28, 32, 42)
+SlotPreviewCard.BackgroundTransparency = 0.15
+SlotPreviewCard.BorderSizePixel = 0
+SlotPreviewCard.Parent = TabVoid
+Instance.new("UICorner", SlotPreviewCard).CornerRadius = UDim.new(0, 6)
+
+local SlotPreviewStroke = Instance.new("UIStroke", SlotPreviewCard)
+SlotPreviewStroke.Color = Color3.fromRGB(65, 165, 245)
+SlotPreviewStroke.Transparency = 0.35
+SlotPreviewStroke.Thickness = 1
+
+State.SlotStatusLabel = Instance.new("TextLabel")
+State.SlotStatusLabel.Size = UDim2.new(1, -20, 1, -8)
+State.SlotStatusLabel.Position = UDim2.new(0, 10, 0, 4)
+State.SlotStatusLabel.BackgroundTransparency = 1
+State.SlotStatusLabel.Text = "[1]: Chưa quét  |  [2]: Chưa quét\n[3]: Chưa quét  |  [4]: Chưa quét"
+State.SlotStatusLabel.TextColor3 = Color3.fromRGB(165, 225, 255)
+State.SlotStatusLabel.Font = Enum.Font.GothamSemibold
+State.SlotStatusLabel.TextSize = 11
+State.SlotStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+State.SlotStatusLabel.Parent = SlotPreviewCard
+
+addButton(TabVoid, "🔍 QUÉT & LƯU NGAY TÊN 4 SKILL HIỆN TẠI (1 -> 4)", Color3.fromRGB(45, 125, 185), function(btn)
+    local slots = scanHotbarSkills1To4()
+    for k = 1, 4 do
+        local sKey = tostring(k)
+        addSkillLogEntry(sKey, slots[sKey] or "Unknown", "Manual Hotbar Scan")
+    end
+    btn.Text = "✅ ĐÃ LƯU TÊN 4 SKILL HIỆN TẠI VÀO LOG!"
+    task.delay(1.8, function()
+        if btn and btn.Parent then
+            btn.Text = "🔍 QUÉT & LƯU NGAY TÊN 4 SKILL HIỆN TẠI (1 -> 4)"
+        end
+    end)
+end)
+
+State.CopyBtnRef = addButton(TabVoid, "📋 COPY LOG TÊN SKILL 1->4 (Đã lưu: 0 dòng)", Color3.fromRGB(35, 140, 95), function(btn)
+    local slots = scanHotbarSkills1To4()
+    local report = "=== NOVA HUB v20 - SKILL 1->4 LOG REPORT ===\n"
+    report = report .. "Current Hero: " .. getHeroIdentifier() .. "\n"
+    report = report .. string.format(
+        "Current Hotbar Slots:\n  Skill 1: \"%s\"\n  Skill 2: \"%s\"\n  Skill 3: \"%s\"\n  Skill 4: \"%s\"\n",
+        tostring(slots["1"]),
+        tostring(slots["2"]),
+        tostring(slots["3"]),
+        tostring(slots["4"])
+    )
+    report = report .. "--------------------------------------------\n"
+    report = report .. "Recorded Skill History (1 -> 4):\n"
+    if #State.SkillHistoryLogs > 0 then
+        report = report .. table.concat(State.SkillHistoryLogs, "\n")
     else
-        releaseM1State()
+        report = report .. "(Hãy bấm phím 1, 2, 3, 4 hoặc bấm nút Quét ở trên trước khi Copy!)"
+    end
+
+    local copied = false
+    pcall(function()
+        if setclipboard then
+            setclipboard(report)
+            copied = true
+        elseif toclipboard then
+            toclipboard(report)
+            copied = true
+        end
+    end)
+
+    if copied then
+        btn.Text = "✅ ĐÃ COPY LOG! (Dán Ctrl+V gửi cho mình nhé)"
+        btn.BackgroundColor3 = Color3.fromRGB(45, 175, 100)
+    else
+        btn.Text = "⚠️ Executor không có setclipboard (Đã in ra F9)"
+        print(report)
+    end
+
+    task.delay(2.5, function()
+        if btn and btn.Parent then
+            btn.BackgroundColor3 = Color3.fromRGB(35, 140, 95)
+            updateCopyButtonCounter()
+        end
+    end)
+end)
+
+addButton(TabVoid, "🗑️ XÓA LOG CŨ (Để test nhân vật khác)", Color3.fromRGB(130, 50, 55), function(btn)
+    State.SkillHistoryLogs = {}
+    updateCopyButtonCounter()
+    btn.Text = "✅ ĐÃ XÓA SẠCH LOG!"
+    task.delay(1.5, function()
+        if btn and btn.Parent then
+            btn.Text = "🗑️ XÓA LOG CŨ (Để test nhân vật khác)"
+        end
+    end)
+end)
+
+addFeatureToggle(TabVoid, "AntiVoid", "Anti-Void (Luôn Bật Sẵn Khi Execute)", "AVOID", true, function(v)
+    Config.AntiVoidEnabled = v
+end)
+
+addFeatureToggle(TabVoid, "AutoVoidKill", "Auto Void Kill (Bay xuống Void & Tự bay về khi hết Skill)", "VOIDK", false, function(v)
+    Config.AutoVoidKill = v
+    if not v then
+        State.VoidKillActive = false
+        State.VoidDropTargetCF = nil
     end
 end)
 
-addDropdown(TabCombat, "Kill Aura Mode", {"TapLeftClick", "HoldLeftClick", "LeftClick+AnimVal"}, 1, function(mode)
-    releaseM1State()
-    Config.KillAuraMode = mode
+addDropdown(TabVoid, "Chế độ kích hoạt Void Kill", {"GrabOrSelectedKeys", "SelectedKeysOnly", "GrabOnly"}, 1, function(mode)
+    Config.VoidTriggerMode = mode
 end)
 
-addFeatureToggle(TabCombat, "KillAuraFace", "Auto Face Enemy On Kill Aura", "KFACE", true, function(v)
-    Config.KillAuraFaceTarget = v
+addFeatureToggle(TabVoid, "VoidKey1", "Tự bay xuống Void khi dùng Skill [1]", "VK1", false, function(v)
+    Config.VoidSkillKeys["1"] = v
 end)
 
-addSlider(TabCombat, "Kill Aura Range (Studs)", 6, 30, 16, function(v)
-    Config.KillAuraRange = v
+addFeatureToggle(TabVoid, "VoidKey2", "Tự bay xuống Void khi dùng Skill [2]", "VK2", false, function(v)
+    Config.VoidSkillKeys["2"] = v
 end)
 
-addSlider(TabCombat, "Kill Aura Delay (0.08 = Default)", 0.03, 0.25, 0.08, function(v)
-    Config.KillAuraDelay = v
+addFeatureToggle(TabVoid, "VoidKey3", "Tự bay xuống Void khi dùng Skill [3]", "VK3", false, function(v)
+    Config.VoidSkillKeys["3"] = v
 end)
 
+addFeatureToggle(TabVoid, "VoidKey4", "Tự bay xuống Void khi dùng Skill [4]", "VK4", false, function(v)
+    Config.VoidSkillKeys["4"] = v
+end)
+
+addSlider(TabVoid, "Delay chờ Skill tóm trước khi xuống Void (s)", 0.05, 0.80, 0.20, function(v)
+    Config.VoidStartupDelay = v
+end)
+
+addSlider(TabVoid, "Thời gian tối đa giữ ở dưới Void (s)", 0.50, 3.50, 1.65, function(v)
+    Config.VoidMaxHoldTime = v
+end)
+
+addButton(TabVoid, "⚡ Test Bay Xuống Void & Tự Bay Về Ngay", Color3.fromRGB(70, 85, 155), function()
+    local wasEnabled = Config.AutoVoidKill
+    Config.AutoVoidKill = true
+    executeVoidKillTrip("Manual Test Button", 0.05)
+    task.delay(0.2, function()
+        Config.AutoVoidKill = wasEnabled
+    end)
+end)
+
+-- // 2. POPULATE COMBAT TAB (ĐÃ BỎ KILL AURA)
 addFeatureToggle(TabCombat, "AntiStun", "Anti-Stun (Full Immunity v8)", "ASTUN", false, function(v)
     Config.AntiStunEnabled = v
     if v and State.Char and State.Root and State.Hum then
@@ -1698,7 +1926,7 @@ addDropdown(TabCombat, "Select Aimbot Part", {"Head", "HumanoidRootPart"}, 1, fu
     Config.AimPart = part
 end)
 
--- // 2. POPULATE AUTOFARM / AUTOTARGET TAB
+-- // 3. POPULATE AUTOFARM / AUTOTARGET TAB
 local function getPlayerNames()
     local list = {}
     for _, p in ipairs(Players:GetPlayers()) do
@@ -1757,29 +1985,6 @@ addFeatureToggle(TabTarget, "TeleportPlayer", "Instant Teleport To Player", "TP"
             end
         end)
     end
-end)
-
--- // 3. POPULATE VOID & SAFETY TAB
-addFeatureToggle(TabVoid, "AutoVoidKill", "Auto Void Kill (Skill-Safe Grab Detect)", "VOIDK", false, function(v)
-    Config.AutoVoidKill = v
-    if not v then
-        State.VoidKillActive = false
-    end
-end)
-
-addSlider(TabVoid, "Void Hold Duration (Seconds)", 0.5, 3.5, 1.35, function(v)
-    Config.VoidHoldTime = v
-end)
-
-addButton(TabVoid, "Manual Trigger Void Drop (Test / Instant)", function()
-    local wasEnabled = Config.AutoVoidKill
-    Config.AutoVoidKill = true
-    executeVoidKillSequence(findNearestValidPlayer())
-    Config.AutoVoidKill = wasEnabled
-end)
-
-addFeatureToggle(TabVoid, "AntiVoid", "Anti-Void (Auto Rescue & Bounce)", "AVOID", true, function(v)
-    Config.AntiVoidEnabled = v
 end)
 
 -- // 4. POPULATE LOCALPLAYER (MOVEMENT) TAB
@@ -1856,18 +2061,19 @@ addFeatureToggle(TabVisual, "ESP", "Player ESP (Throttled Zero-Lag)", "ESP", fal
     end
 end)
 
-addButton(TabVisual, "Refresh Player Dropdown", function()
+addButton(TabVisual, "Refresh Player Dropdown", nil, function()
     PlayerDropdown.Refresh(getPlayerNames())
 end)
 
-addButton(TabVisual, "Unload & Remove Script (Same as × Button)", function()
+addButton(TabVisual, "Unload & Remove Script (Same as × Button)", Color3.fromRGB(145, 45, 50), function()
     unloadEntireScript()
 end)
 
-Config.KillAuraEnabled = false
-Config.AutoVoidKill = false
+-- // ĐẢM BẢO ANTI-VOID LUÔN BẬT MỖI KHI EXECUTE SCRIPT
 Config.AntiVoidEnabled = true
+Config.AutoVoidKill = false
 Config.UIInitialized = true
+task.defer(scanHotbarSkills1To4)
 
 table.insert(State.Connections, Players.PlayerAdded:Connect(function()
     task.wait(0.2)
@@ -1974,12 +2180,29 @@ local function getFlightDirection(hum)
     return Vector3.zero
 end
 
--- // ZERO-LAG CORE RENDERSTEPPED LOOP
+-- // STEPPED LOOP: ÉP CỨNG VỊ TRÍ DƯỚI VOID TRƯỚC PHYSICS STEP
+table.insert(State.Connections, RunService.Stepped:Connect(function()
+    if not Config.ScriptRunning then return end
+    if State.VoidKillActive and State.VoidDropTargetCF and State.Root then
+        if State.Root.Anchored then State.Root.Anchored = false end
+        State.Root.CFrame = State.VoidDropTargetCF
+        State.Root.AssemblyLinearVelocity = Vector3.zero
+        State.Root.AssemblyAngularVelocity = Vector3.zero
+    end
+end))
+
+-- // RENDERSTEPPED LOOP
 table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
     if not Config.ScriptRunning then return end
     local char = State.Char
     local root = State.Root
     local hum = State.Hum
+
+    if State.VoidKillActive and State.VoidDropTargetCF and root then
+        root.CFrame = State.VoidDropTargetCF
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end
 
     if Config.AntiStunEnabled and char and root and hum then
         enforceOldFullAntiStun(char, root, hum)
@@ -2068,7 +2291,7 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
     end
 end))
 
--- // ZERO-LAG CORE HEARTBEAT LOOP
+-- // HEARTBEAT LOOP
 table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
     if not Config.ScriptRunning then return end
     local char = State.Char
@@ -2079,6 +2302,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
         local voidY = Workspace.FallenPartsDestroyHeight
         if voidY ~= voidY or voidY < -10000 or voidY > 500 then voidY = -500 end
 
+        -- Lưu vị trí mặt đất an toàn và kích hoạt Anti-Void khi không đang dìm người xuống Void
         if not State.VoidKillActive then
             if hum.FloorMaterial ~= Enum.Material.Air and root.Position.Y > (voidY + 95) then
                 State.LastSafeCFrame = root.CFrame
@@ -2176,17 +2400,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
     updateESP()
 end))
 
--- // INPUT TRIGGERS + SKILL CAST PAUSE FOR KILL AURA
-local SkillKeys = {
-    [Enum.KeyCode.One] = true,
-    [Enum.KeyCode.Two] = true,
-    [Enum.KeyCode.Three] = true,
-    [Enum.KeyCode.Four] = true,
-    [Enum.KeyCode.G] = true,
-    [Enum.KeyCode.Q] = true,
-    [Enum.KeyCode.F] = true,
-}
-
+-- // INPUT TRIGGERS: BẮT PHÍM 1 -> 4 ĐỂ LƯU TÊN SKILL & KÍCH HOẠT VOID KILL
 table.insert(State.Connections, UserInputService.JumpRequest:Connect(function()
     triggerUndetectedInfJump()
 end))
@@ -2196,12 +2410,12 @@ table.insert(State.Connections, UserInputService.InputBegan:Connect(function(inp
     if not gpe and input.KeyCode == Enum.KeyCode.LeftAlt then
         toggleMenu()
     end
-    if not gpe and SkillKeys[input.KeyCode] then
-        State.LastSkillCastTick = tick()
-        if State.IsHoldingM1 then
-            releaseM1State()
-        end
+
+    local slotStr = KeyMap1To4[input.KeyCode]
+    if not gpe and slotStr then
+        onSkillSlotTriggered(slotStr)
     end
+
     if not gpe and input.KeyCode == Enum.KeyCode.Space and Config.InfJumpEnabled then
         triggerUndetectedInfJump()
     end
