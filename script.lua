@@ -1,6 +1,6 @@
--- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v14)
--- Architecture: Exact Deobfuscated Kill Aura from dump.txt (Character.Main.RemoteEvent 4-Hit Packet Loop)
---               + Exact ChildAdded No-Stun + Auto Void Kill + Anti-Void + Nova Hub Fluent UI.
+-- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v15)
+-- Architecture: Fixed Rolling-State XOR Decoder from dump.txt ("LeftClick" / "LeftClickRelease" 4-Hit Packet Loop)
+--               + Restored Full Multi-Layer Anti-Stun (v8/v11 Immunity Engine) + Auto Void Kill + Nova Hub Fluent UI.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -16,10 +16,10 @@ local Camera = Workspace.CurrentCamera
 local Config = {
     ScriptRunning = true,
 
-    -- Heroes Battlegrounds Specials (Extracted from dump.txt)
-    KillAuraEnabled = false,   -- Exact KillAuraToggle from dump.txt (4-hit M1 packet burst, zero animation)
-    KillAuraDelay = 0.08,      -- Exact wait(0.08) cycle from dump.txt
-    NoStunEnabled = false,     -- Exact NoStunToggle from dump.txt + velocity/ragdoll protection
+    -- Heroes Battlegrounds Specials
+    KillAuraEnabled = false,   -- Exact KillAuraToggle from dump.txt ("LeftClick" 4-hit burst + "LeftClickRelease")
+    KillAuraDelay = 0.08,      -- Default 0.08s cycle from dump.txt
+    AntiStunEnabled = false,   -- Restored Full Multi-Layer Anti-Stun (Un-anchor, WalkSpeed lock, BodyMover & Tag purge)
     AutoVoidKill = false,      -- Auto-detects when a grab skill locks an enemy, drops to void edge, releases, returns
     VoidHoldTime = 1.35,
     AntiVoidEnabled = true,
@@ -56,12 +56,12 @@ local State = {
     Char = nil,
     Root = nil,
     Hum = nil,
-    MainRemote = nil,
     CharConnections = {},
 
-    -- Exact Deobfuscated String Constants from dump.txt for Character.Main.RemoteEvent
-    Str_Attack = nil,
-    Str_Release = nil,
+    -- Exact Rolling-XOR Decoded Strings from dump.txt
+    Str_LeftClick = "LeftClick",
+    Str_LeftClickRelease = "LeftClickRelease",
+    DynamicM1Remote = nil,
 
     -- Void Kill & Anti-Void State
     LastSafeCFrame = nil,
@@ -85,21 +85,33 @@ local State = {
     Connections = {},
 }
 
--- // DECODE EXACT REMOTE CONSTANTS FROM DUMP.TXT
--- Uses the exact XOR byte-tables from dump.txt so the remote arguments match 100% byte-for-byte
-local function xorDecode(bytes, key)
+-- // EXACT ROLLING-STATE DECODER FROM DUMP.TXT (Proto #0)
+-- Why v14 Kill Aura failed: dump.txt mutates the key state after every byte (`state = (state +prevByte) % 256`).
+-- Using this exact rolling decoder produces the real strings: "LeftClick" and "LeftClickRelease"!
+local function rollingXorDecode(cipherBytes, keyBytes)
     local out = {}
-    local kLen = #key
-    for i = 1, #bytes do
-        out[i] = string.char(bit32.bxor(bytes[i], key[((i - 1) % kLen) + 1]))
+    local kLen = #keyBytes
+    local rolling = 0
+    for i = 1, #cipherBytes do
+        local kByte = keyBytes[((i - 1) % kLen) + 1]
+        local combinedKey = (kByte + rolling) % 256
+        local decodedByte = bit32.bxor(cipherBytes[i], combinedKey)
+        out[i] = string.char(decodedByte)
+        rolling = (rolling + cipherBytes[i]) % 256
     end
     return table.concat(out)
 end
 
-State.Str_Attack = xorDecode({0xE9, 0x03, 0x50, 0xF3, 0xCD, 0xE3, 0x8E}, {0x4E, 0x88, 0x6D, 0x39, 0x9E, 0xBB, 0x82, 0xE2})
-State.Str_Release = xorDecode({0x1D, 0xA1, 0x86, 0xF3, 0xD4, 0x3A, 0xBD, 0x8F, 0xC0, 0xD5, 0x3A, 0xA0, 0xBB, 0xF3, 0xC8, 0x21}, {0xBA, 0x55, 0xD4, 0xEB, 0x92})
+pcall(function()
+    -- Constant 025Q00805040 & 025Q00805440 from dump.txt
+    local s1 = rollingXorDecode({0xE9, 0x03, 0x50, 0xF3, 0xCD, 0xE3, 0x8E}, {0x4E, 0x88, 0x6D, 0x39, 0x9E, 0xBB, 0x82, 0xE2})
+    local s2 = rollingXorDecode({0x1D, 0xA1, 0x86, 0xF3, 0xD4, 0x3A, 0xBD, 0x8F, 0xC0, 0xD5, 0x3A, 0xA0, 0xBB, 0xF3, 0xC8, 0x21}, {0xBA, 0x55, 0xD4, 0xEB, 0x92})
+    if #s1 > 0 and not s1:find("%c") then State.Str_LeftClick = s1 end
+    if #s2 > 0 and not s2:find("%c") then State.Str_LeftClickRelease = s2 end
+end)
 
--- // 0. ANTI-KICK + AUTO SNIFFER FALLBACK
+-- // 0. ANTI-KICK + LIVE M1 REMOTE SNIFFER
+-- If you punch once manually, it also caches the exact RemoteEvent and attack string just in case the game updates!
 pcall(function()
     if hookmetamethod and getnamecallmethod and checkcaller then
         local oldNamecall
@@ -109,33 +121,45 @@ pcall(function()
                 if (method == "Kick" or method == "kick") and self == LocalPlayer then
                     return nil
                 end
+                if method == "FireServer" and self:IsA("RemoteEvent") then
+                    local args = {...}
+                    if type(args[1]) == "string" and args[2] == true and typeof(args[3]) == "Vector3" and type(args[4]) == "number" then
+                        State.DynamicM1Remote = self
+                        State.Str_LeftClick = args[1]
+                    end
+                end
             end
             return oldNamecall(self, ...)
         end)
     end
 end)
 
--- // EXACT KILL AURA LOOP FROM DUMP.TXT
--- Decompiled directly from dump.txt proto #1 (KillAuraToggle):
--- Loops 1 to 4, fires Character.Main.RemoteEvent:FireServer(Str_Attack, true, Vector3.new(rand, rand, rand), hitIndex, false, 1)
--- then waits 0.08s and fires Character.Main.RemoteEvent:FireServer(Str_Release, true).
+-- // EXACT KILL AURA LOOP FROM DUMP.TXT (Fixed Strings + Multi-Path Remote Finder)
+local function findCharacterMainRemote(char)
+    if not char then return nil end
+    local main = char:FindFirstChild("Main")
+    if main then
+        local rem = main:FindFirstChild("RemoteEvent") or main:FindFirstChildWhichIsA("RemoteEvent")
+        if rem then return rem end
+    end
+    if State.DynamicM1Remote and State.DynamicM1Remote:IsDescendantOf(char) then
+        return State.DynamicM1Remote
+    end
+    return char:FindFirstChild("RemoteEvent", true) or char:FindFirstChildWhichIsA("RemoteEvent", true)
+end
+
 local function startKillAuraLoop()
     task.spawn(function()
         while Config.ScriptRunning and Config.KillAuraEnabled do
             local char = LocalPlayer.Character
-            local mainFolder = char and char:FindFirstChild("Main")
-            local remote = mainFolder and mainFolder:FindFirstChild("RemoteEvent")
-
-            -- Fallback if game updates folder name: search character for RemoteEvent
-            if not remote and char then
-                remote = char:FindFirstChildWhichIsA("RemoteEvent", true)
-            end
+            local remote = findCharacterMainRemote(char)
 
             if remote then
+                -- 1. Fire 4-Hit M1 Burst in a single loop (Exact structure from dump.txt)
                 for hit = 1, 4 do
                     if not Config.ScriptRunning or not Config.KillAuraEnabled then break end
                     local args = {
-                        [1] = State.Str_Attack,
+                        [1] = State.Str_LeftClick,
                         [2] = true,
                         [3] = Vector3.new(math.random(10, 40), math.random(10, 40), math.random(10, 40)),
                         [4] = hit,
@@ -145,18 +169,28 @@ local function startKillAuraLoop()
                     pcall(function()
                         remote:FireServer(unpack(args))
                     end)
+                    -- Also fire standard "LeftClick" if rolling decode differed
+                    if State.Str_LeftClick ~= "LeftClick" then
+                        pcall(function()
+                            remote:FireServer("LeftClick", true, args[3], hit, false, 1)
+                        end)
+                    end
                 end
 
                 task.wait(Config.KillAuraDelay)
 
-                -- Release M1 lock packet (exact second FireServer in dump.txt)
+                -- 2. Fire Release packet (Exact second FireServer from dump.txt)
                 local charNow = LocalPlayer.Character
-                local mainNow = charNow and charNow:FindFirstChild("Main")
-                local remNow = (mainNow and mainNow:FindFirstChild("RemoteEvent")) or remote
+                local remNow = findCharacterMainRemote(charNow) or remote
                 if remNow then
                     pcall(function()
-                        remNow:FireServer(State.Str_Release, true)
+                        remNow:FireServer(State.Str_LeftClickRelease, true)
                     end)
+                    if State.Str_LeftClickRelease ~= "LeftClickRelease" then
+                        pcall(function()
+                            remNow:FireServer("LeftClickRelease", true)
+                        end)
+                    end
                 end
             else
                 task.wait(0.1)
@@ -165,22 +199,102 @@ local function startKillAuraLoop()
     end)
 end
 
--- // EXACT NO-STUN CHECK FROM DUMP.TXT (ChildAdded + Keyword Match)
-local StunSubstrings = { "stun", "slow", "nojump", "nospeed", "ragdoll", "freeze", "cantmove", "knockback" }
+-- // RESTORED OLD FULL ANTI-STUN ENGINE (v8/v11 Multi-Layer Immunity)
+-- Restores the strong Anti-Stun from the earlier version that you liked!
+local StunKeywords = {
+    "stun", "stuns", "nojump", "nospeed", "slow", "knockback", "ragdoll", "freeze",
+    "frozen", "dizz", "paralyz", "combo", "hitstun", "block", "cantmove", "disabled",
+    "anchor", "heavy", "slam", "downed", "endlag", "m1cooldown"
+}
 
-local function checkAndRemoveStunChild(child)
-    if not Config.ScriptRunning or not Config.NoStunEnabled or not child then return end
-    pcall(function()
-        local lowerName = child.Name:lower()
-        for i = 1, #StunSubstrings do
-            if lowerName:find(StunSubstrings[i], 1, true) then
-                task.defer(function()
-                    pcall(function() child.Parent = nil end)
-                end)
-                return
-            end
+local function isStunName(str)
+    local lower = string.lower(str)
+    -- Never delete the character's "Main" folder where RemoteEvent lives!
+    if lower == "main" or lower == "remoteevent" or lower == "animate" then
+        return false
+    end
+    for i = 1, #StunKeywords do
+        if string.find(lower, StunKeywords[i], 1, true) then
+            return true
         end
-    end)
+    end
+    return false
+end
+
+local function cleanStunInstance(inst)
+    if not Config.ScriptRunning or not Config.AntiStunEnabled or not inst then return end
+    if inst.Name == "Main" or inst:IsA("RemoteEvent") or inst:IsA("LocalScript") or inst:IsA("Script") then
+        return
+    end
+    if inst:IsA("BodyVelocity") or inst:IsA("BodyPosition") or inst:IsA("BodyAngularVelocity")
+        or inst:IsA("BodyGyro") or inst:IsA("LinearVelocity") or inst:IsA("VectorForce") or inst:IsA("AlignPosition") then
+        if inst.Name ~= "NovaMover" and not State.VoidKillActive then
+            task.defer(function() pcall(function() inst:Destroy() end) end)
+        end
+    elseif (inst:IsA("BoolValue") or inst:IsA("StringValue") or inst:IsA("NumberValue")
+        or inst:IsA("IntValue") or inst:IsA("ObjectValue") or inst:IsA("Folder") or inst:IsA("Accessory"))
+        and isStunName(inst.Name) then
+        task.defer(function() pcall(function() inst:Destroy() end) end)
+    end
+end
+
+local function enforceOldFullAntiStun(char, root, hum)
+    if not char or not root or not hum then return end
+
+    -- 1. Un-anchor & unlock character parts frozen by stun scripts
+    if root.Anchored then root.Anchored = false end
+    for _, part in ipairs(char:GetChildren()) do
+        if part:IsA("BasePart") and part.Anchored then
+            part.Anchored = false
+        end
+    end
+
+    -- 2. Force Humanoid out of stun/ragdoll/platform states
+    if hum.PlatformStand then hum.PlatformStand = false end
+    if hum.Sit then hum.Sit = false end
+    hum.AutoRotate = true
+    hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+    hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+    hum:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
+    hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+
+    local curState = hum:GetState()
+    if curState == Enum.HumanoidStateType.Ragdoll
+        or curState == Enum.HumanoidStateType.FallingDown
+        or curState == Enum.HumanoidStateType.Physics
+        or curState == Enum.HumanoidStateType.PlatformStanding then
+        hum:ChangeState(Enum.HumanoidStateType.Running)
+    end
+
+    -- 3. Override WalkSpeed & JumpPower reductions caused by hit-stun
+    local targetWS = Config.SpeedEnabled and Config.WalkSpeed or 16
+    if hum.WalkSpeed < targetWS then
+        hum.WalkSpeed = targetWS
+    end
+    local targetJP = Config.JumpBoostEnabled and Config.JumpPower or 50
+    if hum.UseJumpPower and hum.JumpPower < targetJP then
+        hum.JumpPower = targetJP
+    end
+
+    -- 4. Strip Stun Children & Knockback BodyMovers
+    for _, child in ipairs(char:GetChildren()) do
+        cleanStunInstance(child)
+    end
+    for _, child in ipairs(root:GetChildren()) do
+        cleanStunInstance(child)
+    end
+
+    -- 5. Reset Stun Attributes placed on Character or Humanoid
+    for attrName, attrVal in pairs(char:GetAttributes()) do
+        if isStunName(attrName) and attrVal == true then
+            char:SetAttribute(attrName, false)
+        end
+    end
+    for attrName, attrVal in pairs(hum:GetAttributes()) do
+        if isStunName(attrName) and attrVal == true then
+            hum:SetAttribute(attrName, false)
+        end
+    end
 end
 
 local function checkGrabJoint(inst)
@@ -312,15 +426,10 @@ local function bindCharacter(char)
 
     if not State.Root or not State.Hum then return end
 
-    -- Exact ChildAdded NoStun hook from dump.txt
-    table.insert(State.CharConnections, char.ChildAdded:Connect(function(child)
-        checkAndRemoveStunChild(child)
-    end))
-
     table.insert(State.CharConnections, char.DescendantAdded:Connect(function(inst)
         if not Config.ScriptRunning then return end
-        if Config.NoStunEnabled then
-            checkAndRemoveStunChild(inst)
+        if Config.AntiStunEnabled then
+            cleanStunInstance(inst)
         end
         if Config.AutoVoidKill and not State.VoidKillActive then
             task.defer(function()
@@ -332,10 +441,27 @@ local function bindCharacter(char)
         end
     end))
 
+    table.insert(State.CharConnections, char.AttributeChanged:Connect(function(attrName)
+        if Config.ScriptRunning and Config.AntiStunEnabled and isStunName(attrName) then
+            if char:GetAttribute(attrName) == true then
+                char:SetAttribute(attrName, false)
+            end
+        end
+    end))
+
+    table.insert(State.CharConnections, State.Hum.AttributeChanged:Connect(function(attrName)
+        if Config.ScriptRunning and Config.AntiStunEnabled and isStunName(attrName) then
+            if State.Hum:GetAttribute(attrName) == true then
+                State.Hum:SetAttribute(attrName, false)
+            end
+        end
+    end))
+
     table.insert(State.CharConnections, State.Hum.StateChanged:Connect(function(_, newState)
-        if Config.ScriptRunning and Config.NoStunEnabled then
+        if Config.ScriptRunning and Config.AntiStunEnabled then
             if newState == Enum.HumanoidStateType.Ragdoll
                 or newState == Enum.HumanoidStateType.FallingDown
+                or newState == Enum.HumanoidStateType.Physics
                 or newState == Enum.HumanoidStateType.PlatformStanding then
                 State.Hum:ChangeState(Enum.HumanoidStateType.Running)
             end
@@ -660,7 +786,7 @@ local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 230, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v14"
+SubTitle.Text = "Heroes Battlegrounds v15"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
@@ -728,7 +854,7 @@ local function unloadEntireScript()
     Config.KillAuraEnabled = false
     Config.AutoVoidKill = false
     Config.AntiVoidEnabled = false
-    Config.NoStunEnabled = false
+    Config.AntiStunEnabled = false
     Config.AimbotActive = false
     Config.ESPEnabled = false
 
@@ -1381,7 +1507,7 @@ local function toggleInvisible(enable)
     end
 end
 
--- // 1. POPULATE COMBAT TAB (Renamed to Kill Aura & Powered by Exact dump.txt Logic)
+-- // 1. POPULATE COMBAT TAB
 addFeatureToggle(TabCombat, "KillAura", "Kill Aura", "KAURA", false, function(v)
     Config.KillAuraEnabled = v
     if v then
@@ -1393,12 +1519,10 @@ addSlider(TabCombat, "Kill Aura Cycle Delay (0.08 = Default)", 0.02, 0.25, 0.08,
     Config.KillAuraDelay = v
 end)
 
-addFeatureToggle(TabCombat, "NoStun", "No Stun (Anti-Stun / Anti-Slow)", "NOSTUN", false, function(v)
-    Config.NoStunEnabled = v
-    if v and State.Char then
-        for _, child in ipairs(State.Char:GetChildren()) do
-            checkAndRemoveStunChild(child)
-        end
+addFeatureToggle(TabCombat, "AntiStun", "Anti-Stun (Full Immunity v8)", "ASTUN", false, function(v)
+    Config.AntiStunEnabled = v
+    if v and State.Char and State.Root and State.Hum then
+        enforceOldFullAntiStun(State.Char, State.Root, State.Hum)
     end
 end)
 
@@ -1686,8 +1810,14 @@ end
 -- // ZERO-LAG CORE RENDERSTEPPED LOOP
 table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
     if not Config.ScriptRunning then return end
+    local char = State.Char
     local root = State.Root
     local hum = State.Hum
+
+    -- Enforce Full Multi-Layer Anti-Stun (v8/v11 Engine)
+    if Config.AntiStunEnabled and char and root and hum then
+        enforceOldFullAntiStun(char, root, hum)
+    end
 
     if Config.InvisibleEnabled then
         for i = 1, #State.InvisData.HiddenParts do
@@ -1775,6 +1905,7 @@ end))
 -- // ZERO-LAG CORE HEARTBEAT LOOP
 table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
     if not Config.ScriptRunning then return end
+    local char = State.Char
     local root = State.Root
     local hum = State.Hum
 
@@ -1801,12 +1932,8 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             scanProximityGrab()
         end
 
-        if Config.NoStunEnabled then
-            if root.Anchored then root.Anchored = false end
-            if hum.PlatformStand then hum.PlatformStand = false end
-            if hum.Sit then hum.Sit = false end
-            local minWS = Config.SpeedEnabled and Config.WalkSpeed or 16
-            if hum.WalkSpeed < minWS then hum.WalkSpeed = minWS end
+        if Config.AntiStunEnabled and char then
+            enforceOldFullAntiStun(char, root, hum)
         elseif Config.SpeedEnabled then
             hum.WalkSpeed = Config.WalkSpeed
         end
