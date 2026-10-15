@@ -1,13 +1,14 @@
--- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v23)
--- Fixes in v23:
---   1. Fixed Wall Combo Fling Bug:
---      - No longer collapses giant tree leaf parts onto the player (which caused the sky fling).
---      - Places a single thin real Map Tree Trunk (7x9x1.2) strictly BEHIND the enemy (not inside you).
---      - Attaches NoCollisionConstraints between the Tree Trunk and LocalPlayer so it can NEVER fling you.
---      - Hooks Workspace:Raycast & FindPartOnRay* to spoof a real Map Tree hit behind the enemy.
---   2. Native M1 100% Working + Anti-Void Always ON in background (no UI button).
---   3. Auto Void Kill (36 Grab Skills + Special Logic + -90deg Void Dive).
---   4. Anti-Skill (16-stud close range + Movable Ghost Decoy without stun).
+-- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v24 - M1 HIT-CONFIRM WALL COMBO)
+-- Architecture:
+--   1. Wall Combo Fixed for Heroes Battlegrounds:
+--      - Removed 'G' key trigger completely (so 'G' is only for Ultimate/Awakening).
+--      - Triggers ONLY on Left Click (MouseButton1) + Hit Confirm (Enemy in front is taking damage / in hitstun).
+--      - Positions the real Map Tree directly BEHIND THE ENEMY'S BACK (enemyRoot.Position + attackDir * offset)
+--        so the tree never blocks your punches and catches the enemy's back on the final M1 hit to trigger Wall Combo.
+--   2. Deep Void Plunge Engine (-3200 to -9000 Y) + Self Void Immunity (FallenPartsDestroyHeight = 0/0 NaN).
+--   3. Full 34+ Grab Skill Database + Special Mechanics (Phantom Shot, Sub Zero, MINE, Pierce The Heavens, BLAST AWAY).
+--   4. Anti-Skill Desync Engine (Ghost Illusion holds Camera + Real Root flies 450 studs away).
+--   5. Anti-Void ALWAYS ON by default upon script execution.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -24,50 +25,32 @@ local Config = {
     ScriptRunning = true,
     UIInitialized = false,
 
-    -- Anti-Void: Luôn bật ngầm 100%
-    AntiVoidEnabled = true,
-
-    -- Void Kill & Skill Logger
+    -- 1. Deep Void Kill & Void Immunity Settings
     SkillLoggerEnabled = true,
-    AutoVoidKill = false,
-    VoidTriggerMode = "GrabOrSelectedKeys", -- "GrabOrSelectedKeys" | "SelectedKeysOnly" | "GrabOnly"
-    VoidSkillKeys = {
-        ["1"] = false,
-        ["2"] = false,
-        ["3"] = false,
-        ["4"] = false,
-    },
-    VoidStartupDelay = 0.22,
+    AutoVoidKill = true,
+    VoidKillMode = "DeepPlungeNaN", -- "DeepPlungeNaN" | "PulseDeepSlam"
+    VoidTargetDepth = -3200,
+    VoidStartupDelay = 0.16,
     VoidMaxHoldTime = 1.85,
-    VoidDepthOffset = 14,
+    AntiVoidEnabled = true,         -- LUÔN BẬT SẴN MỖI KHI EXECUTE SCRIPT
+    VoidImmunityNaN = true,         -- Khóa FallenPartsDestroyHeight = 0/0 (NaN)
 
-    MineSelectedTargets = {},
+    -- Multi-Target Selection cho MINE / BLAST AWAY / Pierce The Heavens
+    SelectedMineTargets = {},
+    MineSelectAll = true,
 
-    KnownGrabSkillNames = {
-        "Quintuple Smash", "Shadow Whip", "Lightning Crush", "Whiplash",
-        "Blackout Clutch", "Azure Grab", "Ember Assault", "PEAKING SCORCH",
-        "Infernal Assault", "Glacial Cinder", "Hell Assault", "Phantom Shot",
-        "Cluster Spark", "Sub Zero", "FREEZEBURN WAVE", "BLAZING SOUL",
-        "Explosion Combo", "Blast Cataput", "Blast Catapult", "Eruption Dive",
-        "MINE", "Pierce The Heavens", "BLAST AWAY", "Recipro Assault",
-        "Deteriorate", "Scatter", "Turbo Release", "Jet Storm",
-        "Renovation", "Stone Weaponry", "Calamity", "Disfigruation",
-        "Disfiguration", "Twin Talons", "Crimson Heaven", "Plume",
-        "Razor Blitz", "Assasin's Eclipse", "Assassin's Eclipse",
-    },
-
-    -- Anti-Skill (Bán kính gần + Ảo Ảnh di chuyển tự do không bị Stun)
+    -- 2. Anti-Skill (Ảo ảnh mờ giữ Camera + Nhân vật gốc bay ra xa né Skill)
     AntiSkillEnabled = false,
-    AntiSkillRange = 16,
-    AntiSkillSkyOffset = Vector3.new(0, 420, 0),
+    AntiSkillDetectRange = 34,
+    AntiSkillSafeOffset = Vector3.new(0, 450, 0),
 
-    -- Wall Combo (Đặt cây thật sau lưng đối phương + Không hất văng + Hook Raycast)
+    -- 3. Wall Combo (Chuột Trái M1 + Đánh Dính Địch + Đặt Cây Sau Lưng Đối Phương)
     WallComboEnabled = false,
-    WallComboMode = "TreeBehindEnemy", -- "TreeBehindEnemy" | "RaycastSpoofOnly" | "SnapToRealTree"
-    WallBehindEnemyOffset = 2.6,       -- Khoảng cách đặt cây tính từ sau lưng đối phương
-    WallComboKey = Enum.KeyCode.V,
+    WallComboMode = "M1HitConfirm", -- "M1HitConfirm" (Chỉ khi M1 trúng địch) | "M1NearEnemy" (Khi M1 gần địch)
+    WallComboBehindEnemyDist = 2.4, -- Khoảng cách đặt Cây tính từ sau lưng đối phương (Studs)
+    WallComboMaxM1Range = 9.5,      -- Tầm nhận diện đối phương đang bị mình đánh M1
 
-    -- Combat / Protection
+    -- 4. Combat & AutoTarget
     AntiStunEnabled = false,
     AimbotWidgetOpen = false,
     AimbotActive = false,
@@ -75,25 +58,61 @@ local Config = {
     SelectedPlayer = nil,
     AutoTargetEnabled = false,
     TargetFreeMove = false,
-    TargetMode = "Behind",
+    TargetMode = "Behind", -- "Behind" | "Orbit" | "Random" | "Below" | "Upper" | "Front"
     OrbitSpeed = 15,
     TargetRange = 5.5,
 
-    -- Movement
+    -- 5. Movement & Visuals
     FlyEnabled = false,
-    FlyMode = "FloorPad",
+    FlyMode = "FloorPad", -- "FloorPad" | "LoopPulse"
     FlySpeed = 65,
     InfJumpEnabled = false,
-    InfJumpMode = "FlyPadStep",
+    InfJumpMode = "FlyPadStep", -- "FlyPadStep" | "ParabolicCFrame" | "MicroBounce"
     InvisibleEnabled = false,
-    InvisMode = "RootJointBreak",
+    InvisMode = "RootJointBreak", -- "RootJointBreak" | "UndergroundC0" | "SeatDesync"
     SpeedEnabled = false,
     WalkSpeed = 50,
     JumpBoostEnabled = false,
     JumpPower = 100,
-
-    -- Visuals
     ESPEnabled = false,
+}
+
+-- // DANH SÁCH 34+ SKILL VOID KILL
+local StandardGrabSkills = {
+    "quintuple smash",
+    "shadow whip",
+    "lightning crush",
+    "whiplash",
+    "blackout clutch",
+    "azure grab",
+    "ember assault",
+    "peaking scorch",
+    "infernal assault",
+    "glacial cinder",
+    "hell assault",
+    "cluster spark",
+    "freezeburn wave",
+    "blazing soul",
+    "explosion combo",
+    "blast cataput",
+    "blast catapult",
+    "eruption dive",
+    "recipro assault",
+    "deteriorate",
+    "scatter",
+    "turbo release",
+    "jet storm",
+    "renovation",
+    "stone weaponry",
+    "calamity",
+    "disfigruation",
+    "disfiguration",
+    "twin talons",
+    "crimson heaven",
+    "plume",
+    "razor blitz",
+    "assasin's eclipse",
+    "assassin's eclipse",
 }
 
 local State = {
@@ -103,12 +122,10 @@ local State = {
     Animator = nil,
     CharConnections = {},
 
-    DetectedSlotNames = {
-        ["1"] = "Chưa quét",
-        ["2"] = "Chưa quét",
-        ["3"] = "Chưa quét",
-        ["4"] = "Chưa quét",
-    },
+    OrigFallenDestroyHeight = -500,
+
+    -- Skill 1->4 Logger & Special Trackers
+    DetectedSlotNames = { ["1"] = "Chưa quét", ["2"] = "Chưa quét", ["3"] = "Chưa quét", ["4"] = "Chưa quét" },
     SkillHistoryLogs = {},
     LastKeyPressed = nil,
     LastSkillName = "None",
@@ -116,33 +133,38 @@ local State = {
     CurrentSkillAnimTrack = nil,
     CopyBtnRef = nil,
     SlotStatusLabel = nil,
+    TreeStatusLabel = nil,
 
+    -- Phantom Shot 2-hit state
     PhantomShotStage = 0,
-    PhantomShotLastTick = 0,
-    ActiveSpecialSkill = nil,
-    GrabbedThisCast = {},
-    PendingGrabWatchTick = 0,
+    PhantomShotFirstTick = 0,
 
+    -- Deep Void Kill State
     LastSafeCFrame = nil,
     VoidKillActive = false,
     VoidDropTargetCF = nil,
     VoidReturnCFrame = nil,
+    VoidPulseFrameCounter = 0,
+    AlreadyGrabbedInSession = {},
 
+    -- Anti-Skill State
     AntiSkillEvading = false,
-    DecoyModel = nil,
-    DecoyCameraProxy = nil,
-    DecoyCFrame = nil,
+    AntiSkillGhostModel = nil,
+    AntiSkillAnchorCF = nil,
+    AntiSkillHoldUntil = 0,
 
-    -- Wall Combo State (Zero-Fling)
-    CachedTreeTrunks = {},
-    ActiveWallTree = nil,
-    SavedTrunkData = nil,
-    WallNoCollideConstraints = {},
-    WallComboWindowUntil = 0,
-    WallComboPulseRunning = false,
-    M1ClickCount = 0,
+    -- Wall Combo Tree & M1 Hit Confirm State
+    CachedTreePart = nil,
+    CachedTreeOrigCF = nil,
+    CachedTreeOrigCollide = true,
+    CachedTreeOrigAnchored = true,
+    TreeIsCurrentlyMoved = false,
     LastM1ClickTick = 0,
+    IsLeftMouseDown = false,
+    EnemyHealthCache = {},    -- [Model] = lastHealth
+    EnemyLastDamagedTick = {}, -- [Model] = tick() khi vừa bị tụt máu
 
+    -- Movement / Visual State
     FlyPad = nil,
     InfJumpArcActive = false,
     InfJumpArcTimer = 0,
@@ -158,295 +180,45 @@ local State = {
     Connections = {},
 }
 
--- // HELPER: TÌM ĐỐI THỦ GẦN NHẤT
-local function findNearestValidPlayer(maxRange)
-    local myRoot = State.Root
-    local refPos = myRoot and myRoot.Position or Camera.CFrame.Position
-    local closestPlayer = nil
-    local shortestDist = maxRange or math.huge
-
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer and plr.Character then
-            local tRoot = plr.Character:FindFirstChild("HumanoidRootPart")
-            local tHum = plr.Character:FindFirstChildOfClass("Humanoid")
-            if tRoot and tHum and tHum.Health > 0 then
-                local dist = (tRoot.Position - refPos).Magnitude
-                if dist <= shortestDist then
-                    shortestDist = dist
-                    closestPlayer = plr
-                end
-            end
-        end
-    end
-    return closestPlayer, shortestDist
-end
-
--- Tìm cả Player lẫn Dummy/NPC trong Workspace.Live để test Wall Combo trên cả Dummy
-local function findNearestEnemyRoot(maxRange)
-    local myChar = LocalPlayer.Character or State.Char
-    local myRoot = State.Root
-    if not myChar or not myRoot then return nil, nil end
-
-    local bestModel, bestRoot = nil, nil
-    local shortest = maxRange or 18
-
-    local live = Workspace:FindFirstChild("Live")
-    local list = live and live:GetChildren() or {}
-    for _, m in ipairs(list) do
-        if m ~= myChar and m:IsA("Model") then
-            local r = m:FindFirstChild("HumanoidRootPart")
-            local h = m:FindFirstChildOfClass("Humanoid")
-            if r and h and h.Health > 0 then
-                local d = (r.Position - myRoot.Position).Magnitude
-                if d <= shortest then
-                    shortest = d
-                    bestModel = m
-                    bestRoot = r
-                end
-            end
-        end
-    end
-
-    if not bestRoot then
-        local plr = findNearestValidPlayer(shortest)
-        if plr and plr.Character then
-            bestModel = plr.Character
-            bestRoot = plr.Character:FindFirstChild("HumanoidRootPart")
-        end
-    end
-
-    return bestModel, bestRoot
-end
-
--- // QUÉT THÂN CÂY THẬT (TRUNK) TRONG MAP (LOẠI BỎ TÁN LÁ ĐỂ KHÔNG BỊ VĂNG)
-local function scanRealTreeTrunks()
-    local trunks = {}
-    local myChar = LocalPlayer.Character or State.Char
-
-    for _, inst in ipairs(Workspace:GetDescendants()) do
-        if inst:IsA("BasePart") and (not myChar or not inst:IsDescendantOf(myChar)) then
-            local n = string.lower(inst.Name)
-            local pName = inst.Parent and string.lower(inst.Parent.Name) or ""
-            local isLeaf = string.find(n, "leaf") or string.find(n, "leaves") or string.find(n, "foliage") or string.find(n, "top") or (inst.Material == Enum.Material.Grass)
-            local isTreeRelated = string.find(n, "trunk") or string.find(n, "tree") or string.find(n, "wood") or string.find(pName, "tree") or string.find(pName, "trees") or (inst.Material == Enum.Material.Wood) or (inst.Material == Enum.Material.WoodPlanks)
-
-            if isTreeRelated and not isLeaf and inst.CanCollide and inst.Size.Y >= 3.5 and inst.Size.X <= 18 and inst.Size.Z <= 18 then
-                table.insert(trunks, inst)
-            end
-        end
-    end
-
-    -- Fallback nếu map đặt tên khác: lấy bất kỳ part thân gỗ/trụ đứng nào trong map
-    if #trunks == 0 then
-        for _, inst in ipairs(Workspace:GetDescendants()) do
-            if inst:IsA("BasePart") and inst.CanCollide and inst.Size.Y >= 5 and inst.Size.X <= 15 and inst.Size.Z <= 15 then
-                local pName = inst.Parent and string.lower(inst.Parent.Name) or ""
-                if string.find(pName, "tree") or string.find(pName, "map") or inst.Material == Enum.Material.Wood then
-                    table.insert(trunks, inst)
-                end
-            end
-        end
-    end
-
-    State.CachedTreeTrunks = trunks
-    return trunks
-end
-
-local function restoreActiveWallTree()
-    for _, nc in ipairs(State.WallNoCollideConstraints) do
-        pcall(function() nc:Destroy() end)
-    end
-    State.WallNoCollideConstraints = {}
-
-    local part = State.ActiveWallTree
-    local saved = State.SavedTrunkData
-    if part and part.Parent and saved then
-        pcall(function()
-            part.Size = saved.Size
-            part.CFrame = saved.CFrame
-            part.Anchored = saved.Anchored
-            part.CanCollide = saved.CanCollide
-            part.Transparency = saved.Transparency
-            part.LocalTransparencyModifier = 0
-            part.AssemblyLinearVelocity = Vector3.zero
-            part.AssemblyAngularVelocity = Vector3.zero
-        end)
-    end
-    State.ActiveWallTree = nil
-    State.SavedTrunkData = nil
-    State.WallComboPulseRunning = false
-end
-
--- // HOOK RAYCAST / FINDPARTONRAY ĐỂ ĐÁNH LỪA CLIENT GAME RẰNG CÓ CÂY THẬT SAU LƯNG ĐỊCH
 pcall(function()
-    if hookmetamethod and getnamecallmethod and checkcaller then
-        local oldNamecall
-        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-            if Config.ScriptRunning and not checkcaller() then
-                local method = getnamecallmethod()
-                if (method == "Kick" or method == "kick") and self == LocalPlayer then
-                    return nil
-                end
-
-                -- Nếu đang trong nhịp kích hoạt Wall Combo mà game bắn tia Raycast kiểm tra tường/cây
-                if self == Workspace and Config.WallComboEnabled and tick() <= State.WallComboWindowUntil then
-                    if method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRay" or method == "FindPartOnRayWithWhitelist" then
-                        local ray = select(1, ...)
-                        if typeof(ray) == "Ray" and State.Root then
-                            local origin = ray.Origin
-                            local dir = ray.Direction
-                            if (origin - State.Root.Position).Magnitude <= 18 and dir.Magnitude >= 1.5 and math.abs(dir.Unit.Y) < 0.75 then
-                                local trunk = State.ActiveWallTree or State.CachedTreeTrunks[1]
-                                if trunk and trunk.Parent then
-                                    local hitPos = origin + dir.Unit * math.min(dir.Magnitude * 0.65, 3.2)
-                                    local normal = -dir.Unit
-                                    return trunk, hitPos, normal, trunk.Material
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-            return oldNamecall(self, ...)
-        end)
+    local h = Workspace.FallenPartsDestroyHeight
+    if h == h and h > -10000 and h < 500 then
+        State.OrigFallenDestroyHeight = h
     end
 end)
 
--- // KÍCH HOẠT WALL COMBO SAU LƯNG ĐỐI PHƯƠNG (ZERO-FLING)
-local function triggerWallComboBehindEnemy(duration)
-    local myChar = LocalPlayer.Character or State.Char
-    local myRoot = State.Root
-    if not myChar or not myRoot then return end
-
-    if #State.CachedTreeTrunks == 0 then
-        scanRealTreeTrunks()
-    end
-
-    local holdTime = duration or 0.70
-    State.WallComboWindowUntil = tick() + holdTime
-
-    -- Chế độ 2: Chỉ dùng Hook Raycast, không dịch chuyển Part
-    if Config.WallComboMode == "RaycastSpoofOnly" then
-        return
-    end
-
-    local _, enemyRoot = findNearestEnemyRoot(18)
-
-    -- Chế độ 3: Snap tới cây thật gần nhất trên bản đồ (nếu muốn vị trí thật trên Server)
-    if Config.WallComboMode == "SnapToRealTree" then
-        local nearestTrunk, shortest = nil, math.huge
-        for _, t in ipairs(State.CachedTreeTrunks) do
-            if t and t.Parent then
-                local d = (t.Position - myRoot.Position).Magnitude
-                if d < shortest then
-                    shortest = d
-                    nearestTrunk = t
-                end
-            end
+-- // BẤT TỬ SÁT THƯƠNG VOID CHO BẢN THÂN
+local function applySelfVoidImmunity()
+    if not Config.ScriptRunning or not Config.VoidImmunityNaN then return end
+    pcall(function()
+        if sethiddenproperty then
+            pcall(sethiddenproperty, Workspace, "FallenPartsDestroyHeight", 0/0)
         end
-        if nearestTrunk and shortest <= 85 then
-            local dirToTree = Vector3.new(nearestTrunk.Position.X - myRoot.Position.X, 0, nearestTrunk.Position.Z - myRoot.Position.Z)
-            if dirToTree.Magnitude > 0.1 then
-                dirToTree = dirToTree.Unit
-                local standPos = Vector3.new(nearestTrunk.Position.X, myRoot.Position.Y, nearestTrunk.Position.Z) - (dirToTree * 5.2)
-                myRoot.CFrame = CFrame.lookAt(standPos, Vector3.new(nearestTrunk.Position.X, myRoot.Position.Y, nearestTrunk.Position.Z))
-                myRoot.AssemblyLinearVelocity = Vector3.zero
-            end
-        end
-        return
-    end
-
-    -- Chế độ 1 (Mặc định): Đặt 1 thân cây thật mỏng ngay SAU LƯNG ĐỐI PHƯƠNG + Khóa va chạm với bạn
-    if State.WallComboPulseRunning then return end
-    local chosenTrunk = nil
-    for _, t in ipairs(State.CachedTreeTrunks) do
-        if t and t.Parent then
-            chosenTrunk = t
-            break
-        end
-    end
-    if not chosenTrunk then return end
-
-    State.WallComboPulseRunning = true
-    State.ActiveWallTree = chosenTrunk
-    State.SavedTrunkData = {
-        Size = chosenTrunk.Size,
-        CFrame = chosenTrunk.CFrame,
-        Anchored = chosenTrunk.Anchored,
-        CanCollide = chosenTrunk.CanCollide,
-        Transparency = chosenTrunk.Transparency,
-    }
-
-    -- Gắn NoCollisionConstraint giữa thân cây và toàn bộ cơ thể bạn (kể cả địch) để KHÔNG BAO GIỜ HẤT BAY LÊN TRỜI
-    for _, part in ipairs(myChar:GetDescendants()) do
-        if part:IsA("BasePart") then
-            local nc = Instance.new("NoCollisionConstraint")
-            nc.Part0 = chosenTrunk
-            nc.Part1 = part
-            nc.Parent = chosenTrunk
-            table.insert(State.WallNoCollideConstraints, nc)
-        end
-    end
-
-    task.spawn(function()
-        -- Ép kích thước thân cây thành bức tường mỏng gọn (rộng 7, cao 9, dày 1.2) để không đè lên nhân vật
+        Workspace.FallenPartsDestroyHeight = 0/0
+    end)
+    if State.Hum then
         pcall(function()
-            chosenTrunk.Anchored = true
-            chosenTrunk.CanCollide = true
-            chosenTrunk.CanQuery = true
-            chosenTrunk.Size = Vector3.new(7, 9, 1.2)
-            chosenTrunk.LocalTransparencyModifier = 0.55
+            State.Hum:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
         end)
+    end
+end
 
-        local startTick = tick()
-        while (tick() - startTick) < holdTime and Config.ScriptRunning and State.Root do
-            local _, curEnemyRoot = findNearestEnemyRoot(16)
-            local wallCF
-
-            if curEnemyRoot then
-                -- Đặt thân cây nằm ngay SAU LƯNG ĐỐI PHƯƠNG theo hướng từ mình nhìn tới đối phương
-                local flatMe = Vector3.new(State.Root.Position.X, curEnemyRoot.Position.Y, State.Root.Position.Z)
-                local dirMeToEnemy = (curEnemyRoot.Position - flatMe)
-                if dirMeToEnemy.Magnitude > 0.1 then
-                    dirMeToEnemy = dirMeToEnemy.Unit
-                else
-                    dirMeToEnemy = State.Root.CFrame.LookVector
-                end
-                local behindEnemyPos = curEnemyRoot.Position + (dirMeToEnemy * Config.WallBehindEnemyOffset)
-                wallCF = CFrame.lookAt(behindEnemyPos, curEnemyRoot.Position)
-            else
-                -- Nếu không có địch sát bên thì đặt cách trước mặt mình 5.5 studs
-                wallCF = State.Root.CFrame * CFrame.new(0, 0, -5.5)
-            end
-
-            pcall(function()
-                chosenTrunk.CFrame = wallCF
-                chosenTrunk.AssemblyLinearVelocity = Vector3.zero
-                chosenTrunk.AssemblyAngularVelocity = Vector3.zero
-            end)
-
-            RunService.Heartbeat:Wait()
-        end
-
-        restoreActiveWallTree()
+local function restoreDefaultVoidDestroyHeight()
+    pcall(function()
+        Workspace.FallenPartsDestroyHeight = State.OrigFallenDestroyHeight or -500
     end)
 end
 
--- // HELPER: LÀM SẠCH CHUỖI & ĐỐI CHIẾU TÊN SKILL
+applySelfVoidImmunity()
+
+-- // HELPER: CHUẨN HÓA CHUỖI
 local function trimString(s)
     if typeof(s) ~= "string" then return "" end
     return string.gsub(s, "^%s*(.-)%s*$", "%1")
 end
 
-local function isMatchedGrabSkillName(skillName)
-    if typeof(skillName) ~= "string" or #skillName == 0 then return false end
-    local lower = string.lower(skillName)
-    for _, targetName in ipairs(Config.KnownGrabSkillNames) do
-        if string.find(lower, string.lower(targetName), 1, true) then
-            return true
-        end
-    end
-    return false
+local function normalizeName(s)
+    return string.lower(trimString(s))
 end
 
 local function isValidSkillLabelText(txt, slotStr)
@@ -455,16 +227,13 @@ local function isValidSkillLabelText(txt, slotStr)
     if tonumber(txt) ~= nil then return false end
     local lower = string.lower(txt)
     if string.match(lower, "^%d+%.?%d*s$") then return false end
-    if lower == "cooldown" or lower == "ready" or lower == "locked" or lower == "ult" or lower == "awakening" then
-        return false
-    end
+    if lower == "cooldown" or lower == "ready" or lower == "locked" then return false end
     return true
 end
 
--- // QUÉT TÊN 4 SKILL (1 -> 4) TỪ HOTBAR
+-- // QUÉT TÊN SKILL 1 -> 4 TRÊN HOTBAR / BACKPACK
 local function scanHotbarSkills1To4()
     local found = { ["1"] = nil, ["2"] = nil, ["3"] = nil, ["4"] = nil }
-
     local tools = {}
     local char = LocalPlayer.Character or State.Char
     local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
@@ -490,31 +259,36 @@ local function scanHotbarSkills1To4()
 
     local pGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
     if pGui then
-        local bottomLabels = {}
-        local vpY = Camera and Camera.ViewportSize.Y or 800
-
         for _, inst in ipairs(pGui:GetDescendants()) do
-            if not inst:IsDescendantOf(ScreenGui or Instance.new("Folder")) then
-                local instName = trimString(inst.Name)
-                local matchedSlot = string.match(instName, "^[Ss]?[ll]?[oo]?[tt]?([1-4])$") or string.match(instName, "^Move([1-4])$") or string.match(instName, "^Skill([1-4])$")
+            local instName = trimString(inst.Name)
+            local matchedSlot = string.match(instName, "^[Ss]?[ll]?[oo]?[tt]?([1-4])$") or string.match(instName, "^Move([1-4])$")
 
-                if matchedSlot and (inst:IsA("Frame") or inst:IsA("ImageButton") or inst:IsA("TextButton") or inst:IsA("ImageLabel")) then
-                    for _, child in ipairs(inst:GetDescendants()) do
-                        if child:IsA("TextLabel") or child:IsA("TextButton") then
-                            local t = trimString(child.Text)
-                            if isValidSkillLabelText(t, matchedSlot) then
-                                found[matchedSlot] = found[matchedSlot] or t
-                            end
+            if matchedSlot and (inst:IsA("Frame") or inst:IsA("ImageButton") or inst:IsA("TextButton") or inst:IsA("ImageLabel")) then
+                for _, child in ipairs(inst:GetDescendants()) do
+                    if child:IsA("TextLabel") or child:IsA("TextButton") then
+                        local t = trimString(child.Text)
+                        if isValidSkillLabelText(t, matchedSlot) then
+                            found[matchedSlot] = found[matchedSlot] or t
                         end
                     end
                 end
+            end
 
-                if (inst:IsA("TextLabel") or inst:IsA("TextButton")) and inst.Visible then
-                    local txt = trimString(inst.Text)
-                    local keyMatch = string.match(txt, "^%[?([1-4])%]?$")
-                    if keyMatch and inst.Parent then
-                        local container = inst.Parent
-                        for _, sib in ipairs(container:GetDescendants()) do
+            if inst:IsA("TextLabel") or inst:IsA("TextButton") then
+                local txt = trimString(inst.Text)
+                local keyMatch = string.match(txt, "^%[?([1-4])%]?$")
+                if keyMatch and inst.Parent then
+                    local container = inst.Parent
+                    for _, sib in ipairs(container:GetDescendants()) do
+                        if (sib:IsA("TextLabel") or sib:IsA("TextButton")) and sib ~= inst then
+                            local sTxt = trimString(sib.Text)
+                            if isValidSkillLabelText(sTxt, keyMatch) then
+                                found[keyMatch] = found[keyMatch] or sTxt
+                            end
+                        end
+                    end
+                    if not found[keyMatch] and container.Parent and container.Parent:IsA("GuiObject") then
+                        for _, sib in ipairs(container.Parent:GetDescendants()) do
                             if (sib:IsA("TextLabel") or sib:IsA("TextButton")) and sib ~= inst then
                                 local sTxt = trimString(sib.Text)
                                 if isValidSkillLabelText(sTxt, keyMatch) then
@@ -522,38 +296,7 @@ local function scanHotbarSkills1To4()
                                 end
                             end
                         end
-                        if not found[keyMatch] and container.Parent and container.Parent:IsA("GuiObject") then
-                            for _, sib in ipairs(container.Parent:GetDescendants()) do
-                                if (sib:IsA("TextLabel") or sib:IsA("TextButton")) and sib ~= inst then
-                                    local sTxt = trimString(sib.Text)
-                                    if isValidSkillLabelText(sTxt, keyMatch) then
-                                        found[keyMatch] = found[keyMatch] or sTxt
-                                    end
-                                end
-                            end
-                        end
-                    elseif isMatchedGrabSkillName(txt) or (inst.AbsolutePosition.Y > vpY * 0.68 and isValidSkillLabelText(txt, "")) then
-                        table.insert(bottomLabels, {
-                            Text = txt,
-                            X = inst.AbsolutePosition.X,
-                        })
                     end
-                end
-            end
-        end
-
-        if not (found["1"] and found["2"] and found["3"] and found["4"]) and #bottomLabels > 0 then
-            table.sort(bottomLabels, function(a, b) return a.X < b.X end)
-            local uniqueLabels = {}
-            for _, item in ipairs(bottomLabels) do
-                if #uniqueLabels == 0 or uniqueLabels[#uniqueLabels].Text ~= item.Text then
-                    table.insert(uniqueLabels, item)
-                end
-            end
-            for i = 1, math.min(4, #uniqueLabels) do
-                local k = tostring(i)
-                if not found[k] then
-                    found[k] = uniqueLabels[i].Text
                 end
             end
         end
@@ -579,22 +322,6 @@ local function scanHotbarSkills1To4()
     return State.DetectedSlotNames
 end
 
-local function getHeroIdentifier()
-    local char = LocalPlayer.Character or State.Char
-    if not char then return "UnknownHero" end
-    local parts = {}
-    for k, v in pairs(char:GetAttributes()) do
-        local lk = string.lower(k)
-        if string.find(lk, "hero") or string.find(lk, "char") or string.find(lk, "class") or string.find(lk, "moveset") then
-            table.insert(parts, k .. "=" .. tostring(v))
-        end
-    end
-    if #parts > 0 then
-        return table.concat(parts, ", ")
-    end
-    return char.Name
-end
-
 local function updateCopyButtonCounter()
     if State.CopyBtnRef and State.CopyBtnRef.Parent then
         State.CopyBtnRef.Text = string.format("📋 COPY LOG TÊN SKILL 1->4 (Đã lưu: %d dòng)", #State.SkillHistoryLogs)
@@ -603,28 +330,22 @@ end
 
 local function addSkillLogEntry(slotStr, skillName, extraInfo)
     if not Config.ScriptRunning or not Config.SkillLoggerEnabled then return end
-    local heroInfo = getHeroIdentifier()
-    local entry = string.format(
-        "[Hero: %s] [Phím %s] Tên Skill: \"%s\" | %s",
-        heroInfo,
-        tostring(slotStr),
-        tostring(skillName),
-        tostring(extraInfo or "")
-    )
+    local entry = string.format("[Phím %s] Skill: \"%s\" | %s", tostring(slotStr), tostring(skillName), tostring(extraInfo or ""))
     if State.SkillHistoryLogs[#State.SkillHistoryLogs] == entry then return end
     table.insert(State.SkillHistoryLogs, entry)
     updateCopyButtonCounter()
 end
 
+-- // KIỂM TRA NHÂN VẬT CÒN ĐANG TRONG SKILL KHÔNG
 local function isCharacterStillInSkill(char)
     if not char then return false end
     for _, child in ipairs(char:GetChildren()) do
         local n = string.lower(child.Name)
-        if n == "usingmove" or n == "skill" or n == "casting" or n == "action" or n == "move" or n == "inmove" then
+        if n == "usingmove" or n == "skill" or n == "casting" or n == "action" or n == "move" or n == "inmove" or n == "attacking" then
             return true
         end
     end
-    if char:GetAttribute("UsingMove") == true or char:GetAttribute("InSkill") == true then
+    if char:GetAttribute("UsingMove") == true or char:GetAttribute("InSkill") == true or char:GetAttribute("Attacking") == true then
         return true
     end
     local track = State.CurrentSkillAnimTrack
@@ -634,6 +355,7 @@ local function isCharacterStillInSkill(char)
     return false
 end
 
+-- // KIỂM TRA KHỚP KÉO (WELD / MOTOR6D / ALIGNPOSITION) VỚI ĐỐI THỦ
 local function resolveModelFromPart(part)
     if not part then return nil end
     local live = Workspace:FindFirstChild("Live")
@@ -642,9 +364,7 @@ local function resolveModelFromPart(part)
         while cur and cur.Parent ~= live do
             cur = cur.Parent
         end
-        if cur and cur:IsA("Model") then
-            return cur
-        end
+        if cur and cur:IsA("Model") then return cur end
     end
     return part:FindFirstAncestorOfClass("Model")
 end
@@ -671,7 +391,7 @@ local function checkGrabJointModel(inst)
                 end
             end
         end
-    elseif inst:IsA("AlignPosition") or inst:IsA("AlignOrientation") then
+    elseif inst:IsA("AlignPosition") then
         local a0, a1 = inst.Attachment0, inst.Attachment1
         if a0 and a1 then
             if a0:IsDescendantOf(myChar) and not a1:IsDescendantOf(myChar) then
@@ -701,12 +421,11 @@ local function checkGrabJointModel(inst)
     return nil
 end
 
-local function getCurrentlyGrabbedModels(includeCloseLocked)
-    local myChar = LocalPlayer.Character or State.Char
-    local myRoot = State.Root
+local function getAllCurrentlyGrabbedModels()
     local grabbedMap = {}
     local grabbedList = {}
-    if not myChar or not myRoot then return grabbedList, grabbedMap end
+    local myChar = LocalPlayer.Character or State.Char
+    if not myChar then return grabbedList, grabbedMap end
 
     for _, desc in ipairs(myChar:GetDescendants()) do
         local m = checkGrabJointModel(desc)
@@ -717,31 +436,14 @@ local function getCurrentlyGrabbedModels(includeCloseLocked)
     end
 
     local liveFolder = Workspace:FindFirstChild("Live")
-    local candidates = liveFolder and liveFolder:GetChildren() or {}
-    for _, enemyModel in ipairs(candidates) do
-        if enemyModel ~= myChar and enemyModel:IsA("Model") and not grabbedMap[enemyModel] then
-            local eRoot = enemyModel:FindFirstChild("HumanoidRootPart")
-            local eHum = enemyModel:FindFirstChildOfClass("Humanoid")
-            if eRoot and eHum and eHum.Health > 0 then
-                local dist = (eRoot.Position - myRoot.Position).Magnitude
-                if dist <= 15 then
+    if liveFolder then
+        for _, enemyModel in ipairs(liveFolder:GetChildren()) do
+            if enemyModel ~= myChar and enemyModel.Name ~= LocalPlayer.Name and enemyModel:IsA("Model") then
+                local eRoot = enemyModel:FindFirstChild("HumanoidRootPart")
+                if eRoot and State.Root and (eRoot.Position - State.Root.Position).Magnitude <= 16 then
                     for _, desc in ipairs(enemyModel:GetDescendants()) do
-                        if checkGrabJointModel(desc) then
-                            grabbedMap[enemyModel] = true
-                            table.insert(grabbedList, enemyModel)
-                            break
-                        end
-                    end
-
-                    if not grabbedMap[enemyModel] and includeCloseLocked and dist <= 7.2 and (tick() - State.LastSkillCastTick) <= 2.2 then
-                        local enemyStunnedOrGrabbed = eHum.PlatformStand
-                            or eRoot.Anchored
-                            or enemyModel:GetAttribute("Ragdoll") == true
-                            or enemyModel:GetAttribute("Stunned") == true
-                            or enemyModel:FindFirstChild("Grabbed") ~= nil
-                            or enemyModel:FindFirstChild("Stun") ~= nil
-                            or enemyModel:FindFirstChild("NoJump") ~= nil
-                        if enemyStunnedOrGrabbed then
+                        local m = checkGrabJointModel(desc)
+                        if m and not grabbedMap[enemyModel] then
                             grabbedMap[enemyModel] = true
                             table.insert(grabbedList, enemyModel)
                         end
@@ -754,8 +456,30 @@ local function getCurrentlyGrabbedModels(includeCloseLocked)
     return grabbedList, grabbedMap
 end
 
--- // CƠ CHẾ VOID KILL
-local function executeVoidKillTrip(reasonText, startupDelayOverride)
+local function getMultiTargetCandidates(onlySelectedInDropdown)
+    local results = {}
+    local myChar = LocalPlayer.Character or State.Char
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character and plr.Character ~= myChar then
+            local allowed = true
+            if onlySelectedInDropdown and not Config.MineSelectAll then
+                allowed = (Config.SelectedMineTargets[plr.Name] == true)
+            end
+            if allowed then
+                local tRoot = plr.Character:FindFirstChild("HumanoidRootPart")
+                local tHum = plr.Character:FindFirstChildOfClass("Humanoid")
+                if tRoot and tHum and tHum.Health > 0 then
+                    table.insert(results, { Model = plr.Character, Root = tRoot, Hum = tHum, Name = plr.Name })
+                end
+            end
+        end
+    end
+    return results
+end
+
+-- // DEEP VOID PLUNGE ENGINE
+local function dropToVoidAndReturnWhenSkillEnds(customWaitBeforeDrop)
     if not Config.ScriptRunning or State.VoidKillActive or not Config.AutoVoidKill then return end
     local myChar = LocalPlayer.Character or State.Char
     local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart") or State.Root
@@ -764,12 +488,13 @@ local function executeVoidKillTrip(reasonText, startupDelayOverride)
 
     State.VoidKillActive = true
     State.VoidReturnCFrame = State.LastSafeCFrame or myRoot.CFrame
+    State.VoidPulseFrameCounter = 0
 
-    local waitBeforeDrop = startupDelayOverride or Config.VoidStartupDelay
+    applySelfVoidImmunity()
 
     task.spawn(function()
-        if waitBeforeDrop > 0 then
-            task.wait(waitBeforeDrop)
+        if customWaitBeforeDrop and customWaitBeforeDrop > 0 then
+            task.wait(customWaitBeforeDrop)
         end
 
         if not Config.ScriptRunning or not Config.AutoVoidKill or not State.Root or not State.Hum or State.Hum.Health <= 0 then
@@ -778,30 +503,14 @@ local function executeVoidKillTrip(reasonText, startupDelayOverride)
             return
         end
 
-        local voidHeight = Workspace.FallenPartsDestroyHeight
-        if voidHeight ~= voidHeight or voidHeight < -10000 or voidHeight > 500 then
-            voidHeight = -500
-        end
-
-        local safeVoidY = voidHeight + Config.VoidDepthOffset
+        local initialVictims = getAllCurrentlyGrabbedModels()
         local basePos = State.VoidReturnCFrame.Position
-        local startPos = State.Root.Position
+        local deepY = math.min(-800, Config.VoidTargetDepth)
 
-        for step = 1, 3 do
-            if State.Root then
-                local alpha = step / 3
-                local curY = startPos.Y + (safeVoidY - startPos.Y) * alpha
-                State.VoidDropTargetCF = CFrame.new(basePos.X, curY, basePos.Z) * CFrame.Angles(math.rad(-90), 0, 0)
-                State.Root.CFrame = State.VoidDropTargetCF
-                State.Root.AssemblyLinearVelocity = Vector3.zero
-            end
-            RunService.Heartbeat:Wait()
-        end
-
-        State.VoidDropTargetCF = CFrame.new(basePos.X, safeVoidY, basePos.Z) * CFrame.Angles(math.rad(-90), 0, 0)
+        State.VoidDropTargetCF = CFrame.new(basePos.X, deepY, basePos.Z) * CFrame.Angles(math.rad(-90), 0, 0)
 
         local dropStartTick = tick()
-        local minStayInVoid = 0.45
+        local minStayInVoid = 0.38
 
         while Config.ScriptRunning and Config.AutoVoidKill and State.Root and State.Hum and State.Hum.Health > 0 do
             local elapsed = tick() - dropStartTick
@@ -809,15 +518,48 @@ local function executeVoidKillTrip(reasonText, startupDelayOverride)
                 break
             end
 
+            applySelfVoidImmunity()
+
+            local currentDeepY = math.min(-800, Config.VoidTargetDepth)
+            State.VoidDropTargetCF = CFrame.new(basePos.X, currentDeepY, basePos.Z) * CFrame.Angles(math.rad(-90), 0, 0)
+
             if State.Root.Anchored then
                 State.Root.Anchored = false
             end
-            State.Root.CFrame = State.VoidDropTargetCF
-            State.Root.AssemblyLinearVelocity = Vector3.zero
+
+            if Config.VoidKillMode == "PulseDeepSlam" then
+                State.VoidPulseFrameCounter = State.VoidPulseFrameCounter + 1
+                if (State.VoidPulseFrameCounter % 5) == 0 then
+                    State.Root.CFrame = State.VoidReturnCFrame
+                else
+                    State.Root.CFrame = State.VoidDropTargetCF
+                end
+            else
+                State.Root.CFrame = State.VoidDropTargetCF
+            end
+
+            State.Root.AssemblyLinearVelocity = Vector3.new(0, -450, 0)
             State.Root.AssemblyAngularVelocity = Vector3.zero
 
-            if elapsed >= minStayInVoid and not isCharacterStillInSkill(State.Char) then
-                break
+            if elapsed >= minStayInVoid then
+                if #initialVictims > 0 then
+                    local allDeadOrGone = true
+                    for _, vModel in ipairs(initialVictims) do
+                        local vHum = vModel and vModel.Parent and vModel:FindFirstChildOfClass("Humanoid")
+                        local vRoot = vModel and vModel.Parent and vModel:FindFirstChild("HumanoidRootPart")
+                        if vHum and vHum.Health > 0 and vRoot then
+                            allDeadOrGone = false
+                            break
+                        end
+                    end
+                    if allDeadOrGone then
+                        break
+                    end
+                end
+
+                if not isCharacterStillInSkill(State.Char) then
+                    break
+                end
             end
 
             RunService.Heartbeat:Wait()
@@ -826,10 +568,8 @@ local function executeVoidKillTrip(reasonText, startupDelayOverride)
         State.VoidDropTargetCF = nil
 
         if State.Root and State.VoidReturnCFrame then
-            for _ = 1, 10 do
-                if State.Root.Anchored then
-                    State.Root.Anchored = false
-                end
+            for _ = 1, 12 do
+                if State.Root.Anchored then State.Root.Anchored = false end
                 State.Root.CFrame = State.VoidReturnCFrame + Vector3.new(0, 3.5, 0)
                 State.Root.AssemblyLinearVelocity = Vector3.zero
                 State.Root.AssemblyAngularVelocity = Vector3.zero
@@ -837,268 +577,464 @@ local function executeVoidKillTrip(reasonText, startupDelayOverride)
             end
         end
 
-        State.ActiveSpecialSkill = nil
         State.VoidKillActive = false
     end)
 end
 
--- // CÁC CHUỖI SKILL ĐẶC BIỆT: MINE / PIERCE THE HEAVENS / BLAST AWAY
-local function runMineMultiTargetSequence()
-    if State.VoidKillActive then return end
-    State.ActiveSpecialSkill = "MINE"
+local function executeMineMultiTargetSequence()
+    if State.VoidKillActive or not Config.AutoVoidKill then return end
+    State.VoidKillActive = true
     State.VoidReturnCFrame = State.LastSafeCFrame or (State.Root and State.Root.CFrame)
 
     task.spawn(function()
         local startWait = tick()
         local firstGrabbed = nil
 
-        while (tick() - startWait) < 2.4 and Config.ScriptRunning and Config.AutoVoidKill and not State.VoidKillActive do
-            local list = getCurrentlyGrabbedModels(true)
-            if #list > 0 then
+        while (tick() - startWait) < 2.2 and Config.ScriptRunning and Config.AutoVoidKill do
+            local list = getAllCurrentlyGrabbedModels()
+            if #list >= 1 then
                 firstGrabbed = list[1]
                 break
             end
             RunService.Heartbeat:Wait()
         end
 
-        if not firstGrabbed or not State.Root then
-            State.ActiveSpecialSkill = nil
-            return
-        end
-
-        for targetName, isSelected in pairs(Config.MineSelectedTargets) do
-            if isSelected and Config.ScriptRunning and Config.AutoVoidKill and State.Root then
-                local tPlr = Players:FindFirstChild(targetName)
-                local tChar = tPlr and tPlr.Character
-                local tRoot = tChar and tChar:FindFirstChild("HumanoidRootPart")
-                local tHum = tChar and tChar:FindFirstChildOfClass("Humanoid")
-                if tChar and tChar ~= firstGrabbed and tRoot and tHum and tHum.Health > 0 then
-                    for _ = 1, 3 do
+        if firstGrabbed and State.Root then
+            local targets = getMultiTargetCandidates(true)
+            for _, t in ipairs(targets) do
+                if t.Model ~= firstGrabbed and t.Root and t.Hum and t.Hum.Health > 0 then
+                    for _ = 1, 2 do
                         if State.Root then
-                            State.Root.CFrame = tRoot.CFrame * CFrame.new(0, 0, -1.2)
+                            State.Root.CFrame = t.Root.CFrame
                             State.Root.AssemblyLinearVelocity = Vector3.zero
                         end
-                        RunService.Heartbeat:Wait()
+                        RunService.RenderStepped:Wait()
                     end
                 end
             end
         end
 
-        executeVoidKillTrip("MINE Multi-Target Chain", 0.02)
+        State.VoidKillActive = false
+        dropToVoidAndReturnWhenSkillEnds(0.02)
     end)
 end
 
-local function runPierceTheHeavensSequence()
-    if State.VoidKillActive then return end
-    State.ActiveSpecialSkill = "Pierce The Heavens"
+local function executePierceTheHeavensSequence()
+    if State.VoidKillActive or not Config.AutoVoidKill then return end
+    State.VoidKillActive = true
     State.VoidReturnCFrame = State.LastSafeCFrame or (State.Root and State.Root.CFrame)
 
     task.spawn(function()
         local startWait = tick()
-        local grabbedList, grabbedMap = {}, {}
+        local firstGrabbed = nil
 
-        while (tick() - startWait) < 3.6 and Config.ScriptRunning and Config.AutoVoidKill and not State.VoidKillActive do
-            grabbedList, grabbedMap = getCurrentlyGrabbedModels(true)
-            if #grabbedList >= 1 then
+        while (tick() - startWait) < 3.2 and Config.ScriptRunning and Config.AutoVoidKill do
+            local list = getAllCurrentlyGrabbedModels()
+            if #list >= 1 then
+                firstGrabbed = list[1]
                 break
             end
             RunService.Heartbeat:Wait()
         end
 
-        if #grabbedList == 0 or not State.Root then
-            State.ActiveSpecialSkill = nil
-            return
-        end
+        if firstGrabbed and State.Root then
+            local _, grabbedMap = getAllCurrentlyGrabbedModels()
+            local count = 1
+            local targets = getMultiTargetCandidates(true)
 
-        local candidates = {}
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer and plr.Character and not grabbedMap[plr.Character] then
-                local eRoot = plr.Character:FindFirstChild("HumanoidRootPart")
-                local eHum = plr.Character:FindFirstChildOfClass("Humanoid")
-                if eRoot and eHum and eHum.Health > 0 then
-                    table.insert(candidates, { Model = plr.Character, Root = eRoot, Dist = (eRoot.Position - State.Root.Position).Magnitude })
-                end
-            end
-        end
-        table.sort(candidates, function(a, b) return a.Dist < b.Dist end)
-
-        for _, cand in ipairs(candidates) do
-            local curList, curMap = getCurrentlyGrabbedModels(true)
-            if #curList >= 3 then break end
-            if not curMap[cand.Model] and cand.Root and cand.Root.Parent then
-                local sweepStart = tick()
-                while (tick() - sweepStart) < 0.16 and Config.ScriptRunning and Config.AutoVoidKill and State.Root do
-                    State.Root.CFrame = cand.Root.CFrame * CFrame.new(0, 0, -1.0)
-                    State.Root.AssemblyLinearVelocity = Vector3.zero
-                    local _, checkMap = getCurrentlyGrabbedModels(true)
-                    if checkMap[cand.Model] then break end
-                    RunService.Heartbeat:Wait()
+            for _, t in ipairs(targets) do
+                if count >= 3 then break end
+                if not grabbedMap[t.Model] and t.Root and t.Hum and t.Hum.Health > 0 then
+                    local sweepStart = tick()
+                    while (tick() - sweepStart) < 0.14 and State.Root and t.Root do
+                        State.Root.CFrame = t.Root.CFrame
+                        State.Root.AssemblyLinearVelocity = Vector3.zero
+                        RunService.Heartbeat:Wait()
+                        local _, nowMap = getAllCurrentlyGrabbedModels()
+                        if nowMap[t.Model] then
+                            grabbedMap[t.Model] = true
+                            break
+                        end
+                    end
+                    count = count + 1
                 end
             end
         end
 
-        executeVoidKillTrip("Pierce The Heavens (Max 3)", 0.02)
+        State.VoidKillActive = false
+        dropToVoidAndReturnWhenSkillEnds(0.02)
     end)
 end
 
-local function runBlastAwayLoopSequence()
-    if State.VoidKillActive then return end
-    State.ActiveSpecialSkill = "BLAST AWAY"
-    State.GrabbedThisCast = {}
+local function executeBlastAwayLoopSequence()
+    if State.VoidKillActive or not Config.AutoVoidKill then return end
+    State.VoidKillActive = true
     State.VoidReturnCFrame = State.LastSafeCFrame or (State.Root and State.Root.CFrame)
+    State.AlreadyGrabbedInSession = {}
 
     task.spawn(function()
         local loopStart = tick()
-        while (tick() - loopStart) < 0.85 and Config.ScriptRunning and Config.AutoVoidKill and State.Root and State.Hum and State.Hum.Health > 0 do
-            local _, grabbedMap = getCurrentlyGrabbedModels(true)
-            for m, _ in pairs(grabbedMap) do
-                State.GrabbedThisCast[m] = true
+        while (tick() - loopStart) < 0.85 and Config.ScriptRunning and Config.AutoVoidKill and State.Root do
+            local _, currentGrabbedMap = getAllCurrentlyGrabbedModels()
+            for m, _ in pairs(currentGrabbedMap) do
+                State.AlreadyGrabbedInSession[m] = true
             end
 
-            local nextTargetRoot = nil
-            local shortest = math.huge
-            for _, plr in ipairs(Players:GetPlayers()) do
-                if plr ~= LocalPlayer and plr.Character and not State.GrabbedThisCast[plr.Character] then
-                    local eRoot = plr.Character:FindFirstChild("HumanoidRootPart")
-                    local eHum = plr.Character:FindFirstChildOfClass("Humanoid")
-                    if eRoot and eHum and eHum.Health > 0 then
-                        local d = (eRoot.Position - State.Root.Position).Magnitude
-                        if d < shortest and d <= 120 then
-                            shortest = d
-                            nextTargetRoot = eRoot
-                        end
+            local targets = getMultiTargetCandidates(true)
+            local touchedAny = false
+
+            for _, t in ipairs(targets) do
+                if not State.AlreadyGrabbedInSession[t.Model] and t.Root and t.Hum and t.Hum.Health > 0 then
+                    touchedAny = true
+                    State.Root.CFrame = t.Root.CFrame
+                    State.Root.AssemblyLinearVelocity = Vector3.zero
+                    RunService.Heartbeat:Wait()
+
+                    local _, updatedMap = getAllCurrentlyGrabbedModels()
+                    if updatedMap[t.Model] then
+                        State.AlreadyGrabbedInSession[t.Model] = true
                     end
                 end
             end
 
-            if nextTargetRoot then
-                State.Root.CFrame = nextTargetRoot.CFrame * CFrame.new(0, 0, -0.8)
-                State.Root.AssemblyLinearVelocity = Vector3.zero
-            else
+            if not touchedAny then
                 break
             end
-
             RunService.Heartbeat:Wait()
         end
 
-        executeVoidKillTrip("BLAST AWAY Loop Sweep", 0.02)
+        State.VoidKillActive = false
+        dropToVoidAndReturnWhenSkillEnds(0.02)
     end)
 end
 
-local KeyMap1To4 = {
-    [Enum.KeyCode.One]   = "1",
-    [Enum.KeyCode.Two]   = "2",
-    [Enum.KeyCode.Three] = "3",
-    [Enum.KeyCode.Four]  = "4",
-}
+local function handleSkillCastForVoidKill(rawSkillName)
+    if not Config.AutoVoidKill or not rawSkillName then return end
+    local clean = normalizeName(rawSkillName)
+    if #clean == 0 then return end
 
-local function onSkillSlotTriggered(slotStr)
-    State.LastKeyPressed = slotStr
-    State.LastSkillCastTick = tick()
-    State.PendingGrabWatchTick = tick()
-
-    local slots = scanHotbarSkills1To4()
-    local skillName = slots[slotStr] or ("Skill_" .. slotStr)
-    State.LastSkillName = skillName
-    local lowerSkill = string.lower(skillName)
-
-    addSkillLogEntry(slotStr, skillName, "Triggered via Key " .. slotStr)
-
-    if not Config.AutoVoidKill or State.VoidKillActive then return end
-    if Config.VoidTriggerMode == "GrabOnly" then return end
-
-    local keyEnabled = (Config.VoidSkillKeys[slotStr] == true)
-    local nameMatched = isMatchedGrabSkillName(skillName)
-    if not (keyEnabled or nameMatched) then
+    if string.find(clean, "phantom shot", 1, true) then
+        local now = tick()
+        if State.PhantomShotStage == 1 and (now - State.PhantomShotFirstTick) <= 4.5 then
+            State.PhantomShotStage = 0
+            addSkillLogEntry(State.LastKeyPressed or "?", rawSkillName, "Phantom Shot LẦN 2 -> Cắm thẳng xuống đáy Void!")
+            dropToVoidAndReturnWhenSkillEnds(Config.VoidStartupDelay)
+        else
+            State.PhantomShotStage = 1
+            State.PhantomShotFirstTick = now
+            addSkillLogEntry(State.LastKeyPressed or "?", rawSkillName, "Phantom Shot LẦN 1 (Chờ lần 2)")
+        end
         return
     end
 
-    if string.find(lowerSkill, "sub zero", 1, true) then
+    if string.find(clean, "sub zero", 1, true) then
         local hum = State.Hum
-        local isAirborne = UserInputService:IsKeyDown(Enum.KeyCode.Space)
-            or (hum and (hum.FloorMaterial == Enum.Material.Air or hum:GetState() == Enum.HumanoidStateType.Freefall or hum:GetState() == Enum.HumanoidStateType.Jumping))
-        if isAirborne then
-            addSkillLogEntry(slotStr, skillName, "Sub Zero dạng Air (Space) -> Bỏ qua Void Kill")
-            State.PendingGrabWatchTick = 0
+        local isAir = (not hum)
+            or (hum.FloorMaterial == Enum.Material.Air)
+            or UserInputService:IsKeyDown(Enum.KeyCode.Space)
+            or (hum:GetState() == Enum.HumanoidStateType.Jumping)
+            or (hum:GetState() == Enum.HumanoidStateType.Freefall)
+
+        if isAir then
+            addSkillLogEntry(State.LastKeyPressed or "?", rawSkillName, "Sub Zero AIR -> Bỏ qua")
+            return
+        else
+            addSkillLogEntry(State.LastKeyPressed or "?", rawSkillName, "Sub Zero GROUND -> Cắm thẳng xuống đáy Void!")
+            dropToVoidAndReturnWhenSkillEnds(Config.VoidStartupDelay)
             return
         end
     end
 
-    if string.find(lowerSkill, "phantom shot", 1, true) then
-        local now = tick()
-        if State.PhantomShotStage == 1 and (now - State.PhantomShotLastTick) <= 6.5 then
-            State.PhantomShotStage = 0
-            addSkillLogEntry(slotStr, skillName, "Phantom Shot Lần 2 -> Kích hoạt Void Kill!")
-            executeVoidKillTrip("Phantom Shot (2nd Cast)", Config.VoidStartupDelay)
-        else
-            State.PhantomShotStage = 1
-            State.PhantomShotLastTick = now
-            State.PendingGrabWatchTick = 0
-            addSkillLogEntry(slotStr, skillName, "Phantom Shot Lần 1 -> Chờ lần đánh 2")
+    if clean == "mine" or string.find(clean, "mine", 1, true) then
+        addSkillLogEntry(State.LastKeyPressed or "?", rawSkillName, "MINE -> Multi-Target Chain TP -> Deep Void!")
+        executeMineMultiTargetSequence()
+        return
+    end
+
+    if string.find(clean, "pierce the heavens", 1, true) then
+        addSkillLogEntry(State.LastKeyPressed or "?", rawSkillName, "Pierce The Heavens -> Gom 3 -> Deep Void!")
+        executePierceTheHeavensSequence()
+        return
+    end
+
+    if string.find(clean, "blast away", 1, true) then
+        addSkillLogEntry(State.LastKeyPressed or "?", rawSkillName, "BLAST AWAY -> Loop chạm -> Deep Void!")
+        executeBlastAwayLoopSequence()
+        return
+    end
+
+    for _, grabSkill in ipairs(StandardGrabSkills) do
+        if string.find(clean, grabSkill, 1, true) then
+            addSkillLogEntry(State.LastKeyPressed or "?", rawSkillName, "Matched Grab Skill -> Cắm thẳng xuống đáy Void!")
+            dropToVoidAndReturnWhenSkillEnds(Config.VoidStartupDelay)
+            return
         end
-        return
     end
-
-    if lowerSkill == "mine" or string.find(lowerSkill, "^mine$") then
-        runMineMultiTargetSequence()
-        return
-    end
-
-    if string.find(lowerSkill, "pierce the heavens", 1, true) then
-        runPierceTheHeavensSequence()
-        return
-    end
-
-    if string.find(lowerSkill, "blast away", 1, true) then
-        runBlastAwayLoopSequence()
-        return
-    end
-
-    task.spawn(function()
-        local waitStart = tick()
-        while (tick() - waitStart) < 1.35 and Config.ScriptRunning and Config.AutoVoidKill and not State.VoidKillActive do
-            local list = getCurrentlyGrabbedModels(true)
-            if #list > 0 then
-                executeVoidKillTrip("Confirmed Grab on " .. skillName, 0.04)
-                return
-            end
-            if keyEnabled and (tick() - waitStart) >= Config.VoidStartupDelay then
-                executeVoidKillTrip("Selected Key " .. slotStr, 0.01)
-                return
-            end
-            RunService.Heartbeat:Wait()
-        end
-    end)
 end
 
--- // ANTI-SKILL: BÁN KÍNH GẦN + ẢO ẢNH DI CHUYỂN TỰ DO KHÔNG BỊ STUN
-local function isEnemyActuallyCastingSkillNearMe(enemyChar, enemyRoot, myPosition)
-    if not enemyChar or not enemyRoot then return false end
-    local dist = (enemyRoot.Position - myPosition).Magnitude
-    if dist > Config.AntiSkillRange then return false end
+-- // ANTI-SKILL ENGINE (TẠO BẢN ẢO ẢNH MỜ TẠI CHỖ + ĐƯA NHÂN VẬT GỐC BAY RA XA)
+local function createGhostCloneAt(cframePos)
+    if State.AntiSkillGhostModel then
+        pcall(function() State.AntiSkillGhostModel:Destroy() end)
+        State.AntiSkillGhostModel = nil
+    end
 
-    local dirToMe = (myPosition - enemyRoot.Position)
-    local isAimingAtMe = (dist <= 9.5) or (dirToMe.Magnitude > 0.1 and enemyRoot.CFrame.LookVector:Dot(dirToMe.Unit) >= 0.25)
-    if not isAimingAtMe then return false end
+    local myChar = LocalPlayer.Character or State.Char
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myChar or not myRoot then return nil end
 
-    if enemyChar:GetAttribute("UsingMove") == true or enemyChar:GetAttribute("InSkill") == true or enemyChar:GetAttribute("Skill") == true then
+    local ghost = Instance.new("Model")
+    ghost.Name = "NovaAntiSkillIllusion"
+
+    local ghostRoot = nil
+    for _, part in ipairs(myChar:GetChildren()) do
+        if part:IsA("BasePart") then
+            local cp = Instance.new("Part")
+            cp.Name = part.Name
+            cp.Size = part.Size
+            cp.Color = Color3.fromRGB(90, 195, 255)
+            cp.Material = Enum.Material.ForceField
+            cp.Transparency = (part.Name == "HumanoidRootPart") and 1 or 0.45
+            cp.Anchored = true
+            cp.CanCollide = false
+            cp.CFrame = cframePos * (myRoot.CFrame:ToObjectSpace(part.CFrame))
+            cp.Parent = ghost
+            if part.Name == "HumanoidRootPart" then
+                ghostRoot = cp
+            end
+        end
+    end
+
+    ghost.PrimaryPart = ghostRoot
+    ghost.Parent = Workspace
+    State.AntiSkillGhostModel = ghost
+    return ghostRoot
+end
+
+local function removeGhostCloneAndRestoreCamera()
+    if State.AntiSkillGhostModel then
+        pcall(function() State.AntiSkillGhostModel:Destroy() end)
+        State.AntiSkillGhostModel = nil
+    end
+    if State.Hum then
+        Camera.CameraSubject = State.Hum
+    end
+end
+
+local function isEnemyUsingSkillNearby()
+    local myChar = LocalPlayer.Character or State.Char
+    local myRoot = State.Root
+    if not myChar or not myRoot then return false end
+
+    local refPos = State.AntiSkillEvading and (State.AntiSkillAnchorCF and State.AntiSkillAnchorCF.Position or myRoot.Position) or myRoot.Position
+    local range = Config.AntiSkillDetectRange
+
+    local function checkEnemyModel(eModel)
+        local eRoot = eModel:FindFirstChild("HumanoidRootPart")
+        local eHum = eModel:FindFirstChildOfClass("Humanoid")
+        if not eRoot or not eHum or eHum.Health <= 0 then return false end
+        if (eRoot.Position - refPos).Magnitude > range then return false end
+
+        if isCharacterStillInSkill(eModel) then
+            return true
+        end
+
+        local animator = eHum:FindFirstChildOfClass("Animator")
+        if animator then
+            for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                if track.IsPlaying and (
+                    track.Priority == Enum.AnimationPriority.Action
+                    or track.Priority == Enum.AnimationPriority.Action2
+                    or track.Priority == Enum.AnimationPriority.Action3
+                    or track.Priority == Enum.AnimationPriority.Action4
+                ) then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    local liveFolder = Workspace:FindFirstChild("Live")
+    if liveFolder then
+        for _, m in ipairs(liveFolder:GetChildren()) do
+            if m ~= myChar and m.Name ~= LocalPlayer.Name and m:IsA("Model") then
+                if checkEnemyModel(m) then return true end
+            end
+        end
+    end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            if checkEnemyModel(plr.Character) then return true end
+        end
+    end
+
+    return false
+end
+
+local function updateAntiSkillSystem()
+    if not Config.ScriptRunning or not Config.AntiSkillEnabled or State.VoidKillActive then
+        if State.AntiSkillEvading then
+            State.AntiSkillEvading = false
+            removeGhostCloneAndRestoreCamera()
+            if State.Root and State.AntiSkillAnchorCF then
+                State.Root.CFrame = State.AntiSkillAnchorCF
+                State.Root.AssemblyLinearVelocity = Vector3.zero
+            end
+            State.AntiSkillAnchorCF = nil
+        end
+        return
+    end
+
+    local root = State.Root
+    local hum = State.Hum
+    if not root or not hum or hum.Health <= 0 then return end
+
+    local enemyCasting = isEnemyUsingSkillNearby()
+    if enemyCasting then
+        State.AntiSkillHoldUntil = tick() + 0.32
+    end
+
+    if tick() < State.AntiSkillHoldUntil then
+        if not State.AntiSkillEvading then
+            State.AntiSkillEvading = true
+            State.AntiSkillAnchorCF = root.CFrame
+            local ghostRoot = createGhostCloneAt(State.AntiSkillAnchorCF)
+            if ghostRoot then
+                Camera.CameraSubject = ghostRoot
+            end
+        end
+
+        root.CFrame = State.AntiSkillAnchorCF + Config.AntiSkillSafeOffset
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    elseif State.AntiSkillEvading then
+        State.AntiSkillEvading = false
+        removeGhostCloneAndRestoreCamera()
+        if State.AntiSkillAnchorCF then
+            root.CFrame = State.AntiSkillAnchorCF
+            root.AssemblyLinearVelocity = Vector3.zero
+            State.AntiSkillAnchorCF = nil
+        end
+    end
+end
+
+-- // WALL COMBO v24: CHỈ KÍCH HOẠT KHI BẤM CHUỘT TRÁI (M1) + ĐÁNH DÍNH ĐỐI PHƯƠNG + ĐẶT CÂY SAU LƯNG ĐỐI PHƯƠNG
+local function restoreMapTreePart()
+    if State.CachedTreePart and State.CachedTreePart.Parent and State.CachedTreeOrigCF then
+        pcall(function()
+            State.CachedTreePart.CFrame = State.CachedTreeOrigCF
+            State.CachedTreePart.CanCollide = State.CachedTreeOrigCollide
+            State.CachedTreePart.Anchored = State.CachedTreeOrigAnchored
+            State.CachedTreePart.LocalTransparencyModifier = 0
+        end)
+    end
+    State.TreeIsCurrentlyMoved = false
+end
+
+local function updateTreeStatusUI()
+    if State.TreeStatusLabel and State.TreeStatusLabel.Parent then
+        if State.CachedTreePart and State.CachedTreePart.Parent then
+            State.TreeStatusLabel.Text = "🌳 Cây đang dùng: " .. State.CachedTreePart:GetFullName()
+            State.TreeStatusLabel.TextColor3 = Color3.fromRGB(115, 235, 155)
+        else
+            State.TreeStatusLabel.Text = "🌳 Cây đang dùng: Chưa tìm thấy (Bấm nút Quét Cây bên dưới)"
+            State.TreeStatusLabel.TextColor3 = Color3.fromRGB(255, 175, 105)
+        end
+    end
+end
+
+local function lockTreeCandidate(part)
+    if not part or not part:IsA("BasePart") then return nil end
+    restoreMapTreePart()
+    State.CachedTreePart = part
+    State.CachedTreeOrigCF = part.CFrame
+    State.CachedTreeOrigCollide = part.CanCollide
+    State.CachedTreeOrigAnchored = part.Anchored
+    updateTreeStatusUI()
+    return part
+end
+
+local function scanAndFindRealMapTree(preferNearestToPlayer)
+    if not preferNearestToPlayer and State.CachedTreePart and State.CachedTreePart.Parent then
+        return State.CachedTreePart
+    end
+
+    local myChar = LocalPlayer.Character or State.Char
+    local myRoot = State.Root
+    local refPos = myRoot and myRoot.Position or Vector3.zero
+    local live = Workspace:FindFirstChild("Live")
+
+    local bestPart = nil
+    local bestScore = math.huge
+
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst:IsA("BasePart")
+            and inst.CanCollide
+            and inst.Name ~= "Terrain"
+            and inst.Name ~= "CameraOcclusionPart"
+            and (not myChar or not inst:IsDescendantOf(myChar))
+            and (not live or not inst:IsDescendantOf(live)) then
+
+            if inst.Size.X < 85 and inst.Size.Z < 85 and inst.Size.Y >= 3.2 and inst.Size.Y <= 110 then
+                local fullPath = string.lower(inst:GetFullName())
+                local isTreeNamed = (
+                    string.find(fullPath, "tree", 1, true)
+                    or string.find(fullPath, "trunk", 1, true)
+                    or string.find(fullPath, "wood", 1, true)
+                    or string.find(fullPath, "pine", 1, true)
+                    or string.find(fullPath, "foliage", 1, true)
+                    or inst.Material == Enum.Material.Wood
+                    or inst.Material == Enum.Material.WoodPlanks
+                )
+
+                if isTreeNamed or preferNearestToPlayer then
+                    local dist = (inst.Position - refPos).Magnitude
+                    local score = isTreeNamed and dist or (dist + 5000)
+                    if score < bestScore then
+                        bestScore = score
+                        bestPart = inst
+                    end
+                end
+            end
+        end
+    end
+
+    if bestPart then
+        return lockTreeCandidate(bestPart)
+    end
+    updateTreeStatusUI()
+    return nil
+end
+
+-- Kiểm tra xem đối phương có đang bị dính đòn đánh (Hitstun / Tụt máu) hay không
+local function isEnemyCurrentlyBeingHit(enemyModel, enemyHum)
+    local now = tick()
+    local prevHP = State.EnemyHealthCache[enemyModel]
+    local curHP = enemyHum.Health
+
+    if prevHP and curHP < prevHP then
+        State.EnemyLastDamagedTick[enemyModel] = now
+    end
+    State.EnemyHealthCache[enemyModel] = curHP
+
+    -- 1. Vừa bị mất máu trong 0.85 giây gần nhất (đang ăn chuỗi combo M1)
+    if State.EnemyLastDamagedTick[enemyModel] and (now - State.EnemyLastDamagedTick[enemyModel]) <= 0.85 then
         return true
     end
 
-    for _, child in ipairs(enemyChar:GetChildren()) do
+    -- 2. Hoặc trên người đối phương có tag Stun / Hitstun / Damaged do đòn M1 tạo ra
+    for _, child in ipairs(enemyModel:GetChildren()) do
         local n = string.lower(child.Name)
-        if n == "usingmove" or n == "skill" or n == "casting" or n == "inmove" or n == "heavy" or n == "nojump" then
-            return true
-        end
-        if child:IsA("Tool") then
+        if string.find(n, "stun", 1, true) or string.find(n, "hit", 1, true) or string.find(n, "damaged", 1, true) or string.find(n, "ragdoll", 1, true) then
             return true
         end
     end
-
-    for _, desc in ipairs(enemyRoot:GetChildren()) do
-        if desc:IsA("BodyVelocity") or desc:IsA("BodyPosition") or desc:IsA("LinearVelocity") or desc:IsA("BodyGyro") or desc:IsA("AlignPosition") then
-            local dn = string.lower(desc.Name)
-            if not string.find(dn, "knockback") and not string.find(dn, "stun") then
+    for attrName, attrVal in pairs(enemyModel:GetAttributes()) do
+        if attrVal == true then
+            local n = string.lower(attrName)
+            if string.find(n, "stun", 1, true) or string.find(n, "hit", 1, true) then
                 return true
             end
         end
@@ -1107,110 +1043,107 @@ local function isEnemyActuallyCastingSkillNearMe(enemyChar, enemyRoot, myPositio
     return false
 end
 
-local function detectNearbyEnemySkillThreat()
-    local refPos = State.AntiSkillEvading and (State.DecoyCFrame and State.DecoyCFrame.Position) or (State.Root and State.Root.Position)
-    if not refPos then return false end
+-- Tìm đối phương đang đứng trước mặt và bị đánh trúng bởi M1 của bạn
+local function findM1HitTargetForWallCombo()
+    local myChar = LocalPlayer.Character or State.Char
+    local myRoot = State.Root
+    if not myChar or not myRoot then return nil end
+
+    local bestEnemyRoot = nil
+    local shortestDist = Config.WallComboMaxM1Range
+    local myPos = myRoot.Position
+    local myLook = myRoot.CFrame.LookVector
+
+    local function evaluateEnemyModel(m)
+        local eRoot = m:FindFirstChild("HumanoidRootPart")
+        local eHum = m:FindFirstChildOfClass("Humanoid")
+        if not eRoot or not eHum or eHum.Health <= 0 then return end
+
+        local offset = eRoot.Position - myPos
+        local dist = offset.Magnitude
+        if dist > shortestDist then return end
+
+        -- Cập nhật bộ theo dõi máu/hitstun của đối phương
+        local isHit = isEnemyCurrentlyBeingHit(m, eHum)
+
+        -- Kiểm tra đối phương nằm ở phía trước hướng đánh của mình (dot >= -0.15)
+        local flatDir = Vector3.new(offset.X, 0, offset.Z)
+        local dot = (flatDir.Magnitude > 0.05) and flatDir.Unit:Dot(Vector3.new(myLook.X, 0, myLook.Z).Unit) or 1
+
+        if dot >= -0.15 then
+            if Config.WallComboMode == "M1HitConfirm" then
+                if isHit then
+                    shortestDist = dist
+                    bestEnemyRoot = eRoot
+                end
+            else
+                -- Chế độ M1NearEnemy: chỉ cần bấm M1 khi địch ở ngay trước mặt
+                shortestDist = dist
+                bestEnemyRoot = eRoot
+            end
+        end
+    end
+
+    local liveFolder = Workspace:FindFirstChild("Live")
+    if liveFolder then
+        for _, m in ipairs(liveFolder:GetChildren()) do
+            if m ~= myChar and m.Name ~= LocalPlayer.Name and m:IsA("Model") then
+                evaluateEnemyModel(m)
+            end
+        end
+    end
 
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer and plr.Character then
-            local eRoot = plr.Character:FindFirstChild("HumanoidRootPart")
-            local eHum = plr.Character:FindFirstChildOfClass("Humanoid")
-            if eRoot and eHum and eHum.Health > 0 then
-                if isEnemyActuallyCastingSkillNearMe(plr.Character, eRoot, refPos) then
-                    return true
-                end
-            end
+            evaluateEnemyModel(plr.Character)
         end
     end
-    return false
+
+    return bestEnemyRoot
 end
 
-local function spawnMovableGhostDecoy(startCF)
-    if State.DecoyModel then
-        pcall(function() State.DecoyModel:Destroy() end)
-        State.DecoyModel = nil
-    end
-    if State.DecoyCameraProxy then
-        pcall(function() State.DecoyCameraProxy:Destroy() end)
-        State.DecoyCameraProxy = nil
+local function updateWallComboSystem()
+    if not Config.ScriptRunning or not Config.WallComboEnabled or State.VoidKillActive or State.AntiSkillEvading then
+        if State.TreeIsCurrentlyMoved then
+            restoreMapTreePart()
+        end
+        return
     end
 
-    local myChar = LocalPlayer.Character or State.Char
-    if not myChar then return end
+    local root = State.Root
+    if not root then return end
 
-    State.DecoyCFrame = startCF
+    -- Chỉ kích hoạt khi người chơi đang nhấn/giữ Chuột Trái (M1) hoặc vừa nhấp M1 trong 0.55 giây gần nhất
+    local isM1Active = State.IsLeftMouseDown or ((tick() - State.LastM1ClickTick) <= 0.55)
+    local hitEnemyRoot = findM1HitTargetForWallCombo()
 
-    local prevArch = myChar.Archivable
-    myChar.Archivable = true
-    local clone = myChar:Clone()
-    myChar.Archivable = prevArch
+    if isM1Active and hitEnemyRoot then
+        local treePart = scanAndFindRealMapTree(false)
+        if not treePart then return end
 
-    if clone then
-        clone.Name = "NovaMovableGhostDecoy"
-        for _, desc in ipairs(clone:GetDescendants()) do
-            if desc:IsA("LocalScript") or desc:IsA("Script") or desc:IsA("RemoteEvent") or desc:IsA("RemoteFunction") or desc:IsA("BodyMover") then
-                desc:Destroy()
-            elseif desc:IsA("BasePart") then
-                desc.Anchored = true
-                desc.CanCollide = false
-                if desc.Name == "HumanoidRootPart" then
-                    desc.Transparency = 1
-                else
-                    desc.Transparency = 0.55
-                    desc.Color = Color3.fromRGB(110, 205, 255)
-                end
-            elseif desc:IsA("Decal") then
-                desc.Transparency = 0.55
+        State.TreeIsCurrentlyMoved = true
+        pcall(function()
+            treePart.Anchored = true
+            treePart.CanCollide = true
+            treePart.LocalTransparencyModifier = 0.65
+
+            -- Tính hướng đấm từ nhân vật của bạn xuyên qua đối phương để đặt Cây NGAY ĐẰNG SAU LƯNG ĐỐI PHƯƠNG
+            local flatVec = Vector3.new(hitEnemyRoot.Position.X - root.Position.X, 0, hitEnemyRoot.Position.Z - root.Position.Z)
+            local attackDir
+            if flatVec.Magnitude > 0.05 then
+                attackDir = flatVec.Unit
+            else
+                local look = root.CFrame.LookVector
+                attackDir = Vector3.new(look.X, 0, look.Z).Unit
             end
-        end
-        local dRoot = clone:FindFirstChild("HumanoidRootPart")
-        if dRoot then
-            clone.PrimaryPart = dRoot
-            clone:PivotTo(startCF)
-        end
 
-        local hl = Instance.new("Highlight")
-        hl.FillColor = Color3.fromRGB(70, 185, 255)
-        hl.OutlineColor = Color3.fromRGB(215, 245, 255)
-        hl.FillTransparency = 0.55
-        hl.OutlineTransparency = 0.2
-        hl.Parent = clone
-
-        clone.Parent = Workspace
-        State.DecoyModel = clone
+            -- Vị trí sau lưng đối phương = Vị trí đối phương + (hướng đấm * khoảng cách sau lưng)
+            local behindEnemyPos = hitEnemyRoot.Position + (attackDir * Config.WallComboBehindEnemyDist)
+            treePart.CFrame = CFrame.lookAt(behindEnemyPos, hitEnemyRoot.Position)
+        end)
+    elseif State.TreeIsCurrentlyMoved then
+        restoreMapTreePart()
     end
-
-    local camProxy = Instance.new("Part")
-    camProxy.Name = "NovaDecoyCamSubject"
-    camProxy.Size = Vector3.new(1, 1, 1)
-    camProxy.Transparency = 1
-    camProxy.Anchored = true
-    camProxy.CanCollide = false
-    camProxy.CFrame = startCF + Vector3.new(0, 1.5, 0)
-    camProxy.Parent = Workspace
-    State.DecoyCameraProxy = camProxy
-
-    Camera.CameraSubject = camProxy
-end
-
-local function stopMovableGhostDecoy()
-    local returnCF = State.DecoyCFrame
-    if State.DecoyModel then
-        pcall(function() State.DecoyModel:Destroy() end)
-        State.DecoyModel = nil
-    end
-    if State.DecoyCameraProxy then
-        pcall(function() State.DecoyCameraProxy:Destroy() end)
-        State.DecoyCameraProxy = nil
-    end
-    if State.Hum then
-        Camera.CameraSubject = State.Hum
-    end
-    if State.Root and returnCF then
-        State.Root.CFrame = returnCF
-        State.Root.AssemblyLinearVelocity = Vector3.zero
-    end
-    State.DecoyCFrame = nil
 end
 
 -- // FULL ANTI-STUN ENGINE
@@ -1277,51 +1210,18 @@ local function enforceOldFullAntiStun(char, root, hum)
     end
 
     local targetWS = Config.SpeedEnabled and Config.WalkSpeed or 16
-    if hum.WalkSpeed < targetWS then
-        hum.WalkSpeed = targetWS
-    end
+    if hum.WalkSpeed < targetWS then hum.WalkSpeed = targetWS end
     local targetJP = Config.JumpBoostEnabled and Config.JumpPower or 50
-    if hum.UseJumpPower and hum.JumpPower < targetJP then
-        hum.JumpPower = targetJP
-    end
+    if hum.UseJumpPower and hum.JumpPower < targetJP then hum.JumpPower = targetJP end
 
-    for _, child in ipairs(char:GetChildren()) do
-        cleanStunInstance(child)
-    end
-    for _, child in ipairs(root:GetChildren()) do
-        cleanStunInstance(child)
-    end
+    for _, child in ipairs(char:GetChildren()) do cleanStunInstance(child) end
+    for _, child in ipairs(root:GetChildren()) do cleanStunInstance(child) end
 
     for attrName, attrVal in pairs(char:GetAttributes()) do
-        if isStunName(attrName) and attrVal == true then
-            char:SetAttribute(attrName, false)
-        end
+        if isStunName(attrName) and attrVal == true then char:SetAttribute(attrName, false) end
     end
     for attrName, attrVal in pairs(hum:GetAttributes()) do
-        if isStunName(attrName) and attrVal == true then
-            hum:SetAttribute(attrName, false)
-        end
-    end
-end
-
-local function scanProximityGrab()
-    if not Config.ScriptRunning or not Config.AutoVoidKill or State.VoidKillActive then return end
-    if Config.VoidTriggerMode == "SelectedKeysOnly" then return end
-    if State.ActiveSpecialSkill ~= nil then return end
-
-    if string.find(string.lower(State.LastSkillName or ""), "phantom shot", 1, true) and State.PhantomShotStage == 1 then
-        return
-    end
-
-    local watchWindowActive = ((tick() - State.PendingGrabWatchTick) <= 1.8)
-    local grabbedList = getCurrentlyGrabbedModels(watchWindowActive)
-    if #grabbedList > 0 then
-        local victim = grabbedList[1]
-        if State.LastKeyPressed then
-            addSkillLogEntry(State.LastKeyPressed, State.LastSkillName, "PHÁT HIỆN GRAB TRÚNG -> Target: " .. tostring(victim.Name))
-        end
-        State.PendingGrabWatchTick = 0
-        executeVoidKillTrip("Grab Detected on " .. tostring(victim.Name), 0.04)
+        if isStunName(attrName) and attrVal == true then hum:SetAttribute(attrName, false) end
     end
 end
 
@@ -1338,9 +1238,12 @@ local function bindCharacter(char)
 
     if not State.Root or not State.Hum then return end
 
+    applySelfVoidImmunity()
+
     task.delay(0.6, function()
         if Config.ScriptRunning then
             scanHotbarSkills1To4()
+            scanAndFindRealMapTree(false)
         end
     end)
 
@@ -1353,11 +1256,10 @@ local function bindCharacter(char)
                     if (tick() - State.LastSkillCastTick) <= 1.5 and State.LastKeyPressed then
                         State.CurrentSkillAnimTrack = track
                         local animId = track.Animation and track.Animation.AnimationId or "nil"
-                        local len = track.Length or 0
                         addSkillLogEntry(
                             State.LastKeyPressed,
                             State.LastSkillName,
-                            string.format("AnimID=%s | Duration=%.2fs", tostring(animId), len)
+                            string.format("AnimID=%s | Duration=%.2fs", tostring(animId), track.Length or 0)
                         )
                     end
                 end)
@@ -1372,54 +1274,25 @@ local function bindCharacter(char)
             local slotKey = State.LastKeyPressed or "?"
             State.LastSkillName = inst.Name
             State.LastSkillCastTick = tick()
-            State.PendingGrabWatchTick = tick()
             addSkillLogEntry(slotKey, inst.Name, "Equipped Skill Tool")
+            handleSkillCastForVoidKill(inst.Name)
         end
 
         if Config.AntiStunEnabled then
             cleanStunInstance(inst)
         end
 
-        if Config.AutoVoidKill and not State.VoidKillActive and Config.VoidTriggerMode ~= "SelectedKeysOnly" and State.ActiveSpecialSkill == nil then
+        if Config.AutoVoidKill and not State.VoidKillActive then
             task.defer(function()
-                if string.find(string.lower(State.LastSkillName or ""), "phantom shot", 1, true) and State.PhantomShotStage == 1 then
-                    return
-                end
                 local victim = checkGrabJointModel(inst)
                 if victim then
-                    if State.LastKeyPressed then
-                        addSkillLogEntry(State.LastKeyPressed, State.LastSkillName, string.format("KHỚP KÉO (%s) dính vào %s", inst.Name, victim.Name))
+                    local cleanLast = normalizeName(State.LastSkillName)
+                    if string.find(cleanLast, "sub zero", 1, true) and State.Hum and State.Hum.FloorMaterial == Enum.Material.Air then
+                        return
                     end
-                    executeVoidKillTrip("Instant Descendant Grab", 0.04)
+                    dropToVoidAndReturnWhenSkillEnds(0.03)
                 end
             end)
-        end
-    end))
-
-    table.insert(State.CharConnections, char.AttributeChanged:Connect(function(attrName)
-        if Config.ScriptRunning and Config.AntiStunEnabled and isStunName(attrName) then
-            if char:GetAttribute(attrName) == true then
-                char:SetAttribute(attrName, false)
-            end
-        end
-    end))
-
-    table.insert(State.CharConnections, State.Hum.AttributeChanged:Connect(function(attrName)
-        if Config.ScriptRunning and Config.AntiStunEnabled and isStunName(attrName) then
-            if State.Hum:GetAttribute(attrName) == true then
-                State.Hum:SetAttribute(attrName, false)
-            end
-        end
-    end))
-
-    table.insert(State.CharConnections, State.Hum.StateChanged:Connect(function(_, newState)
-        if Config.ScriptRunning and Config.AntiStunEnabled then
-            if newState == Enum.HumanoidStateType.Ragdoll
-                or newState == Enum.HumanoidStateType.FallingDown
-                or newState == Enum.HumanoidStateType.Physics
-                or newState == Enum.HumanoidStateType.PlatformStanding then
-                State.Hum:ChangeState(Enum.HumanoidStateType.Running)
-            end
         end
     end))
 end
@@ -1491,6 +1364,28 @@ local function makeDraggable(dragHandle, targetFrame, onTapCallback)
             )
         end
     end))
+end
+
+local function findNearestValidPlayer()
+    local myRoot = State.Root
+    local refPos = myRoot and myRoot.Position or Camera.CFrame.Position
+    local closestPlayer = nil
+    local shortestDist = math.huge
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local tRoot = plr.Character:FindFirstChild("HumanoidRootPart")
+            local tHum = plr.Character:FindFirstChildOfClass("Humanoid")
+            if tRoot and tHum and tHum.Health > 0 then
+                local dist = (tRoot.Position - refPos).Magnitude
+                if dist < shortestDist then
+                    shortestDist = dist
+                    closestPlayer = plr
+                end
+            end
+        end
+    end
+    return closestPlayer
 end
 
 -- // SHARED CAMERA FLOOR PAD & INVISIBLE CLEANUP HELPERS
@@ -1658,7 +1553,7 @@ makeDraggable(AimPopBtn, AimbotPopup, function()
     setAimbotActiveState(not Config.AimbotActive)
 end)
 
--- // 3. FLUENT ACRYLIC MAIN WINDOW (NOVA HUB v23)
+-- // 3. FLUENT ACRYLIC MAIN WINDOW (NOVA HUB v24)
 local NormalSize = UDim2.new(0, 560, 0, 360)
 
 local MainFrame = Instance.new("Frame")
@@ -1719,10 +1614,10 @@ local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 290, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v23 (Zero-Fling Wall Combo)"
+SubTitle.Text = "Heroes Battlegrounds v24 (M1 Hit-Confirm Wall Combo)"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
-SubTitle.TextSize = 12
+SubTitle.TextSize = 11
 SubTitle.TextXAlignment = Enum.TextXAlignment.Left
 SubTitle.Parent = TopBar
 
@@ -1785,14 +1680,16 @@ local function unloadEntireScript()
     Config.AutoTargetEnabled = false
     Config.AutoVoidKill = false
     Config.AntiVoidEnabled = false
-    Config.AntiStunEnabled = false
+    Config.VoidImmunityNaN = false
     Config.AntiSkillEnabled = false
     Config.WallComboEnabled = false
+    Config.AntiStunEnabled = false
     Config.AimbotActive = false
     Config.ESPEnabled = false
 
-    pcall(stopMovableGhostDecoy)
-    pcall(restoreActiveWallTree)
+    pcall(restoreDefaultVoidDestroyHeight)
+    pcall(removeGhostCloneAndRestoreCamera)
+    pcall(restoreMapTreePart)
     pcall(cleanupInvisible)
     pcall(clearFlyPad)
 
@@ -1800,6 +1697,7 @@ local function unloadEntireScript()
         pcall(function()
             State.Hum.WalkSpeed = 16
             State.Hum.JumpPower = 50
+            State.Hum:SetStateEnabled(Enum.HumanoidStateType.Dead, true)
             State.Hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
             State.Hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
         end)
@@ -1858,7 +1756,7 @@ local SectionHeader = Instance.new("TextLabel")
 SectionHeader.Size = UDim2.new(1, 0, 0, 32)
 SectionHeader.Position = UDim2.new(0, 4, 0, 0)
 SectionHeader.BackgroundTransparency = 1
-SectionHeader.Text = "Void Kill & Skill Log"
+SectionHeader.Text = "AntiSkill & Wall"
 SectionHeader.TextColor3 = Color3.fromRGB(245, 247, 252)
 SectionHeader.Font = Enum.Font.GothamBold
 SectionHeader.TextSize = 20
@@ -1977,7 +1875,7 @@ local function addFeatureToggle(parent, id, label, shortName, defaultState, call
     Label.Text = label
     Label.TextColor3 = Color3.fromRGB(230, 234, 242)
     Label.Font = Enum.Font.GothamMedium
-    Label.TextSize = 13
+    Label.TextSize = 12
     Label.TextXAlignment = Enum.TextXAlignment.Left
     Label.Parent = Card
 
@@ -2093,7 +1991,163 @@ local function addFeatureToggle(parent, id, label, shortName, defaultState, call
     State.ToggleRegistry[id] = setFeatureState
 end
 
--- // FLUENT CARD SINGLE DROPDOWN BUILDER
+-- // MULTI-SELECT DROPDOWN BUILDER
+local function addMultiSelectDropdown(parent, label, getOptionsFunc)
+    local isOpen = false
+
+    local Container = Instance.new("Frame")
+    Container.Size = UDim2.new(1, 0, 0, 44)
+    Container.BackgroundColor3 = Color3.fromRGB(32, 34, 40)
+    Container.BackgroundTransparency = 0.25
+    Container.BorderSizePixel = 0
+    Container.ClipsDescendants = true
+    Container.Parent = parent
+    Instance.new("UICorner", Container).CornerRadius = UDim.new(0, 6)
+
+    local CardStroke = Instance.new("UIStroke", Container)
+    CardStroke.Color = Color3.fromRGB(52, 56, 66)
+    CardStroke.Transparency = 0.4
+    CardStroke.Thickness = 1
+
+    local HeaderBtn = Instance.new("TextButton")
+    HeaderBtn.Size = UDim2.new(1, 0, 0, 44)
+    HeaderBtn.BackgroundTransparency = 1
+    HeaderBtn.Text = ""
+    HeaderBtn.AutoButtonColor = false
+    HeaderBtn.Parent = Container
+
+    local TitleLbl = Instance.new("TextLabel")
+    TitleLbl.Size = UDim2.new(0.55, -14, 1, 0)
+    TitleLbl.Position = UDim2.new(0, 14, 0, 0)
+    TitleLbl.BackgroundTransparency = 1
+    TitleLbl.Text = label
+    TitleLbl.TextColor3 = Color3.fromRGB(230, 234, 242)
+    TitleLbl.Font = Enum.Font.GothamMedium
+    TitleLbl.TextSize = 12
+    TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
+    TitleLbl.Parent = HeaderBtn
+
+    local SelectBox = Instance.new("Frame")
+    SelectBox.Size = UDim2.new(0.42, -14, 0, 28)
+    SelectBox.Position = UDim2.new(0.58, 0, 0.5, -14)
+    SelectBox.BackgroundColor3 = Color3.fromRGB(40, 43, 50)
+    SelectBox.BackgroundTransparency = 0.15
+    SelectBox.BorderSizePixel = 0
+    SelectBox.Parent = HeaderBtn
+    Instance.new("UICorner", SelectBox).CornerRadius = UDim.new(0, 5)
+
+    local BoxStroke = Instance.new("UIStroke", SelectBox)
+    BoxStroke.Color = Color3.fromRGB(65, 70, 82)
+    BoxStroke.Thickness = 1
+
+    local ValueLbl = Instance.new("TextLabel")
+    ValueLbl.Size = UDim2.new(1, -28, 1, 0)
+    ValueLbl.Position = UDim2.new(0, 10, 0, 0)
+    ValueLbl.BackgroundTransparency = 1
+    ValueLbl.Text = "All Players (Default)"
+    ValueLbl.TextColor3 = Color3.fromRGB(115, 215, 255)
+    ValueLbl.Font = Enum.Font.GothamMedium
+    ValueLbl.TextSize = 11
+    ValueLbl.TextXAlignment = Enum.TextXAlignment.Left
+    ValueLbl.TextTruncate = Enum.TextTruncate.AtEnd
+    ValueLbl.Parent = SelectBox
+
+    local Chevron = Instance.new("TextLabel")
+    Chevron.Size = UDim2.new(0, 20, 1, 0)
+    Chevron.Position = UDim2.new(1, -22, 0, 0)
+    Chevron.BackgroundTransparency = 1
+    Chevron.Text = "⌄"
+    Chevron.TextColor3 = Color3.fromRGB(170, 175, 190)
+    Chevron.Font = Enum.Font.GothamBold
+    Chevron.TextSize = 14
+    Chevron.Parent = SelectBox
+
+    local ListFrame = Instance.new("ScrollingFrame")
+    ListFrame.Size = UDim2.new(1, -20, 0, 110)
+    ListFrame.Position = UDim2.new(0, 10, 0, 46)
+    ListFrame.BackgroundColor3 = Color3.fromRGB(24, 26, 31)
+    ListFrame.BackgroundTransparency = 0.1
+    ListFrame.BorderSizePixel = 0
+    ListFrame.ScrollBarThickness = 2
+    ListFrame.ScrollBarImageColor3 = Color3.fromRGB(70, 175, 255)
+    ListFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    ListFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    ListFrame.Parent = Container
+    Instance.new("UICorner", ListFrame).CornerRadius = UDim.new(0, 5)
+
+    local ListPadding = Instance.new("UIPadding", ListFrame)
+    ListPadding.PaddingTop = UDim.new(0, 4)
+    ListPadding.PaddingBottom = UDim.new(0, 4)
+    ListPadding.PaddingLeft = UDim.new(0, 4)
+    ListPadding.PaddingRight = UDim.new(0, 4)
+
+    local ListLayout = Instance.new("UIListLayout", ListFrame)
+    ListLayout.Padding = UDim.new(0, 3)
+    ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    local function updateSummaryText()
+        local picked = {}
+        for k, v in pairs(Config.SelectedMineTargets) do
+            if v then table.insert(picked, k) end
+        end
+        if #picked == 0 then
+            Config.MineSelectAll = true
+            ValueLbl.Text = "All Players (Auto)"
+        else
+            Config.MineSelectAll = false
+            ValueLbl.Text = string.format("Đã chọn %d: %s", #picked, table.concat(picked, ", "))
+        end
+    end
+
+    local function rebuildMultiItems()
+        for _, child in ipairs(ListFrame:GetChildren()) do
+            if child:IsA("TextButton") then child:Destroy() end
+        end
+
+        local names = getOptionsFunc()
+        for _, pName in ipairs(names) do
+            if pName ~= "None" then
+                local isChecked = (Config.SelectedMineTargets[pName] == true)
+                local ItemBtn = Instance.new("TextButton")
+                ItemBtn.Size = UDim2.new(1, 0, 0, 24)
+                ItemBtn.BackgroundColor3 = isChecked and Color3.fromRGB(40, 95, 155) or Color3.fromRGB(30, 32, 38)
+                ItemBtn.BackgroundTransparency = isChecked and 0.1 or 0.4
+                ItemBtn.Text = (isChecked and " [✓] " or " [ ] ") .. tostring(pName)
+                ItemBtn.TextColor3 = isChecked and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(185, 190, 205)
+                ItemBtn.Font = isChecked and Enum.Font.GothamBold or Enum.Font.Gotham
+                ItemBtn.TextSize = 12
+                ItemBtn.TextXAlignment = Enum.TextXAlignment.Left
+                ItemBtn.AutoButtonColor = false
+                ItemBtn.Parent = ListFrame
+                Instance.new("UICorner", ItemBtn).CornerRadius = UDim.new(0, 4)
+
+                ItemBtn.MouseButton1Click:Connect(function()
+                    Config.SelectedMineTargets[pName] = not Config.SelectedMineTargets[pName]
+                    updateSummaryText()
+                    rebuildMultiItems()
+                end)
+            end
+        end
+    end
+
+    local function setOpen(openState)
+        isOpen = openState
+        rebuildMultiItems()
+        local listHeight = 110
+        ListFrame.Size = UDim2.new(1, -20, 0, listHeight)
+        local targetHeight = isOpen and (54 + listHeight) or 44
+
+        TweenService:Create(Container, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            Size = UDim2.new(1, 0, 0, targetHeight)
+        }):Play()
+        Chevron.Text = isOpen and "⌃" or "⌄"
+    end
+
+    HeaderBtn.MouseButton1Click:Connect(function() setOpen(not isOpen) end)
+    return { Refresh = rebuildMultiItems }
+end
+
+-- // STANDARD SINGLE DROPDOWN BUILDER
 local function addDropdown(parent, label, options, defaultIndex, callback)
     local isOpen = false
     local selectedValue = options[defaultIndex or 1] or "None"
@@ -2126,7 +2180,7 @@ local function addDropdown(parent, label, options, defaultIndex, callback)
     TitleLbl.Text = label
     TitleLbl.TextColor3 = Color3.fromRGB(230, 234, 242)
     TitleLbl.Font = Enum.Font.GothamMedium
-    TitleLbl.TextSize = 13
+    TitleLbl.TextSize = 12
     TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
     TitleLbl.Parent = HeaderBtn
 
@@ -2200,9 +2254,6 @@ local function addDropdown(parent, label, options, defaultIndex, callback)
         TweenService:Create(Container, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
             Size = UDim2.new(1, 0, 0, targetHeight)
         }):Play()
-        TweenService:Create(BoxStroke, TweenInfo.new(0.18), {
-            Color = isOpen and Color3.fromRGB(65, 175, 255) or Color3.fromRGB(65, 70, 82)
-        }):Play()
         Chevron.Text = isOpen and "⌃" or "⌄"
     end
 
@@ -2227,15 +2278,6 @@ local function addDropdown(parent, label, options, defaultIndex, callback)
             ItemBtn.Parent = ListFrame
             Instance.new("UICorner", ItemBtn).CornerRadius = UDim.new(0, 4)
 
-            local AccentBar = Instance.new("Frame")
-            AccentBar.Size = UDim2.new(0, 3, 0, 14)
-            AccentBar.Position = UDim2.new(0, 3, 0.5, -7)
-            AccentBar.BackgroundColor3 = Color3.fromRGB(60, 180, 255)
-            AccentBar.BorderSizePixel = 0
-            AccentBar.Visible = isSelected
-            AccentBar.Parent = ItemBtn
-            Instance.new("UICorner", AccentBar).CornerRadius = UDim.new(1, 0)
-
             ItemBtn.MouseButton1Click:Connect(function()
                 selectedValue = opt
                 ValueLbl.Text = tostring(selectedValue)
@@ -2258,182 +2300,6 @@ local function addDropdown(parent, label, options, defaultIndex, callback)
                 callback(selectedValue)
             end
             rebuildItems(currentOptions)
-            if isOpen then setOpen(true) end
-        end
-    }
-end
-
--- // FLUENT CARD MULTI-SELECT DROPDOWN BUILDER
-local function addMultiDropdown(parent, label, options, callback)
-    local isOpen = false
-    local selectedMap = {}
-
-    local Container = Instance.new("Frame")
-    Container.Size = UDim2.new(1, 0, 0, 44)
-    Container.BackgroundColor3 = Color3.fromRGB(32, 34, 40)
-    Container.BackgroundTransparency = 0.25
-    Container.BorderSizePixel = 0
-    Container.ClipsDescendants = true
-    Container.Parent = parent
-    Instance.new("UICorner", Container).CornerRadius = UDim.new(0, 6)
-
-    local CardStroke = Instance.new("UIStroke", Container)
-    CardStroke.Color = Color3.fromRGB(52, 56, 66)
-    CardStroke.Transparency = 0.4
-    CardStroke.Thickness = 1
-
-    local HeaderBtn = Instance.new("TextButton")
-    HeaderBtn.Size = UDim2.new(1, 0, 0, 44)
-    HeaderBtn.BackgroundTransparency = 1
-    HeaderBtn.Text = ""
-    HeaderBtn.AutoButtonColor = false
-    HeaderBtn.Parent = Container
-
-    local TitleLbl = Instance.new("TextLabel")
-    TitleLbl.Size = UDim2.new(0.55, -14, 1, 0)
-    TitleLbl.Position = UDim2.new(0, 14, 0, 0)
-    TitleLbl.BackgroundTransparency = 1
-    TitleLbl.Text = label
-    TitleLbl.TextColor3 = Color3.fromRGB(230, 234, 242)
-    TitleLbl.Font = Enum.Font.GothamMedium
-    TitleLbl.TextSize = 12
-    TitleLbl.TextXAlignment = Enum.TextXAlignment.Left
-    TitleLbl.Parent = HeaderBtn
-
-    local SelectBox = Instance.new("Frame")
-    SelectBox.Size = UDim2.new(0.42, -14, 0, 28)
-    SelectBox.Position = UDim2.new(0.58, 0, 0.5, -14)
-    SelectBox.BackgroundColor3 = Color3.fromRGB(40, 43, 50)
-    SelectBox.BackgroundTransparency = 0.15
-    SelectBox.BorderSizePixel = 0
-    SelectBox.Parent = HeaderBtn
-    Instance.new("UICorner", SelectBox).CornerRadius = UDim.new(0, 5)
-
-    local BoxStroke = Instance.new("UIStroke", SelectBox)
-    BoxStroke.Color = Color3.fromRGB(65, 70, 82)
-    BoxStroke.Thickness = 1
-
-    local ValueLbl = Instance.new("TextLabel")
-    ValueLbl.Size = UDim2.new(1, -28, 1, 0)
-    ValueLbl.Position = UDim2.new(0, 10, 0, 0)
-    ValueLbl.BackgroundTransparency = 1
-    ValueLbl.Text = "Chưa chọn (0)"
-    ValueLbl.TextColor3 = Color3.fromRGB(215, 220, 230)
-    ValueLbl.Font = Enum.Font.GothamMedium
-    ValueLbl.TextSize = 11
-    ValueLbl.TextXAlignment = Enum.TextXAlignment.Left
-    ValueLbl.TextTruncate = Enum.TextTruncate.AtEnd
-    ValueLbl.Parent = SelectBox
-
-    local Chevron = Instance.new("TextLabel")
-    Chevron.Size = UDim2.new(0, 20, 1, 0)
-    Chevron.Position = UDim2.new(1, -22, 0, 0)
-    Chevron.BackgroundTransparency = 1
-    Chevron.Text = "⌄"
-    Chevron.TextColor3 = Color3.fromRGB(170, 175, 190)
-    Chevron.Font = Enum.Font.GothamBold
-    Chevron.TextSize = 14
-    Chevron.Parent = SelectBox
-
-    local ListFrame = Instance.new("ScrollingFrame")
-    ListFrame.Size = UDim2.new(1, -20, 0, 110)
-    ListFrame.Position = UDim2.new(0, 10, 0, 46)
-    ListFrame.BackgroundColor3 = Color3.fromRGB(24, 26, 31)
-    ListFrame.BackgroundTransparency = 0.1
-    ListFrame.BorderSizePixel = 0
-    ListFrame.ScrollBarThickness = 2
-    ListFrame.ScrollBarImageColor3 = Color3.fromRGB(70, 175, 255)
-    ListFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
-    ListFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    ListFrame.Parent = Container
-    Instance.new("UICorner", ListFrame).CornerRadius = UDim.new(0, 5)
-
-    local ListPadding = Instance.new("UIPadding", ListFrame)
-    ListPadding.PaddingTop = UDim.new(0, 4)
-    ListPadding.PaddingBottom = UDim.new(0, 4)
-    ListPadding.PaddingLeft = UDim.new(0, 4)
-    ListPadding.PaddingRight = UDim.new(0, 4)
-
-    local ListLayout = Instance.new("UIListLayout", ListFrame)
-    ListLayout.Padding = UDim.new(0, 3)
-    ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
-
-    local currentOptions = options
-
-    local function updateSummaryText()
-        local names = {}
-        for k, v in pairs(selectedMap) do
-            if v then table.insert(names, k) end
-        end
-        if #names == 0 then
-            ValueLbl.Text = "Chưa chọn (0)"
-        else
-            ValueLbl.Text = string.format("Đã chọn (%d): %s", #names, table.concat(names, ", "))
-        end
-    end
-
-    local function setOpen(openState)
-        isOpen = openState
-        local count = math.clamp(#currentOptions, 1, 5)
-        local listHeight = count * 27 + 8
-        ListFrame.Size = UDim2.new(1, -20, 0, listHeight)
-        local targetHeight = isOpen and (54 + listHeight) or 44
-
-        TweenService:Create(Container, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-            Size = UDim2.new(1, 0, 0, targetHeight)
-        }):Play()
-        TweenService:Create(BoxStroke, TweenInfo.new(0.18), {
-            Color = isOpen and Color3.fromRGB(65, 175, 255) or Color3.fromRGB(65, 70, 82)
-        }):Play()
-        Chevron.Text = isOpen and "⌃" or "⌄"
-    end
-
-    local function rebuildItems(newList)
-        currentOptions = newList or currentOptions
-        for _, child in ipairs(ListFrame:GetChildren()) do
-            if child:IsA("TextButton") then child:Destroy() end
-        end
-
-        for _, opt in ipairs(currentOptions) do
-            if opt ~= "None" then
-                local isSelected = (selectedMap[opt] == true)
-                local ItemBtn = Instance.new("TextButton")
-                ItemBtn.Size = UDim2.new(1, 0, 0, 24)
-                ItemBtn.BackgroundColor3 = isSelected and Color3.fromRGB(45, 52, 65) or Color3.fromRGB(30, 32, 38)
-                ItemBtn.BackgroundTransparency = isSelected and 0.1 or 0.4
-                ItemBtn.Text = (isSelected and "  [✓] " or "  [ ] ") .. tostring(opt)
-                ItemBtn.TextColor3 = isSelected and Color3.fromRGB(115, 225, 255) or Color3.fromRGB(185, 190, 205)
-                ItemBtn.Font = isSelected and Enum.Font.GothamSemibold or Enum.Font.Gotham
-                ItemBtn.TextSize = 12
-                ItemBtn.TextXAlignment = Enum.TextXAlignment.Left
-                ItemBtn.AutoButtonColor = false
-                ItemBtn.Parent = ListFrame
-                Instance.new("UICorner", ItemBtn).CornerRadius = UDim.new(0, 4)
-
-                ItemBtn.MouseButton1Click:Connect(function()
-                    selectedMap[opt] = not selectedMap[opt]
-                    updateSummaryText()
-                    rebuildItems(currentOptions)
-                    callback(selectedMap)
-                end)
-            end
-        end
-    end
-
-    rebuildItems(options)
-    HeaderBtn.MouseButton1Click:Connect(function() setOpen(not isOpen) end)
-
-    return {
-        Refresh = function(newOptions)
-            currentOptions = newOptions
-            local validSet = {}
-            for _, o in ipairs(newOptions) do validSet[o] = true end
-            for k, _ in pairs(selectedMap) do
-                if not validSet[k] then selectedMap[k] = nil end
-            end
-            updateSummaryText()
-            rebuildItems(currentOptions)
-            callback(selectedMap)
             if isOpen then setOpen(true) end
         end
     }
@@ -2530,11 +2396,20 @@ local function addSlider(parent, label, minVal, maxVal, defaultVal, callback)
 end
 
 -- // CREATE SIDEBAR TABS
-local TabVoid   = createTab("Void Kill & Log", "🌀")
-local TabCombat = createTab("Combat & Wall", "⚔")
+local TabCombat = createTab("AntiSkill & Wall", "🛡")
+local TabVoid   = createTab("Void Kill & Skills", "🌀")
 local TabTarget = createTab("AutoFarm", "◇")
 local TabMove   = createTab("LocalPlayer", "👤")
 local TabVisual = createTab("Settings", "⚙")
+
+local function getPlayerNames()
+    local list = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then table.insert(list, p.Name) end
+    end
+    if #list == 0 then table.insert(list, "None") end
+    return list
+end
 
 local function triggerUndetectedInfJump()
     if not Config.ScriptRunning or not Config.InfJumpEnabled then return end
@@ -2622,179 +2497,79 @@ local function toggleInvisible(enable)
     end
 end
 
-local function getPlayerNames()
-    local list = {}
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer then table.insert(list, p.Name) end
-    end
-    if #list == 0 then table.insert(list, "None") end
-    return list
-end
-
-local currentTargetList = getPlayerNames()
-Config.SelectedPlayer = currentTargetList[1]
-
--- // 1. POPULATE VOID KILL & SKILL LOG TAB
-local SlotPreviewCard = Instance.new("Frame")
-SlotPreviewCard.Size = UDim2.new(1, 0, 0, 48)
-SlotPreviewCard.BackgroundColor3 = Color3.fromRGB(28, 32, 42)
-SlotPreviewCard.BackgroundTransparency = 0.15
-SlotPreviewCard.BorderSizePixel = 0
-SlotPreviewCard.Parent = TabVoid
-Instance.new("UICorner", SlotPreviewCard).CornerRadius = UDim.new(0, 6)
-
-local SlotPreviewStroke = Instance.new("UIStroke", SlotPreviewCard)
-SlotPreviewStroke.Color = Color3.fromRGB(65, 165, 245)
-SlotPreviewStroke.Transparency = 0.35
-SlotPreviewStroke.Thickness = 1
-
-State.SlotStatusLabel = Instance.new("TextLabel")
-State.SlotStatusLabel.Size = UDim2.new(1, -20, 1, -8)
-State.SlotStatusLabel.Position = UDim2.new(0, 10, 0, 4)
-State.SlotStatusLabel.BackgroundTransparency = 1
-State.SlotStatusLabel.Text = "[1]: Chưa quét  |  [2]: Chưa quét\n[3]: Chưa quét  |  [4]: Chưa quét"
-State.SlotStatusLabel.TextColor3 = Color3.fromRGB(165, 225, 255)
-State.SlotStatusLabel.Font = Enum.Font.GothamSemibold
-State.SlotStatusLabel.TextSize = 11
-State.SlotStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
-State.SlotStatusLabel.Parent = SlotPreviewCard
-
-addFeatureToggle(TabVoid, "AutoVoidKill", "Auto Void Kill (36 Grab Skills + Dìm Chết Mục Tiêu)", "VOIDK", false, function(v)
-    Config.AutoVoidKill = v
-    if not v then
-        State.VoidKillActive = false
-        State.VoidDropTargetCF = nil
-        State.ActiveSpecialSkill = nil
-    else
-        scanHotbarSkills1To4()
-    end
-end)
-
-local MineMultiDropdown = addMultiDropdown(TabVoid, "Chọn nhiều mục tiêu cho chiêu MINE (Multi-TP)", currentTargetList, function(selectedMap)
-    Config.MineSelectedTargets = selectedMap
-end)
-
-addDropdown(TabVoid, "Chế độ kích hoạt Void Kill", {"GrabOrSelectedKeys", "SelectedKeysOnly", "GrabOnly"}, 1, function(mode)
-    Config.VoidTriggerMode = mode
-end)
-
-addFeatureToggle(TabVoid, "VoidKey1", "Ép bay xuống Void khi dùng Skill [1]", "VK1", false, function(v)
-    Config.VoidSkillKeys["1"] = v
-end)
-
-addFeatureToggle(TabVoid, "VoidKey2", "Ép bay xuống Void khi dùng Skill [2]", "VK2", false, function(v)
-    Config.VoidSkillKeys["2"] = v
-end)
-
-addFeatureToggle(TabVoid, "VoidKey3", "Ép bay xuống Void khi dùng Skill [3]", "VK3", false, function(v)
-    Config.VoidSkillKeys["3"] = v
-end)
-
-addFeatureToggle(TabVoid, "VoidKey4", "Ép bay xuống Void khi dùng Skill [4]", "VK4", false, function(v)
-    Config.VoidSkillKeys["4"] = v
-end)
-
-addSlider(TabVoid, "Delay chờ Skill tóm trước khi xuống Void (s)", 0.05, 0.80, 0.22, function(v)
-    Config.VoidStartupDelay = v
-end)
-
-addSlider(TabVoid, "Thời gian tối đa giữ ở dưới Void (s)", 0.50, 3.50, 1.85, function(v)
-    Config.VoidMaxHoldTime = v
-end)
-
-addButton(TabVoid, "🔍 QUÉT & LƯU NGAY TÊN 4 SKILL HIỆN TẠI (1 -> 4)", Color3.fromRGB(45, 125, 185), function(btn)
-    local slots = scanHotbarSkills1To4()
-    for k = 1, 4 do
-        local sKey = tostring(k)
-        addSkillLogEntry(sKey, slots[sKey] or "Unknown", "Manual Hotbar Scan")
-    end
-    btn.Text = "✅ ĐÃ LƯU TÊN 4 SKILL HIỆN TẠI VÀO LOG!"
-    task.delay(1.8, function()
-        if btn and btn.Parent then
-            btn.Text = "🔍 QUÉT & LƯU NGAY TÊN 4 SKILL HIỆN TẠI (1 -> 4)"
-        end
-    end)
-end)
-
-State.CopyBtnRef = addButton(TabVoid, "📋 COPY LOG TÊN SKILL 1->4 (Đã lưu: 0 dòng)", Color3.fromRGB(35, 140, 95), function(btn)
-    local slots = scanHotbarSkills1To4()
-    local report = "=== NOVA HUB v23 - SKILL 1->4 LOG REPORT ===\n"
-    report = report .. "Current Hero: " .. getHeroIdentifier() .. "\n"
-    report = report .. string.format(
-        "Current Hotbar Slots:\n  Skill 1: \"%s\"\n  Skill 2: \"%s\"\n  Skill 3: \"%s\"\n  Skill 4: \"%s\"\n",
-        tostring(slots["1"]),
-        tostring(slots["2"]),
-        tostring(slots["3"]),
-        tostring(slots["4"])
-    )
-    report = report .. "--------------------------------------------\n"
-    report = report .. "Recorded Skill History (1 -> 4):\n"
-    if #State.SkillHistoryLogs > 0 then
-        report = report .. table.concat(State.SkillHistoryLogs, "\n")
-    else
-        report = report .. "(Hãy bấm phím 1, 2, 3, 4 hoặc bấm nút Quét ở trên trước khi Copy!)"
-    end
-
-    local copied = false
-    pcall(function()
-        if setclipboard then
-            setclipboard(report)
-            copied = true
-        elseif toclipboard then
-            toclipboard(report)
-            copied = true
-        end
-    end)
-
-    if copied then
-        btn.Text = "✅ ĐÃ COPY LOG! (Dán Ctrl+V gửi cho mình nhé)"
-        btn.BackgroundColor3 = Color3.fromRGB(45, 175, 100)
-    else
-        btn.Text = "⚠️ Executor không có setclipboard (Đã in ra F9)"
-        print(report)
-    end
-
-    task.delay(2.5, function()
-        if btn and btn.Parent then
-            btn.BackgroundColor3 = Color3.fromRGB(35, 140, 95)
-            updateCopyButtonCounter()
-        end
-    end)
-end)
-
--- // 2. POPULATE COMBAT & WALL TAB (ZERO-FLING WALL COMBO BEHIND ENEMY)
-addFeatureToggle(TabCombat, "WallCombo", "Auto Wall Combo (Đặt Cây Sau Lưng Địch + Không Văng)", "WALLC", false, function(v)
+-- // 1. POPULATE ANTI-SKILL & WALL COMBO TAB
+addFeatureToggle(TabCombat, "WallCombo", "Wall Combo (M1 Đánh Trúng + Đặt Cây Sau Lưng Địch)", "WALLC", false, function(v)
     Config.WallComboEnabled = v
     if v then
-        scanRealTreeTrunks()
+        scanAndFindRealMapTree(false)
     else
-        restoreActiveWallTree()
+        restoreMapTreePart()
     end
 end)
 
-addDropdown(TabCombat, "Chế độ Wall Combo", {"TreeBehindEnemy", "RaycastSpoofOnly", "SnapToRealTree"}, 1, function(mode)
+addDropdown(TabCombat, "Chế độ nhận diện Wall Combo", {"M1HitConfirm", "M1NearEnemy"}, 1, function(mode)
     Config.WallComboMode = mode
-    restoreActiveWallTree()
+    restoreMapTreePart()
 end)
 
-addButton(TabCombat, "🌳 KÍCH HOẠT WALL COMBO SAU LƯNG ĐỊCH (Hoặc bấm V)", Color3.fromRGB(45, 130, 85), function()
-    triggerWallComboBehindEnemy(0.80)
+addSlider(TabCombat, "Khoảng cách Cây sau lưng địch (Studs)", 1.2, 5.5, 2.4, function(v)
+    Config.WallComboBehindEnemyDist = v
 end)
 
-addSlider(TabCombat, "Khoảng cách đặt Cây sau lưng địch (Studs)", 1.5, 6.0, 2.6, function(v)
-    Config.WallBehindEnemyOffset = v
+local TreeInfoCard = Instance.new("Frame")
+TreeInfoCard.Size = UDim2.new(1, 0, 0, 38)
+TreeInfoCard.BackgroundColor3 = Color3.fromRGB(28, 32, 42)
+TreeInfoCard.BackgroundTransparency = 0.15
+TreeInfoCard.BorderSizePixel = 0
+TreeInfoCard.Parent = TabCombat
+Instance.new("UICorner", TreeInfoCard).CornerRadius = UDim.new(0, 6)
+
+State.TreeStatusLabel = Instance.new("TextLabel")
+State.TreeStatusLabel.Size = UDim2.new(1, -20, 1, -6)
+State.TreeStatusLabel.Position = UDim2.new(0, 10, 0, 3)
+State.TreeStatusLabel.BackgroundTransparency = 1
+State.TreeStatusLabel.Text = "🌳 Cây đang dùng: Đang tự động quét..."
+State.TreeStatusLabel.TextColor3 = Color3.fromRGB(165, 225, 255)
+State.TreeStatusLabel.Font = Enum.Font.GothamSemibold
+State.TreeStatusLabel.TextSize = 11
+State.TreeStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+State.TreeStatusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+State.TreeStatusLabel.Parent = TreeInfoCard
+
+addButton(TabCombat, "🌳 QUÉT & KHÓA CÂY GẦN BẠN NHẤT (Copy Path)", Color3.fromRGB(40, 130, 95), function(btn)
+    local tree = scanAndFindRealMapTree(true)
+    if tree then
+        local info = string.format(
+            "FullName: %s | Class: %s | Size: %s | Material: %s",
+            tree:GetFullName(),
+            tree.ClassName,
+            tostring(tree.Size),
+            tostring(tree.Material.Name)
+        )
+        pcall(function()
+            if setclipboard then setclipboard(info)
+            elseif toclipboard then toclipboard(info) end
+        end)
+        btn.Text = "✅ ĐÃ KHÓA CÂY: " .. tree.Name
+    else
+        btn.Text = "⚠️ Không tìm thấy Cây nào quanh đây!"
+    end
+    task.delay(2.2, function()
+        if btn and btn.Parent then
+            btn.Text = "🌳 QUÉT & KHÓA CÂY GẦN BẠN NHẤT (Copy Path)"
+        end
+    end)
 end)
 
-addFeatureToggle(TabCombat, "AntiSkill", "Anti-Skill (Tầm Gần + Ảo Ảnh Di Chuyển Tự Do Không Stun)", "ASKILL", false, function(v)
+addFeatureToggle(TabCombat, "AntiSkill", "Anti-Skill (Tạo Ảo Ảnh Mờ + Nhân Vật Gốc Bay Ra Xa)", "ASKILL", false, function(v)
     Config.AntiSkillEnabled = v
-    if not v and State.AntiSkillEvading then
-        State.AntiSkillEvading = false
-        stopMovableGhostDecoy()
+    if not v then
+        updateAntiSkillSystem()
     end
 end)
 
-addSlider(TabCombat, "Bán kính gần phát hiện địch dùng Skill (Studs)", 8, 30, 16, function(v)
-    Config.AntiSkillRange = v
+addSlider(TabCombat, "Khoảng cách phát hiện địch dùng Skill (Studs)", 12, 65, 34, function(v)
+    Config.AntiSkillDetectRange = v
 end)
 
 addFeatureToggle(TabCombat, "AntiStun", "Anti-Stun (Full Immunity v8)", "ASTUN", false, function(v)
@@ -2810,11 +2585,96 @@ addFeatureToggle(TabCombat, "AimbotPopup", "Aimbot (Open Sticky Pop-Up)", "AIM",
     if not v then setAimbotActiveState(false) end
 end)
 
-addDropdown(TabCombat, "Select Aimbot Part", {"Head", "HumanoidRootPart"}, 1, function(part)
-    Config.AimPart = part
+-- // 2. POPULATE VOID KILL & SKILLS TAB
+addFeatureToggle(TabVoid, "AntiVoid", "Anti-Void (Luôn Bật Sẵn Khi Execute)", "AVOID", true, function(v)
+    Config.AntiVoidEnabled = v
+end)
+
+addFeatureToggle(TabVoid, "VoidImmunityNaN", "Bất Tử Sát Thương Void (NaN DestroyHeight)", "VIMM", true, function(v)
+    Config.VoidImmunityNaN = v
+    if v then
+        applySelfVoidImmunity()
+    else
+        restoreDefaultVoidDestroyHeight()
+    end
+end)
+
+addFeatureToggle(TabVoid, "AutoVoidKill", "Auto Deep Void Kill (Đưa Thẳng Xuống Đáy Void)", "VOIDK", true, function(v)
+    Config.AutoVoidKill = v
+    if not v then
+        State.VoidKillActive = false
+        State.VoidDropTargetCF = nil
+    end
+end)
+
+addDropdown(TabVoid, "Chế độ dìm xuống đáy Void", {"DeepPlungeNaN", "PulseDeepSlam"}, 1, function(mode)
+    Config.VoidKillMode = mode
+end)
+
+addSlider(TabVoid, "Độ sâu đáy Void (Y càng âm càng sâu)", -9000, -1000, -3200, function(v)
+    Config.VoidTargetDepth = v
+end)
+
+local MineMultiDropdown = addMultiSelectDropdown(TabVoid, "Chọn nhiều mục tiêu (MINE / BLAST AWAY / Pierce)", getPlayerNames)
+
+addSlider(TabVoid, "Delay chờ Skill tóm trước khi lao xuống Void (s)", 0.05, 0.80, 0.16, function(v)
+    Config.VoidStartupDelay = v
+end)
+
+addSlider(TabVoid, "Thời gian tối đa giữ dưới đáy Void (s)", 0.50, 3.50, 1.85, function(v)
+    Config.VoidMaxHoldTime = v
+end)
+
+local SlotPreviewCard = Instance.new("Frame")
+SlotPreviewCard.Size = UDim2.new(1, 0, 0, 48)
+SlotPreviewCard.BackgroundColor3 = Color3.fromRGB(28, 32, 42)
+SlotPreviewCard.BackgroundTransparency = 0.15
+SlotPreviewCard.BorderSizePixel = 0
+SlotPreviewCard.Parent = TabVoid
+Instance.new("UICorner", SlotPreviewCard).CornerRadius = UDim.new(0, 6)
+
+State.SlotStatusLabel = Instance.new("TextLabel")
+State.SlotStatusLabel.Size = UDim2.new(1, -20, 1, -8)
+State.SlotStatusLabel.Position = UDim2.new(0, 10, 0, 4)
+State.SlotStatusLabel.BackgroundTransparency = 1
+State.SlotStatusLabel.Text = "[1]: Chưa quét  |  [2]: Chưa quét\n[3]: Chưa quét  |  [4]: Chưa quét"
+State.SlotStatusLabel.TextColor3 = Color3.fromRGB(165, 225, 255)
+State.SlotStatusLabel.Font = Enum.Font.GothamSemibold
+State.SlotStatusLabel.TextSize = 11
+State.SlotStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+State.SlotStatusLabel.Parent = SlotPreviewCard
+
+State.CopyBtnRef = addButton(TabVoid, "📋 COPY LOG TÊN SKILL 1->4 (Đã lưu: 0 dòng)", Color3.fromRGB(35, 140, 95), function(btn)
+    local slots = scanHotbarSkills1To4()
+    local report = "=== NOVA HUB v24 - SKILL 1->4 LOG REPORT ===\n"
+    report = report .. string.format(
+        "Hotbar: [1]=%s | [2]=%s | [3]=%s | [4]=%s\n",
+        tostring(slots["1"]), tostring(slots["2"]), tostring(slots["3"]), tostring(slots["4"])
+    )
+    report = report .. "--------------------------------------------\n"
+    report = report .. (#State.SkillHistoryLogs > 0 and table.concat(State.SkillHistoryLogs, "\n") or "(Chưa có log)")
+
+    local copied = false
+    pcall(function()
+        if setclipboard then setclipboard(report); copied = true
+        elseif toclipboard then toclipboard(report); copied = true end
+    end)
+
+    if copied then
+        btn.Text = "✅ ĐÃ COPY LOG VÀO CLIPBOARD!"
+    else
+        btn.Text = "⚠️ Đã in Log ra F9 Console"
+        print(report)
+    end
+    task.delay(2, function()
+        if btn and btn.Parent then updateCopyButtonCounter() end
+    end)
 end)
 
 -- // 3. POPULATE AUTOFARM / AUTOTARGET TAB
+local currentTargetList = getPlayerNames()
+Config.SelectedPlayer = currentTargetList[1]
+
 addFeatureToggle(TabTarget, "AutoTarget", "AutoFarm Player (Zero-Delay Lock)", "TAR", false, function(v)
     Config.AutoTargetEnabled = v
     State.FreeMoveOffset = Vector3.zero
@@ -2937,34 +2797,36 @@ addFeatureToggle(TabVisual, "ESP", "Player ESP (Throttled Zero-Lag)", "ESP", fal
     end
 end)
 
-addButton(TabVisual, "Refresh Player & MINE Dropdowns", nil, function()
-    local updated = getPlayerNames()
-    PlayerDropdown.Refresh(updated)
-    MineMultiDropdown.Refresh(updated)
+addButton(TabVisual, "Refresh Player Lists (AutoFarm & MINE)", nil, function()
+    PlayerDropdown.Refresh(getPlayerNames())
+    MineMultiDropdown.Refresh()
 end)
 
 addButton(TabVisual, "Unload & Remove Script (Same as × Button)", Color3.fromRGB(145, 45, 50), function()
     unloadEntireScript()
 end)
 
--- // KHỞI TẠO TRẠNG THÁI MẶC ĐỊNH
+-- // KHỞI TẠO MẶC ĐỊNH: ANTI-VOID & BẤT TỬ VOID LUÔN BẬT
 Config.AntiVoidEnabled = true
-Config.AutoVoidKill = false
+Config.VoidImmunityNaN = true
+Config.AutoVoidKill = true
 Config.UIInitialized = true
-task.defer(scanHotbarSkills1To4)
-task.defer(scanRealTreeTrunks)
+task.defer(function()
+    scanHotbarSkills1To4()
+    scanAndFindRealMapTree(false)
+end)
 
 table.insert(State.Connections, Players.PlayerAdded:Connect(function()
     task.wait(0.2)
     if Config.ScriptRunning then
-        local updated = getPlayerNames()
-        PlayerDropdown.Refresh(updated)
-        MineMultiDropdown.Refresh(updated)
+        PlayerDropdown.Refresh(getPlayerNames())
+        MineMultiDropdown.Refresh()
     end
 end))
 
 table.insert(State.Connections, Players.PlayerRemoving:Connect(function(leavingPlr)
     if not Config.ScriptRunning then return end
+    Config.SelectedMineTargets[leavingPlr.Name] = nil
     if State.LockedAimbotPlayer == leavingPlr then
         setAimbotActiveState(false)
     end
@@ -2974,9 +2836,8 @@ table.insert(State.Connections, Players.PlayerRemoving:Connect(function(leavingP
         State.ESPObjects[leavingPlr] = nil
     end
     task.wait(0.2)
-    local updated = getPlayerNames()
-    PlayerDropdown.Refresh(updated)
-    MineMultiDropdown.Refresh(updated)
+    PlayerDropdown.Refresh(getPlayerNames())
+    MineMultiDropdown.Refresh()
 end))
 
 -- // THROTTLED ESP MANAGER
@@ -3036,27 +2897,7 @@ local function updateESP()
     end
 end
 
--- // FLIGHT & DECOY MOVEMENT DIRECTION HELPER
-local function getPlanarMoveVector(hum)
-    local moveDir = Vector3.zero
-    local camCF = Camera.CFrame
-    local flatLook = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z)
-    local flatRight = Vector3.new(camCF.RightVector.X, 0, camCF.RightVector.Z)
-    if flatLook.Magnitude > 0.01 then flatLook = flatLook.Unit end
-    if flatRight.Magnitude > 0.01 then flatRight = flatRight.Unit end
-
-    if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveDir = moveDir + flatLook end
-    if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveDir = moveDir - flatLook end
-    if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveDir = moveDir + flatRight end
-    if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveDir = moveDir - flatRight end
-
-    if moveDir.Magnitude == 0 and hum and hum.MoveDirection.Magnitude > 0 then
-        moveDir = Vector3.new(hum.MoveDirection.X, 0, hum.MoveDirection.Z)
-    end
-    if moveDir.Magnitude > 0 then return moveDir.Unit end
-    return Vector3.zero
-end
-
+-- // FLIGHT DIRECTION HELPER
 local function getFlightDirection(hum)
     local moveDir = Vector3.zero
     local camCF = Camera.CFrame
@@ -3085,17 +2926,25 @@ local function getFlightDirection(hum)
     return Vector3.zero
 end
 
--- // STEPPED LOOP
+-- // STEPPED LOOP: ÉP CỨNG VỊ TRÍ DEEP VOID KILL / ANTI-SKILL TRƯỚC PHYSICS STEP
 table.insert(State.Connections, RunService.Stepped:Connect(function()
     if not Config.ScriptRunning then return end
+    if Config.VoidImmunityNaN then
+        pcall(function() Workspace.FallenPartsDestroyHeight = 0/0 end)
+    end
     if State.VoidKillActive and State.VoidDropTargetCF and State.Root then
         if State.Root.Anchored then State.Root.Anchored = false end
-        State.Root.CFrame = State.VoidDropTargetCF
+        if Config.VoidKillMode == "PulseDeepSlam" and (State.VoidPulseFrameCounter % 5 == 0) and State.VoidReturnCFrame then
+            State.Root.CFrame = State.VoidReturnCFrame
+        else
+            State.Root.CFrame = State.VoidDropTargetCF
+        end
+        State.Root.AssemblyLinearVelocity = Vector3.new(0, -450, 0)
+        State.Root.AssemblyAngularVelocity = Vector3.zero
+    elseif State.AntiSkillEvading and State.AntiSkillAnchorCF and State.Root then
+        State.Root.CFrame = State.AntiSkillAnchorCF + Config.AntiSkillSafeOffset
         State.Root.AssemblyLinearVelocity = Vector3.zero
         State.Root.AssemblyAngularVelocity = Vector3.zero
-    elseif State.AntiSkillEvading and State.DecoyCFrame and State.Root then
-        State.Root.CFrame = State.DecoyCFrame + Config.AntiSkillSkyOffset
-        State.Root.AssemblyLinearVelocity = Vector3.zero
     end
 end))
 
@@ -3106,37 +2955,20 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
     local root = State.Root
     local hum = State.Hum
 
+    updateAntiSkillSystem()
+
     if State.VoidKillActive and State.VoidDropTargetCF and root then
-        root.CFrame = State.VoidDropTargetCF
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-    elseif State.AntiSkillEvading and State.DecoyCFrame and root and hum then
-        local moveVec = getPlanarMoveVector(hum)
-        local spd = Config.SpeedEnabled and Config.WalkSpeed or 22
-        local newPos = State.DecoyCFrame.Position + (moveVec * spd * dt)
-
-        local lookDir = moveVec.Magnitude > 0.05 and moveVec or Vector3.new(Camera.CFrame.LookVector.X, 0, Camera.CFrame.LookVector.Z)
-        if lookDir.Magnitude > 0.01 then
-            State.DecoyCFrame = CFrame.lookAt(newPos, newPos + lookDir.Unit)
+        if Config.VoidKillMode == "PulseDeepSlam" and (State.VoidPulseFrameCounter % 5 == 0) and State.VoidReturnCFrame then
+            root.CFrame = State.VoidReturnCFrame
         else
-            State.DecoyCFrame = CFrame.new(newPos) * State.DecoyCFrame.Rotation
+            root.CFrame = State.VoidDropTargetCF
         end
-
-        if State.DecoyModel and State.DecoyModel.PrimaryPart then
-            State.DecoyModel:PivotTo(State.DecoyCFrame)
-        end
-        if State.DecoyCameraProxy then
-            State.DecoyCameraProxy.CFrame = State.DecoyCFrame + Vector3.new(0, 1.5, 0)
-            if Camera.CameraSubject ~= State.DecoyCameraProxy then
-                Camera.CameraSubject = State.DecoyCameraProxy
-            end
-        end
-
-        root.CFrame = State.DecoyCFrame + Config.AntiSkillSkyOffset
-        root.AssemblyLinearVelocity = Vector3.zero
-        local pad = ensureFlyPad()
-        pad.CFrame = CFrame.new(root.Position - Vector3.new(0, (hum.HipHeight + (root.Size.Y / 2) + 0.5), 0))
+        root.AssemblyLinearVelocity = Vector3.new(0, -450, 0)
+        root.AssemblyAngularVelocity = Vector3.zero
     end
+
+    -- Cập nhật Wall Combo: Chỉ chạy khi Chuột Trái (M1) + Đánh dính địch + Đặt Cây sau lưng địch
+    updateWallComboSystem()
 
     if Config.AntiStunEnabled and char and root and hum then
         enforceOldFullAntiStun(char, root, hum)
@@ -3149,7 +2981,7 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
         end
     end
 
-    if Config.AutoTargetEnabled and root and hum and not State.VoidKillActive and not State.AntiSkillEvading and State.ActiveSpecialSkill == nil then
+    if Config.AutoTargetEnabled and root and hum and not State.VoidKillActive and not State.AntiSkillEvading then
         local targetPlr = Players:FindFirstChild(Config.SelectedPlayer or "")
         local tRoot = targetPlr and targetPlr.Character and targetPlr.Character:FindFirstChild("HumanoidRootPart")
 
@@ -3233,34 +3065,14 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
     local hum = State.Hum
 
     if root and hum and hum.Health > 0 then
-        local voidY = Workspace.FallenPartsDestroyHeight
-        if voidY ~= voidY or voidY < -10000 or voidY > 500 then voidY = -500 end
-
-        if Config.AntiSkillEnabled and not State.VoidKillActive then
-            local dangerNear = detectNearbyEnemySkillThreat()
-            if dangerNear and not State.AntiSkillEvading then
-                State.AntiSkillEvading = true
-                spawnMovableGhostDecoy(root.CFrame)
-                root.CFrame = State.DecoyCFrame + Config.AntiSkillSkyOffset
-                root.AssemblyLinearVelocity = Vector3.zero
-            elseif not dangerNear and State.AntiSkillEvading then
-                State.AntiSkillEvading = false
-                stopMovableGhostDecoy()
-                if not Config.FlyEnabled and not Config.AutoTargetEnabled and not Config.InfJumpEnabled then
-                    clearFlyPad()
-                end
-            end
-        elseif State.AntiSkillEvading then
-            State.AntiSkillEvading = false
-            stopMovableGhostDecoy()
-        end
+        local baseVoidY = State.OrigFallenDestroyHeight or -500
 
         if not State.VoidKillActive and not State.AntiSkillEvading then
-            if hum.FloorMaterial ~= Enum.Material.Air and root.Position.Y > (voidY + 95) then
+            if hum.FloorMaterial ~= Enum.Material.Air and root.Position.Y > (baseVoidY + 95) then
                 State.LastSafeCFrame = root.CFrame
             end
 
-            if Config.AntiVoidEnabled and root.Position.Y < (voidY + 65) then
+            if Config.AntiVoidEnabled and root.Position.Y < (baseVoidY + 65) then
                 if State.LastSafeCFrame then
                     root.CFrame = State.LastSafeCFrame + Vector3.new(0, 5, 0)
                 else
@@ -3268,10 +3080,6 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
                 end
                 root.AssemblyLinearVelocity = Vector3.new(0, 15, 0)
             end
-        end
-
-        if Config.AutoVoidKill and not State.VoidKillActive and not State.AntiSkillEvading then
-            scanProximityGrab()
         end
 
         if Config.AntiStunEnabled and char then
@@ -3344,7 +3152,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
                 pad.CFrame = CFrame.new(root.Position - Vector3.new(0, footOffset, 0))
                 root.AssemblyLinearVelocity = (moveDir * Config.FlySpeed) + Vector3.new(0, 2.5, 0)
             end
-        elseif not Config.FlyEnabled and not Config.AutoTargetEnabled and not Config.InfJumpEnabled and not State.AntiSkillEvading then
+        elseif not Config.FlyEnabled and not Config.AutoTargetEnabled and not Config.InfJumpEnabled then
             clearFlyPad()
         end
     end
@@ -3352,7 +3160,14 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
     updateESP()
 end))
 
--- // INPUT TRIGGERS: BẮT PHÍM 1 -> 4, ĐẾM NHỊP M1 ĐỂ ĐẶT CÂY SAU LƯNG ĐỊCH (ĐÒN 3-4 / Q / V)
+-- // INPUT TRIGGERS: CHỈ NHẬN CHUỘT TRÁI (M1) CHO WALL COMBO (ĐÃ BỎ PHÍM G)
+local KeyMap1To4 = {
+    [Enum.KeyCode.One]   = "1",
+    [Enum.KeyCode.Two]   = "2",
+    [Enum.KeyCode.Three] = "3",
+    [Enum.KeyCode.Four]  = "4",
+}
+
 table.insert(State.Connections, UserInputService.JumpRequest:Connect(function()
     triggerUndetectedInfJump()
 end))
@@ -3363,45 +3178,31 @@ table.insert(State.Connections, UserInputService.InputBegan:Connect(function(inp
         toggleMenu()
     end
 
+    -- Chỉ nhận Chuột Trái (MouseButton1) cho Wall Combo
+    if not gpe and input.UserInputType == Enum.UserInputType.MouseButton1 then
+        State.IsLeftMouseDown = true
+        State.LastM1ClickTick = tick()
+    end
+
     local slotStr = KeyMap1To4[input.KeyCode]
     if not gpe and slotStr then
-        onSkillSlotTriggered(slotStr)
-    end
-
-    if not gpe and Config.WallComboEnabled then
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            local now = tick()
-            if (now - State.LastM1ClickTick) > 1.35 then
-                State.M1ClickCount = 1
-            else
-                State.M1ClickCount = State.M1ClickCount + 1
-            end
-            State.LastM1ClickTick = now
-
-            -- Khi sang nhịp M1 thứ 3 hoặc thứ 4 và có đối thủ trước mặt -> Đặt thân cây mỏng sau lưng đối thủ
-            if State.M1ClickCount >= 3 then
-                if State.M1ClickCount >= 4 then
-                    State.M1ClickCount = 0
-                end
-                local _, eRoot = findNearestEnemyRoot(16)
-                if eRoot then
-                    triggerWallComboBehindEnemy(0.75)
-                end
-            end
-        elseif input.KeyCode == Enum.KeyCode.Q then
-            local _, eRoot = findNearestEnemyRoot(16)
-            if eRoot then
-                triggerWallComboBehindEnemy(0.75)
-            end
-        end
-    end
-
-    if not gpe and input.KeyCode == Config.WallComboKey then
-        triggerWallComboBehindEnemy(0.85)
+        State.LastKeyPressed = slotStr
+        State.LastSkillCastTick = tick()
+        local slots = scanHotbarSkills1To4()
+        local skillName = slots[slotStr] or ("Skill_" .. slotStr)
+        State.LastSkillName = skillName
+        addSkillLogEntry(slotStr, skillName, "Key Pressed")
+        handleSkillCastForVoidKill(skillName)
     end
 
     if not gpe and input.KeyCode == Enum.KeyCode.Space and Config.InfJumpEnabled then
         triggerUndetectedInfJump()
+    end
+end))
+
+table.insert(State.Connections, UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        State.IsLeftMouseDown = false
     end
 end))
 
