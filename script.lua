@@ -1,10 +1,9 @@
--- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v27 Zero-Trace Stealth)
--- Fixes for "crash: modded client detected (Error Code: 267)":
---   1. Hooked __namecall, __index, __newindex, GetPropertyChangedSignal, and LocalPlayer.Kick to block client integrity kicks.
---   2. ZERO physical Parts/Models/Seats parented to Workspace or Workspace.CurrentCamera (FlyPad, VoidPlatform, Decoy, SeatDesync replaced with pure CFrame + Velocity suspension & Scriptable Camera).
---   3. NEVER calls :Destroy() on Character children/stun objects (neutralizes BodyMovers in-place via MaxForce/Enabled = false so ChildRemoved/AncestryChanged never fires).
---   4. NEVER mutates Humanoid.WalkSpeed or Humanoid.JumpPower (uses CFrame MoveDirection delta & Velocity impulse to bypass GetPropertyChangedSignal watchers).
---   5. Protected GUI via cloneref(CoreGui) / gethui() with hidden RobloxGui container fallback.
+-- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v28 Native-Clean)
+-- Fixed in v28:
+--   1. Removed getrawmetatable / __namecall / __index hooks that overwrote the Luau namecall register (restores 100% M1, Skills 1-4, Dash, and Awakening RemoteEvents and eliminates "error code: BF" handshake failure).
+--   2. Zero tampering with BodyVelocity / BodyGyro / BodyForce / BoolValues inside Character (eliminates "error code: BF" BodyMover integrity check and prevents self-interrupting skills).
+--   3. Zero Parts/Seats/Models parented to Workspace or Workspace.CurrentCamera (eliminates "crash: modded client detected").
+--   4. WalkSpeed & FlySpeed sliders capped at 500 with ready-to-use defaults (WalkSpeed = 55, FlySpeed = 75).
 
 local cloneref = cloneref or function(obj) return obj end
 
@@ -19,65 +18,6 @@ local HttpService = cloneref(game:GetService("HttpService"))
 
 local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
-
--- // LAYER 0: CLIENT INTEGRITY & ANTI-KICK BYPASS
-pcall(function()
-    local mt = getrawmetatable and getrawmetatable(game)
-    if mt and setreadonly and newcclosure then
-        local oldNamecall = mt.__namecall
-        local oldIndex = mt.__index
-        setreadonly(mt, false)
-
-        mt.__namecall = newcclosure(function(self, ...)
-            local method = getnamecallmethod and getnamecallmethod() or ""
-            if not checkcaller or not checkcaller() then
-                if method == "Kick" or method == "kick" then
-                    return nil
-                end
-                if method == "FireServer" and typeof(self) == "Instance" and self:IsA("RemoteEvent") then
-                    local args = { ... }
-                    for i = 1, #args do
-                        if typeof(args[i]) == "string" then
-                            local lowerArg = string.lower(args[i])
-                            if string.find(lowerArg, "modded", 1, true)
-                                or string.find(lowerArg, "crash", 1, true)
-                                or string.find(lowerArg, "exploit", 1, true)
-                                or string.find(lowerArg, "cheat", 1, true)
-                                or string.find(lowerArg, "detect", 1, true)
-                                or string.find(lowerArg, "ban", 1, true) then
-                                return nil
-                            end
-                        end
-                    end
-                end
-            end
-            return oldNamecall(self, ...)
-        end)
-
-        mt.__index = newcclosure(function(self, key)
-            if not checkcaller or not checkcaller() then
-                if typeof(self) == "Instance" and self:IsA("Humanoid") then
-                    if key == "WalkSpeed" then
-                        return 16
-                    elseif key == "JumpPower" then
-                        return 50
-                    elseif key == "HipHeight" then
-                        return 0
-                    end
-                end
-            end
-            return oldIndex(self, key)
-        end)
-
-        setreadonly(mt, true)
-    end
-
-    if hookfunction and LocalPlayer and LocalPlayer.Kick then
-        hookfunction(LocalPlayer.Kick, newcclosure(function(...)
-            return nil
-        end))
-    end
-end)
 
 local function randomToken()
     local chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -96,7 +36,7 @@ local Config = {
     -- Background Anti-Void
     AntiVoidEnabled = true,
 
-    -- Deep Void & Void Kill (Pure velocity/CFrame suspension — zero parts created)
+    -- Deep Void & Void Kill
     DeepVoidActive = false,
     VoidKillDepth = 445,
     AutoVoidKill = false,
@@ -119,7 +59,7 @@ local Config = {
 
     -- Combat & Auto Features
     AutoSkillEnabled = false,
-    AutoSkillDelay = 0.35,
+    AutoSkillDelay = 0.45,
     AutoUltimateEnabled = false,
     AutoUltimateDelay = 0.80,
 
@@ -144,16 +84,16 @@ local Config = {
     OrbitSpeed = 15,
     TargetRange = 5.5,
 
-    -- Movement
+    -- Movement (Max 500, Default WalkSpeed = 55, FlySpeed = 75)
     FlyEnabled = false,
     FlyMode = "FloorPad",
-    FlySpeed = 65,
+    FlySpeed = 75,
     InfJumpEnabled = false,
     InfJumpMode = "FlyPadStep",
     InvisibleEnabled = false,
     InvisMode = "RootJointBreak",
     SpeedEnabled = false,
-    WalkSpeed = 50,
+    WalkSpeed = 55,
     JumpBoostEnabled = false,
     JumpPower = 100,
 
@@ -199,7 +139,6 @@ local State = {
 
     AntiSkillEvading = false,
     DecoyCFrame = nil,
-    SavedCameraType = nil,
 
     CachedTreeWoods = {},
     ActiveWallTree = nil,
@@ -304,7 +243,6 @@ local function findNearestEnemyRoot(maxRange)
     return bestModel, bestRoot
 end
 
--- // SCAN TREE OBJECTS FOR WALL COMBO (ZERO PROPERTY TAMPERING ON ANCHORED FLAG)
 local function scanRealTreeWoods()
     local woods = {}
     local mapFolder = Workspace:FindFirstChild("Map")
@@ -344,8 +282,6 @@ local function restoreActiveWallTree()
     if part and part.Parent and saved then
         pcall(function()
             part.CFrame = saved.CFrame
-            part.AssemblyLinearVelocity = Vector3.zero
-            part.AssemblyAngularVelocity = Vector3.zero
         end)
     end
     State.ActiveWallTree = nil
@@ -429,8 +365,6 @@ local function triggerWallComboBehindEnemy(duration)
 
             pcall(function()
                 chosenWood.CFrame = wallCF
-                chosenWood.AssemblyLinearVelocity = Vector3.zero
-                chosenWood.AssemblyAngularVelocity = Vector3.zero
             end)
 
             RunService.Heartbeat:Wait()
@@ -440,7 +374,7 @@ local function triggerWallComboBehindEnemy(duration)
     end)
 end
 
--- // ZERO-PART DEEP VOID SUSPENSION (NO PARTS IN CAMERA OR WORKSPACE)
+-- // DEEP VOID SUSPENSION (ZERO PARTS CREATED)
 local function teleportToDeepVoid()
     local myRoot = State.Root
     if not myRoot then return end
@@ -751,7 +685,7 @@ local function getConfirmedCarriedEnemies()
     return grabbedList, grabbedMap
 end
 
--- // UNDETECTED VOID KILL EXECUTION
+-- // VOID KILL EXECUTION
 local function executeVoidKillTrip()
     if not Config.ScriptRunning or State.VoidKillActive or not Config.AutoVoidKill then return end
     local myChar = LocalPlayer.Character or State.Char
@@ -817,7 +751,7 @@ local function executeVoidKillTrip()
     end)
 end
 
--- // SPECIAL SKILL SEQUENCES: MINE / PIERCE THE HEAVENS / BLAST AWAY
+-- // SPECIAL SKILL SEQUENCES
 local function runMineMultiTargetSequence()
     if State.VoidKillActive then return end
     State.ActiveSpecialSkill = "MINE"
@@ -1041,7 +975,7 @@ local function onSkillSlotTriggered(slotStr)
     end)
 end
 
--- // ZERO-INSTANCE ANTI-SKILL EVASION (NO DECOY MODEL OR CAMERA PROXY PART)
+-- // ZERO-INSTANCE ANTI-SKILL EVASION
 local function isEnemyActuallyCastingSkillNearMe(enemyChar, enemyRoot, myPosition)
     if not enemyChar or not enemyRoot then return false end
     local dist = (enemyRoot.Position - myPosition).Magnitude
@@ -1278,70 +1212,37 @@ local function joinServerByJobId(btn)
     end
 end
 
--- // NON-DESTRUCTIVE ANTI-STUN ENGINE (NEVER CALLS :Destroy() ON CHARACTER CHILDREN)
-local StunKeywords = {
-    "stun", "stuns", "nojump", "nospeed", "slow", "knockback", "ragdoll", "freeze",
-    "frozen", "dizz", "paralyz", "hitstun", "cantmove", "disabled",
-    "anchor", "heavy", "slam", "downed", "endlag", "m1cooldown"
-}
+local function getPlanarMoveVector(hum)
+    local moveDir = Vector3.zero
+    local camCF = Camera.CFrame
+    local flatLook = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z)
+    local flatRight = Vector3.new(camCF.RightVector.X, 0, camCF.RightVector.Z)
+    if flatLook.Magnitude > 0.01 then flatLook = flatLook.Unit end
+    if flatRight.Magnitude > 0.01 then flatRight = flatRight.Unit end
 
-local function isStunName(str)
-    local lower = string.lower(str)
-    if lower == "main" or lower == "remoteevent" or lower == "animate" or lower == "humanoid" or lower == "humanoidrootpart" then
-        return false
+    if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveDir = moveDir + flatLook end
+    if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveDir = moveDir - flatLook end
+    if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveDir = moveDir + flatRight end
+    if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveDir = moveDir - flatRight end
+
+    if moveDir.Magnitude == 0 and hum and hum.MoveDirection.Magnitude > 0 then
+        moveDir = Vector3.new(hum.MoveDirection.X, 0, hum.MoveDirection.Z)
     end
-    for i = 1, #StunKeywords do
-        if string.find(lower, StunKeywords[i], 1, true) then
-            return true
-        end
-    end
-    return false
+    if moveDir.Magnitude > 0 then return moveDir.Unit end
+    return Vector3.zero
 end
 
-local function neutralizeStunInstance(inst)
-    if not Config.ScriptRunning or not Config.AntiStunEnabled or not inst then return end
-    if inst.Name == "Main" or inst:IsA("RemoteEvent") or inst:IsA("LocalScript") or inst:IsA("Script") or inst:IsA("Folder") then
-        return
-    end
-    -- Neutralize physics movers in-place instead of calling :Destroy() so ChildRemoved/AncestryChanged anti-cheat never triggers
-    if not State.VoidKillActive and isStunName(inst.Name) then
-        pcall(function()
-            if inst:IsA("BodyVelocity") then
-                inst.MaxForce = Vector3.zero
-                inst.Velocity = Vector3.zero
-            elseif inst:IsA("BodyPosition") then
-                inst.MaxForce = Vector3.zero
-            elseif inst:IsA("BodyGyro") or inst:IsA("BodyAngularVelocity") then
-                inst.MaxTorque = Vector3.zero
-            elseif inst:IsA("LinearVelocity") or inst:IsA("AlignPosition") or inst:IsA("VectorForce") or inst:IsA("AlignOrientation") then
-                inst.Enabled = false
-            elseif inst:IsA("BoolValue") then
-                inst.Value = false
-            elseif inst:IsA("NumberValue") or inst:IsA("IntValue") then
-                inst.Value = 0
-            end
-        end)
-    end
-end
+-- // ZERO-TOUCH ANTI-STUN ENGINE (NEVER MODIFIES BODYMOVERS OR BOOLVALUES -> PREVENTS ERROR CODE: BF)
+local function enforceZeroTouchAntiStun(char, root, hum, dt)
+    if not char or not root or not hum or not dt or dt <= 0 then return end
+    if isCharacterStillInSkill(char) then return end
 
-local function enforceStealthAntiStun(char, root, hum, dt)
-    if not char or not root or not hum then return end
-
-    if hum.PlatformStand then hum.PlatformStand = false end
-    if hum.Sit then hum.Sit = false end
-
-    for _, child in ipairs(char:GetChildren()) do
-        neutralizeStunInstance(child)
-    end
-    for _, child in ipairs(root:GetChildren()) do
-        neutralizeStunInstance(child)
-    end
-
-    -- If stunned (WalkSpeed < 14), compensate movement via CFrame delta instead of mutating WalkSpeed
-    if hum.WalkSpeed < 14 and hum.MoveDirection.Magnitude > 0 and dt then
-        local desiredSpd = Config.SpeedEnabled and Config.WalkSpeed or 16
-        local Deficit = math.max(0, desiredSpd - hum.WalkSpeed)
-        root.CFrame = root.CFrame + (hum.MoveDirection * Deficit * dt)
+    local inputVec = getPlanarMoveVector(hum)
+    local isStunnedOrSlowed = (hum.WalkSpeed < 14) or hum.PlatformStand or hum.Sit
+    if isStunnedOrSlowed and inputVec.Magnitude > 0 then
+        local desiredSpd = Config.SpeedEnabled and Config.WalkSpeed or 18
+        local stepSpd = math.max(0, desiredSpd - math.max(0, hum.WalkSpeed))
+        root.CFrame = root.CFrame + (inputVec * stepSpd * dt)
     end
 end
 
@@ -1373,8 +1274,8 @@ local function bindCharacter(char)
 
     if not State.Root or not State.Hum then return end
 
-    task.delay(0.6, function()
-        if Config.ScriptRunning then
+    task.delay(0.8, function()
+        if Config.ScriptRunning and Config.AutoVoidKill then
             scanHotbarSkills1To4()
         end
     end)
@@ -1401,10 +1302,6 @@ local function bindCharacter(char)
             State.LastSkillCastTick = tick()
         end
 
-        if Config.AntiStunEnabled then
-            neutralizeStunInstance(inst)
-        end
-
         if Config.AutoVoidKill and not State.VoidKillActive and State.ActiveSpecialSkill == nil then
             task.defer(function()
                 if string.find(string.lower(State.LastSkillName or ""), "phantom shot", 1, true) and State.PhantomShotStage == 1 then
@@ -1424,17 +1321,12 @@ if LocalPlayer.Character then
 end
 table.insert(State.Connections, LocalPlayer.CharacterAdded:Connect(bindCharacter))
 
--- // STEALTH GUI PARENTING (NEVER FALLS BACK TO UNPROTECTED PLAYERGUI IF COREGUI EXISTS)
+-- // STEALTH GUI PARENTING
 local function getGuiParent()
     local okHui, hui = pcall(function()
         return gethui and gethui()
     end)
     if okHui and hui then return hui end
-
-    local okRobloxGui, robloxGui = pcall(function()
-        return CoreGui:FindFirstChild("RobloxGui")
-    end)
-    if okRobloxGui and robloxGui then return robloxGui end
 
     local okCore, cGui = pcall(function()
         return CoreGui
@@ -1523,28 +1415,18 @@ local function cleanupInvisible()
 end
 
 -- // UI ROOT
-local uiRootParent = getGuiParent()
-if uiRootParent:IsA("ScreenGui") then
-    ScreenGui = Instance.new("Frame")
-    ScreenGui.Name = State.UIToken
-    ScreenGui.Archivable = false
-    ScreenGui.Size = UDim2.new(1, 0, 1, 0)
-    ScreenGui.BackgroundTransparency = 1
-    ScreenGui.Parent = uiRootParent
-else
-    ScreenGui = Instance.new("ScreenGui")
-    ScreenGui.Name = State.UIToken
-    ScreenGui.Archivable = false
-    ScreenGui.ResetOnSpawn = false
-    ScreenGui.IgnoreGuiInset = true
-    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    pcall(function()
-        if syn and syn.protect_gui then
-            syn.protect_gui(ScreenGui)
-        end
-    end)
-    ScreenGui.Parent = uiRootParent
-end
+ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = State.UIToken
+ScreenGui.Archivable = false
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+pcall(function()
+    if syn and syn.protect_gui then
+        syn.protect_gui(ScreenGui)
+    end
+end)
+ScreenGui.Parent = getGuiParent()
 
 -- // EXTERNAL DROPDOWN POPUP
 local DropdownPopup = Instance.new("Frame")
@@ -1789,7 +1671,7 @@ local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 290, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v27 Zero-Trace"
+SubTitle.Text = "Heroes Battlegrounds v28 Native-Clean"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
@@ -2636,7 +2518,6 @@ local function triggerUndetectedInfJump()
     State.InfJumpArcTimer = now
 end
 
--- // ZERO-INSTANCE INVISIBLE (NO SEAT PART CREATED IN CAMERA)
 local function toggleInvisible(enable)
     cleanupInvisible()
     if not enable or not Config.ScriptRunning then return end
@@ -2761,6 +2642,7 @@ end)
 
 addFeatureToggle(TabCombat, "AutoSkill", "Auto Skill", "ASKL", false, function(v)
     Config.AutoSkillEnabled = v
+    if v then scanHotbarSkills1To4() end
 end)
 
 addFeatureToggle(TabCombat, "AutoUltimate", "Auto Ultimate", "AULT", false, function(v)
@@ -2779,11 +2661,8 @@ addSlider(TabCombat, "Anti Skill Range", 8, 35, 16, function(v)
     Config.AntiSkillRange = v
 end)
 
-addFeatureToggle(TabCombat, "AntiStun", "Anti Stun", "ASTUN", false, function(v)
+addFeatureToggle(TabCombat, "AntiStun", "Anti Stun (Zero-BF)", "ASTUN", false, function(v)
     Config.AntiStunEnabled = v
-    if v and State.Char and State.Root and State.Hum then
-        enforceStealthAntiStun(State.Char, State.Root, State.Hum, 0)
-    end
 end)
 
 addFeatureToggle(TabCombat, "AimbotPopup", "Aimbot Widget", "AIM", false, function(v)
@@ -2845,7 +2724,7 @@ addFeatureToggle(TabTarget, "TeleportPlayer", "Instant Teleport To Player", "TP"
     end
 end)
 
--- // 4. POPULATE LOCALPLAYER TAB
+-- // 4. POPULATE LOCALPLAYER TAB (MAX 500 FOR WALKSPEED & FLYSPEED)
 addFeatureToggle(TabMove, "Fly", "Loop Fly", "FLY", false, function(v)
     Config.FlyEnabled = v
     if not v and State.Root then
@@ -2857,7 +2736,7 @@ addDropdown(TabMove, "Fly Mode", {"FloorPad", "LoopPulse"}, 1, function(opt)
     Config.FlyMode = opt
 end)
 
-addSlider(TabMove, "Fly Speed", 10, 500, 65, function(v)
+addSlider(TabMove, "Fly Speed", 10, 500, 75, function(v)
     Config.FlySpeed = v
 end)
 
@@ -2886,7 +2765,7 @@ addFeatureToggle(TabMove, "Speed", "WalkSpeed Boost", "SPD", false, function(v)
     Config.SpeedEnabled = v
 end)
 
-addSlider(TabMove, "WalkSpeed", 16, 500, 50, function(v)
+addSlider(TabMove, "WalkSpeed", 16, 500, 55, function(v)
     Config.WalkSpeed = v
 end)
 
@@ -2939,8 +2818,6 @@ end)
 Config.AntiVoidEnabled = true
 Config.AutoVoidKill = false
 Config.UIInitialized = true
-task.defer(scanHotbarSkills1To4)
-task.defer(scanRealTreeWoods)
 
 table.insert(State.Connections, Players.PlayerAdded:Connect(function()
     task.wait(0.2)
@@ -3014,26 +2891,6 @@ local function updateESP()
     end
 end
 
-local function getPlanarMoveVector(hum)
-    local moveDir = Vector3.zero
-    local camCF = Camera.CFrame
-    local flatLook = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z)
-    local flatRight = Vector3.new(camCF.RightVector.X, 0, camCF.RightVector.Z)
-    if flatLook.Magnitude > 0.01 then flatLook = flatLook.Unit end
-    if flatRight.Magnitude > 0.01 then flatRight = flatRight.Unit end
-
-    if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveDir = moveDir + flatLook end
-    if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveDir = moveDir - flatLook end
-    if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveDir = moveDir + flatRight end
-    if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveDir = moveDir - flatRight end
-
-    if moveDir.Magnitude == 0 and hum and hum.MoveDirection.Magnitude > 0 then
-        moveDir = Vector3.new(hum.MoveDirection.X, 0, hum.MoveDirection.Z)
-    end
-    if moveDir.Magnitude > 0 then return moveDir.Unit end
-    return Vector3.zero
-end
-
 local function getFlightDirection(hum)
     local moveDir = Vector3.zero
     local camCF = Camera.CFrame
@@ -3062,7 +2919,7 @@ local function getFlightDirection(hum)
     return Vector3.zero
 end
 
--- // STEPPED LOOP (PURE VELOCITY/CFRAME SUSPENSION — ZERO PARTS CREATED)
+-- // STEPPED LOOP
 table.insert(State.Connections, RunService.Stepped:Connect(function()
     if not Config.ScriptRunning then return end
     local targetY = getSafeVoidFloorY()
@@ -3111,7 +2968,7 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
     end
 
     if Config.AntiStunEnabled and char and root and hum then
-        enforceStealthAntiStun(char, root, hum, dt)
+        enforceZeroTouchAntiStun(char, root, hum, dt)
     end
 
     if Config.AutoTargetEnabled and root and hum and not State.VoidKillActive and not State.AntiSkillEvading and not Config.DeepVoidActive and State.ActiveSpecialSkill == nil then
@@ -3196,7 +3053,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
         local voidY = Workspace.FallenPartsDestroyHeight
         if voidY ~= voidY or voidY < -10000 or voidY > 500 then voidY = -500 end
 
-        if Config.AutoSkillEnabled and not State.VoidKillActive and not State.AntiSkillEvading and not UserInputService:GetFocusedTextBox() then
+        if Config.AutoSkillEnabled and not State.VoidKillActive and not State.AntiSkillEvading and not isCharacterStillInSkill(char) and not UserInputService:GetFocusedTextBox() then
             local now = tick()
             if (now - State.LastAutoSkillTick) >= Config.AutoSkillDelay then
                 State.LastAutoSkillTick = now
@@ -3215,7 +3072,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             end
         end
 
-        if Config.AutoUltimateEnabled and not State.VoidKillActive and not UserInputService:GetFocusedTextBox() then
+        if Config.AutoUltimateEnabled and not State.VoidKillActive and not isCharacterStillInSkill(char) and not UserInputService:GetFocusedTextBox() then
             local now = tick()
             if (now - State.LastAutoUltTick) >= Config.AutoUltimateDelay then
                 State.LastAutoUltTick = now
@@ -3265,15 +3122,15 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             scanProximityGrab()
         end
 
-        -- Speed Boost via CFrame delta (never triggers Humanoid.WalkSpeed property signal)
-        if Config.SpeedEnabled and hum.MoveDirection.Magnitude > 0 and not Config.FlyEnabled and not Config.AutoTargetEnabled then
+        -- Speed Boost via CFrame delta (only when not casting a move so skills never rubberband)
+        if Config.SpeedEnabled and hum.MoveDirection.Magnitude > 0 and not Config.FlyEnabled and not Config.AutoTargetEnabled and not isCharacterStillInSkill(char) then
             local extraSpeed = math.max(0, Config.WalkSpeed - 16)
             if extraSpeed > 0 then
                 root.CFrame = root.CFrame + (hum.MoveDirection * extraSpeed * dt)
             end
         end
 
-        -- Infinite Jump without spawning FlyPad parts in Camera/Workspace
+        -- Infinite Jump
         if Config.InfJumpEnabled and not Config.FlyEnabled and not Config.AutoTargetEnabled and not State.VoidKillActive and not State.AntiSkillEvading then
             local elapsed = tick() - State.InfJumpArcTimer
             if State.InfJumpArcActive and elapsed < 0.22 then
@@ -3292,7 +3149,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             end
         end
 
-        -- Fly without spawning FlyPad parts in Camera/Workspace
+        -- Fly
         if Config.FlyEnabled and not Config.AutoTargetEnabled and not State.VoidKillActive and not State.AntiSkillEvading then
             local moveDir = getFlightDirection(hum)
             if Config.FlyMode == "FloorPad" then
