@@ -1,9 +1,9 @@
--- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v30 Exact Tree.TPPOINT/Wood & 10000-Stud Instant Void Kill)
--- Updates in v30:
---   1. Exact HBG Tree Wall Combo: locks onto Workspace.Map.DestroyableParts.Trees.Tree containing the 4 Wood segments (12.10x4.95x4.50 base, 12.10x3.95x3.30, 9.20x2.35x2.30, 9.00x1.65x1.50) AND all 4 TPPOINT (0.01x0.01x0.01) markers.
---   2. Places the 12.10x4.95x4.50 Wood trunk flush behind the enemy while snapping the 4 TPPOINT parts directly onto the enemy/player contact point so HBG's TPPOINT distance check passes 100%.
---   3. Instant Far-Void Kill: teleports 10,000 studs horizontally and drops right onto the exact FallenPartsDestroyHeight kill line (+2.2 studs with -90deg pitch) so the grabbed target crosses the death plane immediately.
---   4. WalkSpeed (default 55, max 500) & FlySpeed (default 75, max 500) with 100% working M1 & Skills 1-4.
+-- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v31)
+-- Fixes & Upgrades in v31:
+--   1. Instant 2900-Stud Void Kill (zero interpolation delay) + Full Character Pivot/Motor6D/Camera Resync on Return (fixes visual body & camera getting stuck in the void while server hitbox is back on map).
+--   2. Real Anti-Stun (Zero-BF): stops hitstun/ragdoll AnimationTracks, clears Ragdoll/PlatformStand states, cancels knockback velocity, and drives WASD movement without destroying Character BodyMovers.
+--   3. Server-Valid Wall Combo ("InstantTreeSnap" & "HybridSnapAndPull") + Live Wall Combo Inspector Logger to record exact RemoteEvents, Animations, Attributes, and TPPOINT distances in-game.
+--   4. WalkSpeed (default 55, max 500) & FlySpeed (default 75, max 500) with 100% working M1 & Skills.
 
 local cloneref = cloneref or function(obj) return obj end
 
@@ -36,13 +36,13 @@ local Config = {
     -- Background Anti-Void
     AntiVoidEnabled = true,
 
-    -- Deep Void & Void Kill (10,000 studs far void + exact death-line edge)
+    -- Instant 2900-Stud Void Kill
     DeepVoidActive = false,
     VoidKillDepth = 445,
-    VoidFarHorizontalDist = 10000,
+    VoidFarHorizontalDist = 2900,
     VoidEdgeOffset = 2.2,
     AutoVoidKill = false,
-    VoidMaxHoldTime = 1.65,
+    VoidMaxHoldTime = 1.45,
 
     MineSelectedTargets = {},
 
@@ -69,9 +69,10 @@ local Config = {
     AntiSkillRange = 16,
 
     WallComboEnabled = false,
-    WallComboMode = "TreeBehindEnemy",
+    WallComboMode = "InstantTreeSnap",
     WallBehindEnemyOffset = 3.8,
     WallComboKey = Enum.KeyCode.V,
+    WallInspectorEnabled = false,
     ObjectESPEnabled = false,
     ObjectESPRange = 45,
 
@@ -111,6 +112,8 @@ local State = {
     Root = nil,
     Hum = nil,
     Animator = nil,
+    OrigRootJointC0 = nil,
+    OrigRootJointC1 = nil,
     CharConnections = {},
 
     DetectedSlotNames = {
@@ -142,12 +145,16 @@ local State = {
     AntiSkillEvading = false,
     DecoyCFrame = nil,
 
-    -- HBG Tree bundles: { Model, BaseWood (12.10x4.95x4.50), Woods = {}, TPPoints = {}, SavedCFrames = {} }
+    -- HBG Tree bundles
     CachedTreeBundles = {},
     ActiveTreeBundle = nil,
     WallComboPulseRunning = false,
     M1ClickCount = 0,
     LastM1ClickTick = 0,
+
+    -- Wall Combo Inspector Logs
+    InspectorLogs = {},
+    InspectorStatusLabel = nil,
 
     ObjectESPItems = {},
     LastObjectESPRefresh = 0,
@@ -184,11 +191,94 @@ local function getSafeVoidFloorY()
     return math.max(desiredY, destroyY + 25)
 end
 
--- Places LocalPlayer right at the exact edge of FallenPartsDestroyHeight (+2.2 studs)
--- while pitching -90 degrees so the grabbed victim is pushed 3-5 studs BELOW FallenPartsDestroyHeight for an instant Void Kill!
 local function getKillZoneVoidY()
     local destroyY = getRawDestroyHeight()
     return destroyY + math.clamp(Config.VoidEdgeOffset, 1.2, 14.0)
+end
+
+local function getRootMotor(char)
+    if not char then return nil end
+    local lowerTorso = char:FindFirstChild("LowerTorso")
+    if lowerTorso and lowerTorso:FindFirstChild("Root") then
+        return lowerTorso.Root
+    end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp and hrp:FindFirstChild("RootJoint") then
+        return hrp.RootJoint
+    end
+    local torso = char:FindFirstChild("Torso")
+    if torso and torso:FindFirstChild("RootJoint") then
+        return torso.RootJoint
+    end
+    return nil
+end
+
+-- // FULL VISUAL BODY & CAMERA RESYNC (Fixes visual character/camera stuck in void while server hitbox returned)
+local function forceFullCharacterAndCameraResync(targetCF)
+    local char = LocalPlayer.Character or State.Char
+    local root = (char and char:FindFirstChild("HumanoidRootPart")) or State.Root
+    local hum = (char and char:FindFirstChildOfClass("Humanoid")) or State.Hum
+    if not char or not root or not targetCF then return end
+
+    pcall(function()
+        -- 1. Restore RootJoint C0/C1 if a grab weld or void pitch twisted the visual torso away from HumanoidRootPart
+        local motor = getRootMotor(char)
+        if motor and not Config.InvisibleEnabled then
+            if State.OrigRootJointC0 then motor.C0 = State.OrigRootJointC0 end
+            if State.OrigRootJointC1 then motor.C1 = State.OrigRootJointC1 end
+            motor.Transform = CFrame.identity
+        end
+
+        -- 2. Remove any leftover foreign welds attaching our character to a dead/voided enemy
+        for _, desc in ipairs(char:GetDescendants()) do
+            if desc:IsA("Weld") or desc:IsA("WeldConstraint") or desc:IsA("RigidConstraint") or desc:IsA("AlignPosition") or desc:IsA("AlignOrientation") then
+                local p0 = (desc:IsA("AlignPosition") or desc:IsA("AlignOrientation")) and desc.Attachment0 or desc.Part0
+                local p1 = (desc:IsA("AlignPosition") or desc:IsA("AlignOrientation")) and desc.Attachment1 or desc.Part1
+                if (p0 and not p0:IsDescendantOf(char)) or (p1 and not p1:IsDescendantOf(char)) then
+                    if desc:IsA("WeldConstraint") or desc:IsA("RigidConstraint") or desc:IsA("AlignPosition") or desc:IsA("AlignOrientation") then
+                        desc.Enabled = false
+                    end
+                    desc:Destroy()
+                end
+            end
+        end
+
+        -- 3. Snap entire character assembly + Pivot + upright rotation
+        local pos = targetCF.Position
+        local _, yaw, _ = targetCF:ToEulerAnglesYXZ()
+        local uprightCF = CFrame.new(pos) * CFrame.Angles(0, yaw, 0)
+
+        if root.Anchored then root.Anchored = false end
+        char:PivotTo(uprightCF)
+        root.CFrame = uprightCF
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.AssemblyLinearVelocity = Vector3.zero
+                part.AssemblyAngularVelocity = Vector3.zero
+            end
+        end
+
+        -- 4. Force Camera & Humanoid state back to normal on the surface
+        if hum then
+            if hum.PlatformStand then hum.PlatformStand = false end
+            if hum.Sit then hum.Sit = false end
+            hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+            hum:ChangeState(Enum.HumanoidStateType.Running)
+
+            Camera = Workspace.CurrentCamera
+            if Camera then
+                Camera.CameraType = Enum.CameraType.Custom
+                Camera.CameraSubject = hum
+                -- If camera is still far away in the void (>150 studs from root), snap camera near character
+                if (Camera.CFrame.Position - uprightCF.Position).Magnitude > 150 then
+                    Camera.CFrame = CFrame.lookAt(uprightCF.Position + Vector3.new(0, 6, 12), uprightCF.Position + Vector3.new(0, 1.5, 0))
+                end
+            end
+        end
+    end)
 end
 
 local function findNearestValidPlayer(maxRange)
@@ -249,13 +339,7 @@ local function findNearestEnemyRoot(maxRange)
     return bestModel, bestRoot
 end
 
--- // SCAN EXACT HBG TREE STRUCTURE:
--- Workspace.Map.DestroyableParts.Trees.Tree
---   - Wood (Size: 12.10, 4.95, 4.50) [Base Trunk]
---   - Wood (Size: 12.10, 3.95, 3.30) [Mid Trunk]
---   - Wood (Size: 9.20, 2.35, 2.30)  [Upper Trunk]
---   - Wood (Size: 9.00, 1.65, 1.50)  [Top Branch]
---   - 4x TPPOINT (Size: 0.01, 0.01, 0.01, Material: Plastic)
+-- // SCAN EXACT HBG TREE STRUCTURE (Wood + TPPOINT)
 local function scanRealTreeWoods()
     local bundles = {}
     local mapFolder = Workspace:FindFirstChild("Map")
@@ -279,7 +363,6 @@ local function scanRealTreeWoods()
                 end
 
                 if #woods > 0 then
-                    -- Sort so the thickest base trunk (12.10, 4.95, 4.50) is always woods[1] (BaseWood)
                     table.sort(woods, function(a, b)
                         return (a.Size.Y * a.Size.Z) > (b.Size.Y * b.Size.Z)
                     end)
@@ -346,12 +429,61 @@ local function findNearestTreeBundle(refPos)
     return bestBundle, shortest
 end
 
+-- // WALL COMBO INSPECTOR LOGGER (Records how HBG checks & triggers Wall Combo in real time)
+local function appendInspectorLog(msg)
+    if not Config.WallInspectorEnabled then return end
+    local stamp = string.format("[%.2fs] %s", tick() % 1000, msg)
+    table.insert(State.InspectorLogs, stamp)
+    if #State.InspectorLogs > 60 then
+        table.remove(State.InspectorLogs, 1)
+    end
+    if State.InspectorStatusLabel and State.InspectorStatusLabel.Parent then
+        State.InspectorStatusLabel.Text = "Inspector Log (" .. tostring(#State.InspectorLogs) .. " events): " .. msg
+    end
+end
+
+local function snapshotTreeDistanceForInspector(tag)
+    if not Config.WallInspectorEnabled or not State.Root then return end
+    local myPos = State.Root.Position
+    local bundle, woodDist = findNearestTreeBundle(myPos)
+    local bestTPDist = math.huge
+    local tpPosStr = "None"
+    if bundle then
+        for _, tp in ipairs(bundle.TPPoints) do
+            if tp and tp.Parent then
+                local d = (tp.Position - myPos).Magnitude
+                if d < bestTPDist then
+                    bestTPDist = d
+                    tpPosStr = string.format("(%.1f, %.1f, %.1f)", tp.Position.X, tp.Position.Y, tp.Position.Z)
+                end
+            end
+        end
+    end
+    local _, enemyRoot = findNearestEnemyRoot(25)
+    local enemyDist = enemyRoot and (enemyRoot.Position - myPos).Magnitude or -1
+    local enemyToWood = (enemyRoot and bundle and bundle.BaseWood) and (enemyRoot.Position - bundle.BaseWood.Position).Magnitude or -1
+    appendInspectorLog(string.format(
+        "%s | Me->Wood:%.2fm | Me->TPPOINT:%.2fm %s | Me->Enemy:%.2fm | Enemy->Wood:%.2fm",
+        tag, woodDist or -1, bestTPDist, tpPosStr, enemyDist, enemyToWood
+    ))
+end
+
+-- // SERVER-VALID WALL COMBO EXECUTION
+-- Why moving Tree.Wood alone failed on Server:
+--   Tree.Wood is Anchored=true, so changing its CFrame on client only moves it visually on your screen;
+--   the server still sees the tree at its original map position!
+-- Solution:
+--   1. "InstantTreeSnap": When M1 #4 or Q or V is pressed, instantly teleports YOU to the nearest real Tree.TPPOINT
+--      (aligned facing Tree.Wood so the enemy in front of you / carried by your M1 lunge hits the real server-side tree),
+--      and also fires Q/M1 at that exact server tree position!
+--   2. "HybridSnapAndPull": Both snaps you to the real Tree.TPPOINT AND pulls the visual Wood/TPPOINT behind the enemy.
 local function triggerWallComboBehindEnemy(duration)
     local myChar = LocalPlayer.Character or State.Char
     local myRoot = State.Root
     if not myChar or not myRoot then return end
+    if State.WallComboPulseRunning then return end
 
-    local holdTime = duration or 0.82
+    local holdTime = duration or 0.55
     local bundle, shortest = findNearestTreeBundle(myRoot.Position)
     if not bundle or not bundle.BaseWood or not bundle.BaseWood.Parent then
         scanRealTreeWoods()
@@ -359,10 +491,16 @@ local function triggerWallComboBehindEnemy(duration)
     end
     if not bundle or not bundle.BaseWood then return end
 
-    -- Mode 2: Snap player directly onto the nearest Tree.TPPOINT facing Tree.Wood
-    if Config.WallComboMode == "SnapToRealTree" then
-        if shortest <= 180 then
+    snapshotTreeDistanceForInspector("TriggerWallCombo[" .. tostring(Config.WallComboMode) .. "]")
+
+    -- Mode 1 (Default & Server-Valid): Instant Snap to Real Tree TPPOINT / Wood Face
+    if Config.WallComboMode == "InstantTreeSnap" or Config.WallComboMode == "HybridSnapAndPull" then
+        if shortest <= 280 then
+            State.WallComboPulseRunning = true
+            local preSnapCF = myRoot.CFrame
             local woodPos = bundle.BaseWood.Position
+
+            -- Find the best TPPOINT on that tree
             local bestTP = nil
             local bestDist = math.huge
             for _, tp in ipairs(bundle.TPPoints) do
@@ -375,24 +513,73 @@ local function triggerWallComboBehindEnemy(duration)
                 end
             end
 
-            local standPos
-            if bestTP then
-                standPos = Vector3.new(bestTP.Position.X, myRoot.Position.Y, bestTP.Position.Z)
-            else
-                local dirToWood = Vector3.new(woodPos.X - myRoot.Position.X, 0, woodPos.Z - myRoot.Position.Z)
-                dirToWood = (dirToWood.Magnitude > 0.1) and dirToWood.Unit or myRoot.CFrame.LookVector
-                standPos = Vector3.new(woodPos.X, myRoot.Position.Y, woodPos.Z) - (dirToWood * 4.6)
-            end
+            task.spawn(function()
+                local startTick = tick()
+                while (tick() - startTick) < holdTime and Config.ScriptRunning and State.Root do
+                    local _, enemyRoot = findNearestEnemyRoot(24)
+                    local standPos
+                    local lookAtPos = Vector3.new(woodPos.X, State.Root.Position.Y, woodPos.Z)
 
-            myRoot.CFrame = CFrame.lookAt(standPos, Vector3.new(woodPos.X, myRoot.Position.Y, woodPos.Z))
-            myRoot.AssemblyLinearVelocity = Vector3.zero
+                    if bestTP and bestTP.Parent then
+                        -- Stand right on the Tree's TPPOINT facing the Wood trunk center
+                        local dirTPToWood = Vector3.new(woodPos.X - bestTP.Position.X, 0, woodPos.Z - bestTP.Position.Z)
+                        if dirTPToWood.Magnitude > 0.05 then
+                            dirTPToWood = dirTPToWood.Unit
+                        else
+                            dirTPToWood = State.Root.CFrame.LookVector
+                        end
+                        -- Place player 1.8 studs behind TPPOINT facing Wood so enemy is sandwiched between player and Wood/TPPOINT
+                        standPos = Vector3.new(bestTP.Position.X, bestTP.Position.Y + 2.5, bestTP.Position.Z) - (dirTPToWood * 1.8)
+                        lookAtPos = Vector3.new(woodPos.X, standPos.Y, woodPos.Z)
+                    else
+                        local dirToWood = Vector3.new(woodPos.X - State.Root.Position.X, 0, woodPos.Z - State.Root.Position.Z)
+                        dirToWood = (dirToWood.Magnitude > 0.1) and dirToWood.Unit or State.Root.CFrame.LookVector
+                        standPos = Vector3.new(woodPos.X, bundle.BaseWood.Position.Y, woodPos.Z) - (dirToWood * 4.5)
+                        lookAtPos = Vector3.new(woodPos.X, standPos.Y, woodPos.Z)
+                    end
+
+                    local snapCF = CFrame.lookAt(standPos, lookAtPos)
+                    State.Root.CFrame = snapCF
+                    State.Root.AssemblyLinearVelocity = Vector3.zero
+
+                    -- If enemy is close and we are in Hybrid mode, also pull enemy & TPPOINT visually
+                    if Config.WallComboMode == "HybridSnapAndPull" and enemyRoot then
+                        pcall(function()
+                            enemyRoot.CFrame = snapCF * CFrame.new(0, 0, -2.6)
+                        end)
+                    end
+
+                    -- Also try firing Main.RemoteEvent dash/wallcombo trigger if character has Main.RemoteEvent
+                    if (tick() - startTick) < 0.06 then
+                        pcall(function()
+                            local main = myChar:FindFirstChild("Main")
+                            local rem = main and main:FindFirstChild("RemoteEvent")
+                            if rem then
+                                rem:FireServer("Dash", "Forward")
+                            end
+                        end)
+                    end
+
+                    -- If HBG accepted the Wall Combo (character entered UsingMove / InSkill), stop snapping early so the animation plays naturally!
+                    if isCharacterStillInSkill(myChar) and (tick() - startTick) > 0.12 then
+                        snapshotTreeDistanceForInspector("WallCombo_AcceptedByServer!")
+                        break
+                    end
+
+                    RunService.Heartbeat:Wait()
+                end
+
+                -- If Wall Combo didn't lock us into an animation at the tree, return to our fight position
+                if State.Root and not isCharacterStillInSkill(myChar) then
+                    forceFullCharacterAndCameraResync(preSnapCF)
+                end
+                State.WallComboPulseRunning = false
+            end)
         end
         return
     end
 
-    -- Mode 1: Pull BaseWood (12.10 x 4.95 x 4.50) + upper Wood segments flush behind enemy
-    -- AND snap all 4 TPPOINTs right onto the enemy/player contact zone!
-    if State.WallComboPulseRunning then return end
+    -- Mode 3: Client-side TreeBehindEnemy (pulls Wood + TPPOINT to enemy)
     State.WallComboPulseRunning = true
     State.ActiveTreeBundle = bundle
 
@@ -417,7 +604,6 @@ local function triggerWallComboBehindEnemy(duration)
             local baseWood = bundle.BaseWood
             if not baseWood or not baseWood.Parent then break end
 
-            -- BaseWood is Size (12.10, 4.95, 4.50): half-thickness is ~2.25 studs
             local halfThickness = math.max(baseWood.Size.Y, baseWood.Size.Z) * 0.5
             local centerDistBehindEnemy = math.max(Config.WallBehindEnemyOffset, halfThickness + 1.35)
 
@@ -435,7 +621,6 @@ local function triggerWallComboBehindEnemy(duration)
 
                 local trunkCenterPos = curEnemyRoot.Position + (dirMeToEnemy * centerDistBehindEnemy)
                 contactPointPos = curEnemyRoot.Position + (dirMeToEnemy * 0.85)
-                -- Rotate 90deg on Z so the 12.10-stud X axis stands upright vertically behind the enemy
                 targetBaseWoodCF = CFrame.lookAt(trunkCenterPos, curEnemyRoot.Position) * CFrame.Angles(0, 0, math.rad(90))
             else
                 local lookVec = State.Root.CFrame.LookVector
@@ -445,7 +630,6 @@ local function triggerWallComboBehindEnemy(duration)
             end
 
             pcall(function()
-                -- Position all 4 Wood segments (12.10x4.95x4.50 base + 3 upper segments)
                 for _, w in ipairs(bundle.Woods) do
                     if w and w.Parent then
                         local rel = woodRelOffsets[w] or CFrame.identity
@@ -455,8 +639,6 @@ local function triggerWallComboBehindEnemy(duration)
                     end
                 end
 
-                -- Place all 4 TPPOINTs (0.01, 0.01, 0.01) directly around the contact point & player root
-                -- so HBG's TPPOINT proximity & alignment check succeeds 100%
                 for idx, tp in ipairs(bundle.TPPoints) do
                     if tp and tp.Parent then
                         if idx == 1 then
@@ -507,16 +689,10 @@ end
 
 local function teleportBackFromDeepVoid()
     Config.DeepVoidActive = false
-    local myRoot = State.Root
-    if myRoot then
-        local returnCF = State.PreDeepVoidCFrame or State.LastSafeCFrame or CFrame.new(0, 65, 0)
-        for _ = 1, 10 do
-            if State.Root then
-                State.Root.CFrame = returnCF + Vector3.new(0, 4, 0)
-                State.Root.AssemblyLinearVelocity = Vector3.zero
-            end
-            RunService.RenderStepped:Wait()
-        end
+    local returnCF = State.PreDeepVoidCFrame or State.LastSafeCFrame or CFrame.new(0, 65, 0)
+    for _ = 1, 12 do
+        forceFullCharacterAndCameraResync(returnCF + Vector3.new(0, 4, 0))
+        RunService.RenderStepped:Wait()
     end
 end
 
@@ -658,7 +834,7 @@ local function scanHotbarSkills1To4()
     return State.DetectedSlotNames
 end
 
-local function isCharacterStillInSkill(char)
+function isCharacterStillInSkill(char)
     if not char then return false end
     for _, child in ipairs(char:GetChildren()) do
         local n = string.lower(child.Name)
@@ -791,7 +967,7 @@ local function getConfirmedCarriedEnemies()
     return grabbedList, grabbedMap
 end
 
--- // 10,000-STUD INSTANT VOID KILL AT EXACT DEATH LINE
+-- // INSTANT 2900-STUD VOID KILL + GUARANTEED VISUAL/CAMERA RESYNC ON RETURN
 local function executeVoidKillTrip()
     if not Config.ScriptRunning or State.VoidKillActive or not Config.AutoVoidKill then return end
     local myChar = LocalPlayer.Character or State.Char
@@ -800,15 +976,20 @@ local function executeVoidKillTrip()
     if not myChar or not myRoot or not myHum or myHum.Health <= 0 then return end
 
     State.VoidKillActive = true
-    State.VoidReturnCFrame = State.LastSafeCFrame or myRoot.CFrame
+    -- Always lock a guaranteed safe surface CFrame (Y > -20)
+    if State.LastSafeCFrame and State.LastSafeCFrame.Position.Y > -20 then
+        State.VoidReturnCFrame = State.LastSafeCFrame
+    elseif myRoot.Position.Y > -20 then
+        State.VoidReturnCFrame = myRoot.CFrame
+    else
+        State.VoidReturnCFrame = CFrame.new(0, 55, 0)
+    end
 
     task.spawn(function()
         local destroyY = getRawDestroyHeight()
         local safeEdgeY = getKillZoneVoidY()
         local originPos = State.VoidReturnCFrame.Position
-        local startPos = myRoot.Position
 
-        -- Direction out to 10,000 studs in the void
         local flatDir = Vector3.new(originPos.X, 0, originPos.Z)
         if flatDir.Magnitude < 1 then
             flatDir = Vector3.new(1, 0, 0)
@@ -816,25 +997,20 @@ local function executeVoidKillTrip()
             flatDir = flatDir.Unit
         end
 
-        local farDist = Config.VoidFarHorizontalDist or 10000
+        local farDist = Config.VoidFarHorizontalDist or 2900
         local voidXZ = Vector3.new(originPos.X, 0, originPos.Z) + (flatDir * farDist)
 
-        -- Step 1: Drag grabbed enemy out to 10,000 studs & down to the exact void death line in 3 fast physics steps
-        for step = 1, 3 do
-            if State.Root then
-                local alpha = step / 3
-                local curPos = startPos:Lerp(Vector3.new(voidXZ.X, safeEdgeY, voidXZ.Z), alpha)
-                -- Pitch -90 degrees (face straight down into the void) so the enemy welded in front of you is submerged below FallenPartsDestroyHeight!
-                State.VoidDropTargetCF = CFrame.new(curPos) * CFrame.Angles(math.rad(-90), 0, 0)
-                State.Root.CFrame = State.VoidDropTargetCF
-                State.Root.AssemblyLinearVelocity = Vector3.new(0, -120, 0)
-                State.Root.AssemblyAngularVelocity = Vector3.zero
-            end
-            RunService.Heartbeat:Wait()
+        -- INSTANT 0-DELAY TELEPORT straight to 2900 studs & exact void death line
+        local instantDropCF = CFrame.new(voidXZ.X, safeEdgeY, voidXZ.Z) * CFrame.Angles(math.rad(-90), 0, 0)
+        State.VoidDropTargetCF = instantDropCF
+        if State.Root then
+            State.Root.CFrame = instantDropCF
+            State.Root.AssemblyLinearVelocity = Vector3.zero
+            State.Root.AssemblyAngularVelocity = Vector3.zero
         end
 
         local dropStartTick = tick()
-        local minStayInVoid = 0.35
+        local minStayInVoid = 0.28
 
         while Config.ScriptRunning and Config.AutoVoidKill and State.Root and State.Hum and State.Hum.Health > 0 do
             local elapsed = tick() - dropStartTick
@@ -842,8 +1018,6 @@ local function executeVoidKillTrip()
                 break
             end
 
-            -- Keep LocalPlayer's HRP safely at destroyY + VoidEdgeOffset (e.g. -497.8) while pitching -90 deg
-            -- so the victim's body hangs at destroyY - 3.5 (e.g. -503.5, below the -500 kill plane) and gets deleted by the server!
             local microDip = math.sin(elapsed * 35) * 0.65
             local clampedY = math.max(destroyY + 1.35, safeEdgeY + microDip)
             local activeCF = CFrame.new(voidXZ.X, clampedY, voidXZ.Z) * CFrame.Angles(math.rad(-90), 0, 0)
@@ -873,13 +1047,11 @@ local function executeVoidKillTrip()
 
         State.VoidDropTargetCF = nil
 
-        if State.Root and State.VoidReturnCFrame then
-            for _ = 1, 12 do
-                State.Root.CFrame = State.VoidReturnCFrame + Vector3.new(0, 3.5, 0)
-                State.Root.AssemblyLinearVelocity = Vector3.zero
-                State.Root.AssemblyAngularVelocity = Vector3.zero
-                RunService.RenderStepped:Wait()
-            end
+        -- GUARANTEED RETURN & FULL VISUAL/CAMERA RESYNC
+        local returnCF = (State.VoidReturnCFrame or CFrame.new(0, 55, 0)) + Vector3.new(0, 3.5, 0)
+        for _ = 1, 16 do
+            forceFullCharacterAndCameraResync(returnCF)
+            RunService.RenderStepped:Wait()
         end
 
         State.ActiveSpecialSkill = nil
@@ -1171,13 +1343,9 @@ end
 
 local function stopMovableGhostDecoy()
     local returnCF = State.DecoyCFrame
-    if State.Hum then
-        Camera.CameraSubject = State.Hum
-    end
-    if State.Root and returnCF and not Config.DeepVoidActive then
-        for _ = 1, 5 do
-            State.Root.CFrame = returnCF
-            State.Root.AssemblyLinearVelocity = Vector3.zero
+    if returnCF and not Config.DeepVoidActive then
+        for _ = 1, 8 do
+            forceFullCharacterAndCameraResync(returnCF)
             RunService.RenderStepped:Wait()
         end
     end
@@ -1368,17 +1536,113 @@ local function getPlanarMoveVector(hum)
     return Vector3.zero
 end
 
--- // ZERO-TOUCH ANTI-STUN ENGINE
-local function enforceZeroTouchAntiStun(char, root, hum, dt)
-    if not char or not root or not hum or not dt or dt <= 0 then return end
-    if isCharacterStillInSkill(char) then return end
+-- // REAL ANTI-STUN ENGINE (Zero-BF: Never destroys BodyMovers, but cancels hitstun animations, ragdoll states, and knockback velocity!)
+local HitstunAnimKeywords = {
+    "stun", "hit", "hurt", "stagger", "ragdoll", "knock", "down", "slam", "grabbed", "freeze", "paralyz"
+}
 
-    local inputVec = getPlanarMoveVector(hum)
-    local isStunnedOrSlowed = (hum.WalkSpeed < 14) or hum.PlatformStand or hum.Sit
-    if isStunnedOrSlowed and inputVec.Magnitude > 0 then
-        local desiredSpd = Config.SpeedEnabled and Config.WalkSpeed or 18
-        local stepSpd = math.max(0, desiredSpd - math.max(0, hum.WalkSpeed))
-        root.CFrame = root.CFrame + (inputVec * stepSpd * dt)
+local function isCharCurrentlyStunned(char, hum)
+    if not char or not hum then return false end
+    if hum.WalkSpeed < 14 or hum.PlatformStand or hum.Sit then
+        return true
+    end
+    local st = hum:GetState()
+    if st == Enum.HumanoidStateType.Ragdoll
+        or st == Enum.HumanoidStateType.FallingDown
+        or st == Enum.HumanoidStateType.Physics
+        or st == Enum.HumanoidStateType.PlatformStanding then
+        return true
+    end
+    if char:GetAttribute("Stunned") == true
+        or char:GetAttribute("Stun") == true
+        or char:GetAttribute("Ragdoll") == true
+        or char:GetAttribute("Hitstun") == true
+        or char:GetAttribute("NoMove") == true then
+        return true
+    end
+    for _, child in ipairs(char:GetChildren()) do
+        local n = string.lower(child.Name)
+        if string.find(n, "stun", 1, true)
+            or string.find(n, "ragdoll", 1, true)
+            or string.find(n, "nojump", 1, true)
+            or string.find(n, "nospeed", 1, true)
+            or string.find(n, "slow", 1, true)
+            or string.find(n, "knockback", 1, true)
+            or string.find(n, "cantmove", 1, true)
+            or string.find(n, "freeze", 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function enforceRealAntiStun(char, root, hum, dt)
+    if not char or not root or not hum then return end
+
+    -- 1. Unanchor character parts if anchored by a freeze/slam stun while not casting our own skill
+    if not isCharacterStillInSkill(char) then
+        if root.Anchored then root.Anchored = false end
+        for _, p in ipairs(char:GetChildren()) do
+            if p:IsA("BasePart") and p.Anchored then
+                p.Anchored = false
+            end
+        end
+    end
+
+    -- 2. Force Humanoid out of Ragdoll / FallingDown / PlatformStand
+    if hum.PlatformStand then hum.PlatformStand = false end
+    if hum.Sit then hum.Sit = false end
+    hum.AutoRotate = true
+
+    local curState = hum:GetState()
+    if curState == Enum.HumanoidStateType.Ragdoll
+        or curState == Enum.HumanoidStateType.FallingDown
+        or curState == Enum.HumanoidStateType.Physics
+        or curState == Enum.HumanoidStateType.PlatformStanding then
+        pcall(function()
+            hum:ChangeState(Enum.HumanoidStateType.Running)
+        end)
+    end
+
+    -- 3. Stop playing Hitstun / Ragdoll / Knockback animations
+    local animator = State.Animator or hum:FindFirstChildOfClass("Animator")
+    if animator then
+        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+            if track ~= State.CurrentSkillAnimTrack then
+                local tName = string.lower(track.Name or "")
+                for i = 1, #HitstunAnimKeywords do
+                    if string.find(tName, HitstunAnimKeywords[i], 1, true) then
+                        pcall(function() track:Stop(0) end)
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    -- 4. Override knockback velocity & drive WASD movement even when server sets WalkSpeed = 0
+    local stunned = isCharCurrentlyStunned(char, hum)
+    if stunned and not isCharacterStillInSkill(char) then
+        local inputVec = getPlanarMoveVector(hum)
+        local targetSpd = Config.SpeedEnabled and Config.WalkSpeed or 22
+        local curVel = root.AssemblyLinearVelocity
+
+        if inputVec.Magnitude > 0 then
+            -- Cancel enemy knockback and drive in WASD direction
+            root.AssemblyLinearVelocity = Vector3.new(inputVec.X * targetSpd, math.clamp(curVel.Y, -35, 35), inputVec.Z * targetSpd)
+            if dt and dt > 0 then
+                root.CFrame = root.CFrame + (inputVec * targetSpd * dt * 0.65)
+            end
+            -- Face movement or camera direction
+            local camLook = Vector3.new(Camera.CFrame.LookVector.X, 0, Camera.CFrame.LookVector.Z)
+            if camLook.Magnitude > 0.1 then
+                root.CFrame = CFrame.lookAt(root.Position, root.Position + camLook.Unit)
+            end
+        else
+            -- Standing still while stunned: dampen horizontal knockback velocity so enemy can't fling/combo-push you
+            root.AssemblyLinearVelocity = Vector3.new(0, math.clamp(curVel.Y, -45, 25), 0)
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
     end
 end
 
@@ -1410,6 +1674,15 @@ local function bindCharacter(char)
 
     if not State.Root or not State.Hum then return end
 
+    -- Save original RootJoint C0/C1 for post-VoidKill visual body resync
+    task.defer(function()
+        local motor = getRootMotor(char)
+        if motor then
+            State.OrigRootJointC0 = motor.C0
+            State.OrigRootJointC1 = motor.C1
+        end
+    end)
+
     task.delay(0.8, function()
         if Config.ScriptRunning and Config.AutoVoidKill then
             scanHotbarSkills1To4()
@@ -1425,10 +1698,22 @@ local function bindCharacter(char)
                     if (tick() - State.LastSkillCastTick) <= 1.5 and State.LastKeyPressed then
                         State.CurrentSkillAnimTrack = track
                     end
+                    if Config.WallInspectorEnabled then
+                        local animId = track.Animation and track.Animation.AnimationId or "nil"
+                        appendInspectorLog(string.format("AnimPlayed: %s (%s)", tostring(track.Name), tostring(animId)))
+                        snapshotTreeDistanceForInspector("OnAnimPlayed")
+                    end
                 end)
             end))
         end
     end)
+
+    -- Inspector attribute listeners
+    table.insert(State.CharConnections, char.AttributeChanged:Connect(function(attrName)
+        if Config.WallInspectorEnabled then
+            appendInspectorLog(string.format("CharAttrChanged: %s = %s", tostring(attrName), tostring(char:GetAttribute(attrName))))
+        end
+    end))
 
     table.insert(State.CharConnections, char.DescendantAdded:Connect(function(inst)
         if not Config.ScriptRunning then return end
@@ -1436,6 +1721,12 @@ local function bindCharacter(char)
         if inst:IsA("Tool") then
             State.LastSkillName = inst.Name
             State.LastSkillCastTick = tick()
+        end
+
+        if Config.WallInspectorEnabled then
+            if inst.Parent == char or inst.Parent == State.Root then
+                appendInspectorLog(string.format("CharChildAdded: %s [%s]", inst.Name, inst.ClassName))
+            end
         end
 
         if Config.AutoVoidKill and not State.VoidKillActive and State.ActiveSpecialSkill == nil then
@@ -1519,18 +1810,6 @@ local function makeDraggable(dragHandle, targetFrame, onTapCallback)
             )
         end
     end))
-end
-
-local function getRootMotor(char)
-    local lowerTorso = char:FindFirstChild("LowerTorso")
-    if lowerTorso and lowerTorso:FindFirstChild("Root") then
-        return lowerTorso.Root
-    end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if hrp and hrp:FindFirstChild("RootJoint") then
-        return hrp.RootJoint
-    end
-    return nil
 end
 
 local function cleanupInvisible()
@@ -1807,7 +2086,7 @@ local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 290, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v30 TPPOINT+Void10k"
+SubTitle.Text = "Heroes Battlegrounds v31 Instant2k9+Resync"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
@@ -1880,6 +2159,7 @@ local function unloadEntireScript()
     Config.AntiStunEnabled = false
     Config.AntiSkillEnabled = false
     Config.WallComboEnabled = false
+    Config.WallInspectorEnabled = false
     Config.ObjectESPEnabled = false
     Config.AutoSkillEnabled = false
     Config.AutoUltimateEnabled = false
@@ -2724,21 +3004,24 @@ State.SlotStatusLabel.Parent = SlotPreviewCard
 addDualButtons(
     TabVoid,
     "Teleport Void", Color3.fromRGB(45, 115, 195), function() teleportToDeepVoid() end,
-    "Teleport Back", Color3.fromRGB(55, 135, 95), function() teleportBackFromDeepVoid() end
+    "Teleport Back (Resync)", Color3.fromRGB(55, 135, 95), function() teleportBackFromDeepVoid() end
 )
 
-addFeatureToggle(TabVoid, "AutoVoidKill", "Auto Void Kill (10,000 Studs + Death Line)", "VOIDK", false, function(v)
+addFeatureToggle(TabVoid, "AutoVoidKill", "Auto Void Kill (Instant 2,900 Studs + Resync)", "VOIDK", false, function(v)
     Config.AutoVoidKill = v
     if not v then
         State.VoidKillActive = false
         State.VoidDropTargetCF = nil
         State.ActiveSpecialSkill = nil
+        if State.LastSafeCFrame then
+            forceFullCharacterAndCameraResync(State.LastSafeCFrame + Vector3.new(0, 3, 0))
+        end
     else
         scanHotbarSkills1To4()
     end
 end)
 
-addSlider(TabVoid, "Void Far Distance (Studs)", 0, 25000, 10000, function(v)
+addSlider(TabVoid, "Void Far Distance (Studs)", 0, 10000, 2900, function(v)
     Config.VoidFarHorizontalDist = v
 end)
 
@@ -2750,12 +3033,12 @@ local MineMultiDropdown = addMultiDropdown(TabVoid, "Mine Multi Targets", curren
     Config.MineSelectedTargets = selectedMap
 end)
 
-addSlider(TabVoid, "Void Hold Duration", 0.40, 3.50, 1.65, function(v)
+addSlider(TabVoid, "Void Hold Duration", 0.35, 3.00, 1.45, function(v)
     Config.VoidMaxHoldTime = v
 end)
 
 -- // 2. POPULATE COMBAT TAB
-addFeatureToggle(TabCombat, "WallCombo", "Auto Wall Combo (4x Wood + 4x TPPOINT)", "WALLC", false, function(v)
+addFeatureToggle(TabCombat, "WallCombo", "Auto Wall Combo (Server-Valid Tree Snap)", "WALLC", false, function(v)
     Config.WallComboEnabled = v
     if v then
         scanRealTreeWoods()
@@ -2764,7 +3047,7 @@ addFeatureToggle(TabCombat, "WallCombo", "Auto Wall Combo (4x Wood + 4x TPPOINT)
     end
 end)
 
-addDropdown(TabCombat, "Wall Combo Mode", {"TreeBehindEnemy", "SnapToRealTree"}, 1, function(mode)
+addDropdown(TabCombat, "Wall Combo Mode", {"InstantTreeSnap", "HybridSnapAndPull", "TreeBehindEnemy"}, 1, function(mode)
     Config.WallComboMode = mode
     restoreActiveWallTree()
 end)
@@ -2774,7 +3057,52 @@ addSlider(TabCombat, "Tree Behind Offset", 2.5, 8.0, 3.8, function(v)
 end)
 
 addButton(TabCombat, "Trigger Wall Combo Now (Key: V)", Color3.fromRGB(45, 130, 85), function()
-    triggerWallComboBehindEnemy(0.85)
+    triggerWallComboBehindEnemy(0.55)
+end)
+
+-- Wall Combo Inspector UI Card
+local InspectorCard = Instance.new("Frame")
+InspectorCard.Size = UDim2.new(1, 0, 0, 34)
+InspectorCard.BackgroundColor3 = Color3.fromRGB(28, 32, 42)
+InspectorCard.BackgroundTransparency = 0.15
+InspectorCard.BorderSizePixel = 0
+InspectorCard.Parent = TabCombat
+Instance.new("UICorner", InspectorCard).CornerRadius = UDim.new(0, 6)
+
+State.InspectorStatusLabel = Instance.new("TextLabel")
+State.InspectorStatusLabel.Size = UDim2.new(1, -16, 1, 0)
+State.InspectorStatusLabel.Position = UDim2.new(0, 8, 0, 0)
+State.InspectorStatusLabel.BackgroundTransparency = 1
+State.InspectorStatusLabel.Text = "Inspector Log: OFF (Enable below to record real Wall Combo)"
+State.InspectorStatusLabel.TextColor3 = Color3.fromRGB(255, 215, 110)
+State.InspectorStatusLabel.Font = Enum.Font.GothamSemibold
+State.InspectorStatusLabel.TextSize = 10
+State.InspectorStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+State.InspectorStatusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+State.InspectorStatusLabel.Parent = InspectorCard
+
+addFeatureToggle(TabCombat, "WallInspector", "Wall Combo Inspector (Record Live Mechanics)", "WINSP", false, function(v)
+    Config.WallInspectorEnabled = v
+    if v then
+        State.InspectorLogs = {}
+        appendInspectorLog("Inspector Started — Do a real Wall Combo near a Tree!")
+    end
+end)
+
+addButton(TabCombat, "Copy Wall Combo Inspector Log", Color3.fromRGB(165, 115, 45), function(btn)
+    snapshotTreeDistanceForInspector("ManualCopySnapshot")
+    local header = "=== HBG WALL COMBO INSPECTOR REPORT ===\n"
+    local body = (#State.InspectorLogs > 0) and table.concat(State.InspectorLogs, "\n") or "No events recorded yet. Enable 'Wall Combo Inspector' and hit an enemy into a tree!"
+    local fullText = header .. body
+    pcall(function()
+        if setclipboard then setclipboard(fullText) elseif toclipboard then toclipboard(fullText) end
+    end)
+    if btn then
+        btn.Text = "Copied Inspector Report (" .. tostring(#State.InspectorLogs) .. " lines)"
+        task.delay(2, function()
+            if btn and btn.Parent then btn.Text = "Copy Wall Combo Inspector Log" end
+        end)
+    end
 end)
 
 addFeatureToggle(TabCombat, "ObjectESP", "Tree And Map Object ESP", "OBJESP", false, function(v)
@@ -2809,7 +3137,7 @@ addSlider(TabCombat, "Anti Skill Range", 8, 35, 16, function(v)
     Config.AntiSkillRange = v
 end)
 
-addFeatureToggle(TabCombat, "AntiStun", "Anti Stun (Zero-BF)", "ASTUN", false, function(v)
+addFeatureToggle(TabCombat, "AntiStun", "Real Anti Stun (Stop HitAnim + Anti-Knockback)", "ASTUN", false, function(v)
     Config.AntiStunEnabled = v
 end)
 
@@ -3068,7 +3396,7 @@ local function getFlightDirection(hum)
 end
 
 -- // STEPPED LOOP
-table.insert(State.Connections, RunService.Stepped:Connect(function()
+table.insert(State.Connections, RunService.Stepped:Connect(function(_, dt)
     if not Config.ScriptRunning then return end
     local targetY = getSafeVoidFloorY()
 
@@ -3083,6 +3411,10 @@ table.insert(State.Connections, RunService.Stepped:Connect(function()
     elseif Config.DeepVoidActive and State.Root then
         State.Root.CFrame = CFrame.new(State.Root.Position.X, targetY + 3.5, State.Root.Position.Z) * State.Root.CFrame.Rotation
         State.Root.AssemblyLinearVelocity = Vector3.new(State.Root.AssemblyLinearVelocity.X, 0, State.Root.AssemblyLinearVelocity.Z)
+    end
+
+    if Config.AntiStunEnabled and State.Char and State.Root and State.Hum then
+        enforceRealAntiStun(State.Char, State.Root, State.Hum, dt)
     end
 end))
 
@@ -3116,7 +3448,7 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
     end
 
     if Config.AntiStunEnabled and char and root and hum then
-        enforceZeroTouchAntiStun(char, root, hum, dt)
+        enforceRealAntiStun(char, root, hum, dt)
     end
 
     if Config.AutoTargetEnabled and root and hum and not State.VoidKillActive and not State.AntiSkillEvading and not Config.DeepVoidActive and State.ActiveSpecialSkill == nil then
@@ -3251,17 +3583,13 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
         end
 
         if not State.VoidKillActive and not State.AntiSkillEvading and not Config.DeepVoidActive then
-            if hum.FloorMaterial ~= Enum.Material.Air and root.Position.Y > -50 then
+            if hum.FloorMaterial ~= Enum.Material.Air and root.Position.Y > -30 and root.Position.Magnitude < 1200 then
                 State.LastSafeCFrame = root.CFrame
             end
 
             if Config.AntiVoidEnabled and root.Position.Y < (voidY + 65) then
-                if State.LastSafeCFrame then
-                    root.CFrame = State.LastSafeCFrame + Vector3.new(0, 5, 0)
-                else
-                    root.CFrame = CFrame.new(0, 60, 0)
-                end
-                root.AssemblyLinearVelocity = Vector3.new(0, 15, 0)
+                local safeCF = (State.LastSafeCFrame and State.LastSafeCFrame.Position.Y > -20) and (State.LastSafeCFrame + Vector3.new(0, 5, 0)) or CFrame.new(0, 60, 0)
+                forceFullCharacterAndCameraResync(safeCF)
             end
         end
 
@@ -3332,6 +3660,14 @@ table.insert(State.Connections, UserInputService.InputBegan:Connect(function(inp
         onSkillSlotTriggered(slotStr)
     end
 
+    if not gpe and Config.WallInspectorEnabled then
+        if input.KeyCode == Enum.KeyCode.Q then
+            snapshotTreeDistanceForInspector("KeyPressed[Q]")
+        elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
+            snapshotTreeDistanceForInspector("MouseClick[M1]")
+        end
+    end
+
     if not gpe and Config.WallComboEnabled then
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             local now = tick()
@@ -3348,19 +3684,19 @@ table.insert(State.Connections, UserInputService.InputBegan:Connect(function(inp
                 end
                 local _, eRoot = findNearestEnemyRoot(20)
                 if eRoot then
-                    triggerWallComboBehindEnemy(0.85)
+                    triggerWallComboBehindEnemy(0.55)
                 end
             end
         elseif input.KeyCode == Enum.KeyCode.Q then
             local _, eRoot = findNearestEnemyRoot(20)
             if eRoot then
-                triggerWallComboBehindEnemy(0.85)
+                triggerWallComboBehindEnemy(0.55)
             end
         end
     end
 
     if not gpe and input.KeyCode == Config.WallComboKey then
-        triggerWallComboBehindEnemy(0.85)
+        triggerWallComboBehindEnemy(0.65)
     end
 
     if not gpe and input.KeyCode == Enum.KeyCode.Space and Config.InfJumpEnabled then
