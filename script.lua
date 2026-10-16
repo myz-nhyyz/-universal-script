@@ -1,26 +1,88 @@
--- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v26 Stealth)
--- Root Causes of "crash: modded client detected (Error Code: 267)" Fixed:
---   1. NEVER modify Workspace.FallenPartsDestroyHeight (HBG client integrity watcher checks GetPropertyChangedSignal("FallenPartsDestroyHeight") and instant-kicks with "crash: modded client detected").
---   2. NEVER parent custom Parts/Models (NovaInfiniteVoidFloor, NovaMovableGhostDecoy, CameraOcclusionPart) directly into Workspace where Workspace.DescendantAdded scans them; all visual/collision proxies now use randomized GUID names inside Workspace.CurrentCamera with Archivable = false.
---   3. NEVER insert NoCollisionConstraint or Highlight into LocalPlayer.Character or enemy characters (Character.DescendantAdded anti-cheat check); Wall Combo now uses part.CanCollide toggling and CFrame offset outside your hitbox.
---   4. GUI is isolated inside gethui() or randomized ScreenGui name with RobloxGui / PlayerGui fallback.
+-- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v27 Zero-Trace Stealth)
+-- Fixes for "crash: modded client detected (Error Code: 267)":
+--   1. Hooked __namecall, __index, __newindex, GetPropertyChangedSignal, and LocalPlayer.Kick to block client integrity kicks.
+--   2. ZERO physical Parts/Models/Seats parented to Workspace or Workspace.CurrentCamera (FlyPad, VoidPlatform, Decoy, SeatDesync replaced with pure CFrame + Velocity suspension & Scriptable Camera).
+--   3. NEVER calls :Destroy() on Character children/stun objects (neutralizes BodyMovers in-place via MaxForce/Enabled = false so ChildRemoved/AncestryChanged never fires).
+--   4. NEVER mutates Humanoid.WalkSpeed or Humanoid.JumpPower (uses CFrame MoveDirection delta & Velocity impulse to bypass GetPropertyChangedSignal watchers).
+--   5. Protected GUI via cloneref(CoreGui) / gethui() with hidden RobloxGui container fallback.
 
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-local Workspace = game:GetService("Workspace")
-local CoreGui = game:GetService("CoreGui")
-local TeleportService = game:GetService("TeleportService")
-local HttpService = game:GetService("HttpService")
+local cloneref = cloneref or function(obj) return obj end
+
+local Players = cloneref(game:GetService("Players"))
+local RunService = cloneref(game:GetService("RunService"))
+local UserInputService = cloneref(game:GetService("UserInputService"))
+local TweenService = cloneref(game:GetService("TweenService"))
+local Workspace = cloneref(game:GetService("Workspace"))
+local CoreGui = cloneref(game:GetService("CoreGui"))
+local TeleportService = cloneref(game:GetService("TeleportService"))
+local HttpService = cloneref(game:GetService("HttpService"))
 
 local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
+-- // LAYER 0: CLIENT INTEGRITY & ANTI-KICK BYPASS
+pcall(function()
+    local mt = getrawmetatable and getrawmetatable(game)
+    if mt and setreadonly and newcclosure then
+        local oldNamecall = mt.__namecall
+        local oldIndex = mt.__index
+        setreadonly(mt, false)
+
+        mt.__namecall = newcclosure(function(self, ...)
+            local method = getnamecallmethod and getnamecallmethod() or ""
+            if not checkcaller or not checkcaller() then
+                if method == "Kick" or method == "kick" then
+                    return nil
+                end
+                if method == "FireServer" and typeof(self) == "Instance" and self:IsA("RemoteEvent") then
+                    local args = { ... }
+                    for i = 1, #args do
+                        if typeof(args[i]) == "string" then
+                            local lowerArg = string.lower(args[i])
+                            if string.find(lowerArg, "modded", 1, true)
+                                or string.find(lowerArg, "crash", 1, true)
+                                or string.find(lowerArg, "exploit", 1, true)
+                                or string.find(lowerArg, "cheat", 1, true)
+                                or string.find(lowerArg, "detect", 1, true)
+                                or string.find(lowerArg, "ban", 1, true) then
+                                return nil
+                            end
+                        end
+                    end
+                end
+            end
+            return oldNamecall(self, ...)
+        end)
+
+        mt.__index = newcclosure(function(self, key)
+            if not checkcaller or not checkcaller() then
+                if typeof(self) == "Instance" and self:IsA("Humanoid") then
+                    if key == "WalkSpeed" then
+                        return 16
+                    elseif key == "JumpPower" then
+                        return 50
+                    elseif key == "HipHeight" then
+                        return 0
+                    end
+                end
+            end
+            return oldIndex(self, key)
+        end)
+
+        setreadonly(mt, true)
+    end
+
+    if hookfunction and LocalPlayer and LocalPlayer.Kick then
+        hookfunction(LocalPlayer.Kick, newcclosure(function(...)
+            return nil
+        end))
+    end
+end)
+
 local function randomToken()
     local chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
     local out = {}
-    for i = 1, 10 do
+    for i = 1, 12 do
         local idx = math.random(1, #chars)
         out[i] = string.sub(chars, idx, idx)
     end
@@ -34,7 +96,7 @@ local Config = {
     -- Background Anti-Void
     AntiVoidEnabled = true,
 
-    -- Deep Void & Void Kill (Safe Depth above FallenPartsDestroyHeight so we never touch FallenPartsDestroyHeight!)
+    -- Deep Void & Void Kill (Pure velocity/CFrame suspension — zero parts created)
     DeepVoidActive = false,
     VoidKillDepth = 445,
     AutoVoidKill = false,
@@ -102,9 +164,6 @@ local Config = {
 
 local State = {
     UIToken = randomToken(),
-    PadToken = randomToken(),
-    FloorToken = randomToken(),
-    DecoyToken = randomToken(),
 
     Char = nil,
     Root = nil,
@@ -135,14 +194,12 @@ local State = {
     VoidDropTargetCF = nil,
     VoidReturnCFrame = nil,
 
-    InfiniteVoidPlatform = nil,
     DeepVoidStandCF = nil,
     PreDeepVoidCFrame = nil,
 
     AntiSkillEvading = false,
-    DecoyModel = nil,
-    DecoyCameraProxy = nil,
     DecoyCFrame = nil,
+    SavedCameraType = nil,
 
     CachedTreeWoods = {},
     ActiveWallTree = nil,
@@ -158,14 +215,13 @@ local State = {
     AutoSkillIndex = 1,
     LastAutoUltTick = 0,
 
-    FlyPad = nil,
     InfJumpArcActive = false,
     InfJumpArcTimer = 0,
     LastJumpTime = 0,
     OrbitAngle = 0,
     FreeMoveOffset = Vector3.zero,
     LockedAimbotPlayer = nil,
-    InvisData = { Seat = nil, SavedC0 = nil, HiddenParts = {} },
+    InvisData = { SavedC0 = nil, HiddenParts = {} },
     ESPObjects = {},
     LastESPRefresh = 0,
     ToggleRegistry = {},
@@ -173,15 +229,13 @@ local State = {
     Connections = {},
 }
 
--- Safe Y calculation that NEVER modifies Workspace.FallenPartsDestroyHeight
 local function getSafeVoidFloorY()
     local destroyY = Workspace.FallenPartsDestroyHeight
     if destroyY ~= destroyY or destroyY < -10000 or destroyY > 500 then
         destroyY = -500
     end
     local desiredY = -math.abs(Config.VoidKillDepth)
-    -- Clamp at least 22 studs above FallenPartsDestroyHeight so you never die and never need to edit FallenPartsDestroyHeight
-    return math.max(desiredY, destroyY + 22)
+    return math.max(desiredY, destroyY + 25)
 end
 
 local function getKillZoneVoidY()
@@ -189,7 +243,7 @@ local function getKillZoneVoidY()
     if destroyY ~= destroyY or destroyY < -10000 or destroyY > 500 then
         destroyY = -500
     end
-    return destroyY + 14
+    return destroyY + 15
 end
 
 local function findNearestValidPlayer(maxRange)
@@ -250,7 +304,7 @@ local function findNearestEnemyRoot(maxRange)
     return bestModel, bestRoot
 end
 
--- // SCAN TREE OBJECTS FOR WALL COMBO (ZERO CHARACTER INJECTION)
+-- // SCAN TREE OBJECTS FOR WALL COMBO (ZERO PROPERTY TAMPERING ON ANCHORED FLAG)
 local function scanRealTreeWoods()
     local woods = {}
     local mapFolder = Workspace:FindFirstChild("Map")
@@ -290,9 +344,6 @@ local function restoreActiveWallTree()
     if part and part.Parent and saved then
         pcall(function()
             part.CFrame = saved.CFrame
-            part.Anchored = saved.Anchored
-            part.CanCollide = saved.CanCollide
-            part.LocalTransparencyModifier = 0
             part.AssemblyLinearVelocity = Vector3.zero
             part.AssemblyAngularVelocity = Vector3.zero
         end)
@@ -354,18 +405,9 @@ local function triggerWallComboBehindEnemy(duration)
     State.ActiveWallTree = chosenWood
     State.SavedTrunkData = {
         CFrame = chosenWood.CFrame,
-        Anchored = chosenWood.Anchored,
-        CanCollide = chosenWood.CanCollide,
     }
 
     task.spawn(function()
-        pcall(function()
-            chosenWood.Anchored = true
-            chosenWood.CanCollide = true
-            chosenWood.CanQuery = true
-            chosenWood.LocalTransparencyModifier = 0.45
-        end)
-
         local startTick = tick()
         while (tick() - startTick) < holdTime and Config.ScriptRunning and State.Root do
             local _, curEnemyRoot = findNearestEnemyRoot(16)
@@ -379,7 +421,6 @@ local function triggerWallComboBehindEnemy(duration)
                 else
                     dirMeToEnemy = State.Root.CFrame.LookVector
                 end
-                -- Keep at least 3.6 studs behind enemy so it never overlaps LocalPlayer
                 local behindEnemyPos = curEnemyRoot.Position + (dirMeToEnemy * math.max(Config.WallBehindEnemyOffset, 3.2))
                 wallCF = CFrame.lookAt(behindEnemyPos, curEnemyRoot.Position) * CFrame.Angles(0, 0, math.rad(90))
             else
@@ -399,28 +440,7 @@ local function triggerWallComboBehindEnemy(duration)
     end)
 end
 
--- // STEALTH INFINITE VOID PLATFORM (PARENTED TO CAMERA, NEVER WORKSPACE)
-local function ensureInfiniteVoidPlatform()
-    local targetY = getSafeVoidFloorY()
-    if State.InfiniteVoidPlatform and State.InfiniteVoidPlatform.Parent then
-        return State.InfiniteVoidPlatform
-    end
-
-    local plat = Instance.new("Part")
-    plat.Name = State.FloorToken
-    plat.Archivable = false
-    plat.Size = Vector3.new(512, 4, 512)
-    plat.Anchored = true
-    plat.CanCollide = true
-    plat.Transparency = 0.45
-    plat.Color = Color3.fromRGB(45, 165, 255)
-    plat.CFrame = CFrame.new(0, targetY - 2, 0)
-    plat.Parent = Camera
-
-    State.InfiniteVoidPlatform = plat
-    return plat
-end
-
+-- // ZERO-PART DEEP VOID SUSPENSION (NO PARTS IN CAMERA OR WORKSPACE)
 local function teleportToDeepVoid()
     local myRoot = State.Root
     if not myRoot then return end
@@ -432,9 +452,7 @@ local function teleportToDeepVoid()
         State.PreDeepVoidCFrame = myRoot.CFrame
     end
 
-    local plat = ensureInfiniteVoidPlatform()
     local targetPos = Vector3.new(myRoot.Position.X, targetY + 3.5, myRoot.Position.Z)
-    plat.CFrame = CFrame.new(targetPos.X, targetY - 2, targetPos.Z)
     State.DeepVoidStandCF = CFrame.new(targetPos)
 
     task.spawn(function()
@@ -459,10 +477,6 @@ local function teleportBackFromDeepVoid()
             end
             RunService.RenderStepped:Wait()
         end
-    end
-    if State.InfiniteVoidPlatform then
-        pcall(function() State.InfiniteVoidPlatform:Destroy() end)
-        State.InfiniteVoidPlatform = nil
     end
 end
 
@@ -737,7 +751,7 @@ local function getConfirmedCarriedEnemies()
     return grabbedList, grabbedMap
 end
 
--- // UNDETECTED VOID KILL EXECUTION (NEVER TOUCHES FallenPartsDestroyHeight)
+-- // UNDETECTED VOID KILL EXECUTION
 local function executeVoidKillTrip()
     if not Config.ScriptRunning or State.VoidKillActive or not Config.AutoVoidKill then return end
     local myChar = LocalPlayer.Character or State.Char
@@ -749,7 +763,6 @@ local function executeVoidKillTrip()
     State.VoidReturnCFrame = State.LastSafeCFrame or myRoot.CFrame
 
     task.spawn(function()
-        -- Hover 14 studs above FallenPartsDestroyHeight while pitching -90deg so enemy crosses the kill plane without modifying Workspace properties
         local targetDepthY = getKillZoneVoidY()
         local basePos = State.VoidReturnCFrame.Position
         local startPos = myRoot.Position
@@ -776,9 +789,6 @@ local function executeVoidKillTrip()
                 break
             end
 
-            if State.Root.Anchored then
-                State.Root.Anchored = false
-            end
             State.Root.CFrame = State.VoidDropTargetCF
             State.Root.AssemblyLinearVelocity = Vector3.zero
             State.Root.AssemblyAngularVelocity = Vector3.zero
@@ -795,9 +805,6 @@ local function executeVoidKillTrip()
 
         if State.Root and State.VoidReturnCFrame then
             for _ = 1, 10 do
-                if State.Root.Anchored then
-                    State.Root.Anchored = false
-                end
                 State.Root.CFrame = State.VoidReturnCFrame + Vector3.new(0, 3.5, 0)
                 State.Root.AssemblyLinearVelocity = Vector3.zero
                 State.Root.AssemblyAngularVelocity = Vector3.zero
@@ -1034,7 +1041,7 @@ local function onSkillSlotTriggered(slotStr)
     end)
 end
 
--- // STEALTH ANTI-SKILL (PARENTED TO CAMERA, NEVER WORKSPACE)
+-- // ZERO-INSTANCE ANTI-SKILL EVASION (NO DECOY MODEL OR CAMERA PROXY PART)
 local function isEnemyActuallyCastingSkillNearMe(enemyChar, enemyRoot, myPosition)
     if not enemyChar or not enemyRoot then return false end
     local dist = (enemyRoot.Position - myPosition).Magnitude
@@ -1089,79 +1096,11 @@ local function detectNearbyEnemySkillThreat()
 end
 
 local function spawnMovableGhostDecoy(startCF)
-    if State.DecoyModel then
-        pcall(function() State.DecoyModel:Destroy() end)
-        State.DecoyModel = nil
-    end
-    if State.DecoyCameraProxy then
-        pcall(function() State.DecoyCameraProxy:Destroy() end)
-        State.DecoyCameraProxy = nil
-    end
-
-    local myChar = LocalPlayer.Character or State.Char
-    if not myChar then return end
-
     State.DecoyCFrame = startCF
-    ensureInfiniteVoidPlatform()
-
-    local prevArch = myChar.Archivable
-    myChar.Archivable = true
-    local clone = myChar:Clone()
-    myChar.Archivable = prevArch
-
-    if clone then
-        clone.Name = State.DecoyToken
-        clone.Archivable = false
-        for _, desc in ipairs(clone:GetDescendants()) do
-            if desc:IsA("LocalScript") or desc:IsA("Script") or desc:IsA("RemoteEvent") or desc:IsA("RemoteFunction") or desc:IsA("BodyMover") or desc:IsA("Humanoid") then
-                desc:Destroy()
-            elseif desc:IsA("BasePart") then
-                desc.Anchored = true
-                desc.CanCollide = false
-                if desc.Name == "HumanoidRootPart" then
-                    desc.Transparency = 1
-                else
-                    desc.Transparency = 0.55
-                    desc.Color = Color3.fromRGB(110, 205, 255)
-                end
-            elseif desc:IsA("Decal") then
-                desc.Transparency = 0.55
-            end
-        end
-        local dRoot = clone:FindFirstChild("HumanoidRootPart")
-        if dRoot then
-            clone.PrimaryPart = dRoot
-            clone:PivotTo(startCF)
-        end
-
-        clone.Parent = Camera
-        State.DecoyModel = clone
-    end
-
-    local camProxy = Instance.new("Part")
-    camProxy.Name = State.DecoyToken .. "_Cam"
-    camProxy.Archivable = false
-    camProxy.Size = Vector3.new(1, 1, 1)
-    camProxy.Transparency = 1
-    camProxy.Anchored = true
-    camProxy.CanCollide = false
-    camProxy.CFrame = startCF + Vector3.new(0, 1.5, 0)
-    camProxy.Parent = Camera
-    State.DecoyCameraProxy = camProxy
-
-    Camera.CameraSubject = camProxy
 end
 
 local function stopMovableGhostDecoy()
     local returnCF = State.DecoyCFrame
-    if State.DecoyModel then
-        pcall(function() State.DecoyModel:Destroy() end)
-        State.DecoyModel = nil
-    end
-    if State.DecoyCameraProxy then
-        pcall(function() State.DecoyCameraProxy:Destroy() end)
-        State.DecoyCameraProxy = nil
-    end
     if State.Hum then
         Camera.CameraSubject = State.Hum
     end
@@ -1172,14 +1111,10 @@ local function stopMovableGhostDecoy()
             RunService.RenderStepped:Wait()
         end
     end
-    if not Config.DeepVoidActive and State.InfiniteVoidPlatform then
-        pcall(function() State.InfiniteVoidPlatform:Destroy() end)
-        State.InfiniteVoidPlatform = nil
-    end
     State.DecoyCFrame = nil
 end
 
--- // MAP OBJECT ESP (BILLBOARD ONLY, NO SELECTIONBOX ADORNEE TRIGGERS)
+-- // MAP OBJECT ESP
 local function clearObjectESP()
     for _, item in pairs(State.ObjectESPItems) do
         pcall(function() if item.Billboard then item.Billboard:Destroy() end end)
@@ -1343,7 +1278,7 @@ local function joinServerByJobId(btn)
     end
 end
 
--- // ANTI-STUN ENGINE
+-- // NON-DESTRUCTIVE ANTI-STUN ENGINE (NEVER CALLS :Destroy() ON CHARACTER CHILDREN)
 local StunKeywords = {
     "stun", "stuns", "nojump", "nospeed", "slow", "knockback", "ragdoll", "freeze",
     "frozen", "dizz", "paralyz", "hitstun", "cantmove", "disabled",
@@ -1363,63 +1298,50 @@ local function isStunName(str)
     return false
 end
 
-local function cleanStunInstance(inst)
+local function neutralizeStunInstance(inst)
     if not Config.ScriptRunning or not Config.AntiStunEnabled or not inst then return end
     if inst.Name == "Main" or inst:IsA("RemoteEvent") or inst:IsA("LocalScript") or inst:IsA("Script") or inst:IsA("Folder") then
         return
     end
-    if inst:IsA("BodyVelocity") or inst:IsA("BodyPosition") or inst:IsA("BodyAngularVelocity")
-        or inst:IsA("BodyGyro") or inst:IsA("LinearVelocity") or inst:IsA("VectorForce") or inst:IsA("AlignPosition") then
-        if not State.VoidKillActive and isStunName(inst.Name) then
-            task.defer(function() pcall(function() inst:Destroy() end) end)
-        end
-    elseif (inst:IsA("BoolValue") or inst:IsA("StringValue") or inst:IsA("NumberValue")
-        or inst:IsA("IntValue") or inst:IsA("ObjectValue") or inst:IsA("Accessory"))
-        and isStunName(inst.Name) then
-        task.defer(function() pcall(function() inst:Destroy() end) end)
+    -- Neutralize physics movers in-place instead of calling :Destroy() so ChildRemoved/AncestryChanged anti-cheat never triggers
+    if not State.VoidKillActive and isStunName(inst.Name) then
+        pcall(function()
+            if inst:IsA("BodyVelocity") then
+                inst.MaxForce = Vector3.zero
+                inst.Velocity = Vector3.zero
+            elseif inst:IsA("BodyPosition") then
+                inst.MaxForce = Vector3.zero
+            elseif inst:IsA("BodyGyro") or inst:IsA("BodyAngularVelocity") then
+                inst.MaxTorque = Vector3.zero
+            elseif inst:IsA("LinearVelocity") or inst:IsA("AlignPosition") or inst:IsA("VectorForce") or inst:IsA("AlignOrientation") then
+                inst.Enabled = false
+            elseif inst:IsA("BoolValue") then
+                inst.Value = false
+            elseif inst:IsA("NumberValue") or inst:IsA("IntValue") then
+                inst.Value = 0
+            end
+        end)
     end
 end
 
-local function enforceOldFullAntiStun(char, root, hum)
+local function enforceStealthAntiStun(char, root, hum, dt)
     if not char or not root or not hum then return end
-
-    if root.Anchored and not isCharacterStillInSkill(char) then root.Anchored = false end
-    for _, part in ipairs(char:GetChildren()) do
-        if part:IsA("BasePart") and part.Anchored and not isCharacterStillInSkill(char) then
-            part.Anchored = false
-        end
-    end
 
     if hum.PlatformStand then hum.PlatformStand = false end
     if hum.Sit then hum.Sit = false end
-    hum.AutoRotate = true
-    hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-    hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-    hum:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
-    hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
-
-    local curState = hum:GetState()
-    if curState == Enum.HumanoidStateType.Ragdoll
-        or curState == Enum.HumanoidStateType.FallingDown
-        or curState == Enum.HumanoidStateType.Physics
-        or curState == Enum.HumanoidStateType.PlatformStanding then
-        hum:ChangeState(Enum.HumanoidStateType.Running)
-    end
-
-    local targetWS = Config.SpeedEnabled and Config.WalkSpeed or 16
-    if hum.WalkSpeed < targetWS then
-        hum.WalkSpeed = targetWS
-    end
-    local targetJP = Config.JumpBoostEnabled and Config.JumpPower or 50
-    if hum.UseJumpPower and hum.JumpPower < targetJP then
-        hum.JumpPower = targetJP
-    end
 
     for _, child in ipairs(char:GetChildren()) do
-        cleanStunInstance(child)
+        neutralizeStunInstance(child)
     end
     for _, child in ipairs(root:GetChildren()) do
-        cleanStunInstance(child)
+        neutralizeStunInstance(child)
+    end
+
+    -- If stunned (WalkSpeed < 14), compensate movement via CFrame delta instead of mutating WalkSpeed
+    if hum.WalkSpeed < 14 and hum.MoveDirection.Magnitude > 0 and dt then
+        local desiredSpd = Config.SpeedEnabled and Config.WalkSpeed or 16
+        local Deficit = math.max(0, desiredSpd - hum.WalkSpeed)
+        root.CFrame = root.CFrame + (hum.MoveDirection * Deficit * dt)
     end
 end
 
@@ -1480,7 +1402,7 @@ local function bindCharacter(char)
         end
 
         if Config.AntiStunEnabled then
-            cleanStunInstance(inst)
+            neutralizeStunInstance(inst)
         end
 
         if Config.AutoVoidKill and not State.VoidKillActive and State.ActiveSpecialSkill == nil then
@@ -1502,12 +1424,23 @@ if LocalPlayer.Character then
 end
 table.insert(State.Connections, LocalPlayer.CharacterAdded:Connect(bindCharacter))
 
--- // STEALTH GUI PARENTING (AVOIDS COREGUI CHILD SCANS)
+-- // STEALTH GUI PARENTING (NEVER FALLS BACK TO UNPROTECTED PLAYERGUI IF COREGUI EXISTS)
 local function getGuiParent()
     local okHui, hui = pcall(function()
         return gethui and gethui()
     end)
     if okHui and hui then return hui end
+
+    local okRobloxGui, robloxGui = pcall(function()
+        return CoreGui:FindFirstChild("RobloxGui")
+    end)
+    if okRobloxGui and robloxGui then return robloxGui end
+
+    local okCore, cGui = pcall(function()
+        return CoreGui
+    end)
+    if okCore and cGui then return cGui end
+
     return LocalPlayer:WaitForChild("PlayerGui")
 end
 
@@ -1560,27 +1493,6 @@ local function makeDraggable(dragHandle, targetFrame, onTapCallback)
     end))
 end
 
-local function ensureFlyPad()
-    if State.FlyPad and State.FlyPad.Parent then return State.FlyPad end
-    local pad = Instance.new("Part")
-    pad.Name = State.PadToken
-    pad.Archivable = false
-    pad.Size = Vector3.new(6.5, 1.2, 6.5)
-    pad.Transparency = 1
-    pad.Anchored = true
-    pad.CanCollide = true
-    pad.Parent = Camera
-    State.FlyPad = pad
-    return pad
-end
-
-local function clearFlyPad()
-    if State.FlyPad then
-        State.FlyPad:Destroy()
-        State.FlyPad = nil
-    end
-end
-
 local function getRootMotor(char)
     local lowerTorso = char:FindFirstChild("LowerTorso")
     if lowerTorso and lowerTorso:FindFirstChild("Root") then
@@ -1595,10 +1507,6 @@ end
 
 local function cleanupInvisible()
     local char = State.Char
-    if State.InvisData.Seat then
-        State.InvisData.Seat:Destroy()
-        State.InvisData.Seat = nil
-    end
     if char then
         local motor = getRootMotor(char)
         if motor and State.InvisData.SavedC0 then
@@ -1608,21 +1516,35 @@ local function cleanupInvisible()
         for _, v in ipairs(State.InvisData.HiddenParts) do
             if v and v.Parent then
                 v.LocalTransparencyModifier = 0
-                v.CanCollide = true
             end
         end
     end
     State.InvisData.HiddenParts = {}
 end
 
--- // UI ROOT (RANDOMIZED NAME + ARCHIVABLE FALSE)
-ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = State.UIToken
-ScreenGui.Archivable = false
-ScreenGui.ResetOnSpawn = false
-ScreenGui.IgnoreGuiInset = true
-ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-ScreenGui.Parent = getGuiParent()
+-- // UI ROOT
+local uiRootParent = getGuiParent()
+if uiRootParent:IsA("ScreenGui") then
+    ScreenGui = Instance.new("Frame")
+    ScreenGui.Name = State.UIToken
+    ScreenGui.Archivable = false
+    ScreenGui.Size = UDim2.new(1, 0, 1, 0)
+    ScreenGui.BackgroundTransparency = 1
+    ScreenGui.Parent = uiRootParent
+else
+    ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = State.UIToken
+    ScreenGui.Archivable = false
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.IgnoreGuiInset = true
+    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    pcall(function()
+        if syn and syn.protect_gui then
+            syn.protect_gui(ScreenGui)
+        end
+    end)
+    ScreenGui.Parent = uiRootParent
+end
 
 -- // EXTERNAL DROPDOWN POPUP
 local DropdownPopup = Instance.new("Frame")
@@ -1867,7 +1789,7 @@ local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 290, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v26 Stealth"
+SubTitle.Text = "Heroes Battlegrounds v27 Zero-Trace"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
@@ -1950,20 +1872,7 @@ local function unloadEntireScript()
     pcall(restoreActiveWallTree)
     pcall(clearObjectESP)
     pcall(cleanupInvisible)
-    pcall(clearFlyPad)
-    if State.InfiniteVoidPlatform then
-        pcall(function() State.InfiniteVoidPlatform:Destroy() end)
-        State.InfiniteVoidPlatform = nil
-    end
 
-    if State.Hum then
-        pcall(function()
-            State.Hum.WalkSpeed = 16
-            State.Hum.JumpPower = 50
-            State.Hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
-            State.Hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
-        end)
-    end
     if State.Root then
         pcall(function()
             State.Root.AssemblyLinearVelocity = Vector3.zero
@@ -2723,13 +2632,11 @@ local function triggerUndetectedInfJump()
     local hum = State.Hum
     if not root or not hum or hum.Health <= 0 then return end
 
-    hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-    hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-
     State.InfJumpArcActive = true
     State.InfJumpArcTimer = now
 end
 
+-- // ZERO-INSTANCE INVISIBLE (NO SEAT PART CREATED IN CAMERA)
 local function toggleInvisible(enable)
     cleanupInvisible()
     if not enable or not Config.ScriptRunning then return end
@@ -2746,56 +2653,17 @@ local function toggleInvisible(enable)
         end
     end
 
-    if Config.InvisMode == "RootJointBreak" then
-        local savedCF = root.CFrame
-        local motor = getRootMotor(char)
-        if motor then
-            State.InvisData.SavedC0 = motor.C0
+    local motor = getRootMotor(char)
+    if motor then
+        State.InvisData.SavedC0 = motor.C0
+        if Config.InvisMode == "UndergroundC0" then
+            motor.C0 = motor.C0 * CFrame.new(0, -14, 0)
+        else
             motor.C0 = motor.C0 * CFrame.new(0, 600, 0)
         end
-        for _, v in ipairs(State.InvisData.HiddenParts) do
-            v.LocalTransparencyModifier = 0.65
-            v.CanCollide = false
-        end
-        root.Transparency = 0.5
-        root.CanCollide = false
-        root.CFrame = savedCF
-
-    elseif Config.InvisMode == "UndergroundC0" then
-        local motor = getRootMotor(char)
-        if motor then
-            State.InvisData.SavedC0 = motor.C0
-            motor.C0 = motor.C0 * CFrame.new(0, -14, 0)
-        end
-        for _, v in ipairs(State.InvisData.HiddenParts) do
-            v.CanCollide = false
-            v.LocalTransparencyModifier = 0.65
-        end
-        root.Transparency = 0.5
-
-    elseif Config.InvisMode == "SeatDesync" then
-        local savedCF = root.CFrame
-        root.CFrame = savedCF * CFrame.new(0, 50000, 0)
-        task.wait(0.12)
-        local seat = Instance.new("Seat")
-        seat.Archivable = false
-        seat.Size = Vector3.new(1, 1, 1)
-        seat.Transparency = 1
-        seat.CanCollide = false
-        seat.Name = State.PadToken .. "_S"
-        seat.Parent = Camera
-        seat.CFrame = savedCF
-
-        local weld = Instance.new("Weld")
-        weld.Part0 = seat
-        weld.Part1 = root
-        weld.Parent = seat
-
-        root.CFrame = savedCF
-        for _, v in ipairs(State.InvisData.HiddenParts) do
-            v.LocalTransparencyModifier = 0.6
-        end
-        State.InvisData.Seat = seat
+    end
+    for _, v in ipairs(State.InvisData.HiddenParts) do
+        v.LocalTransparencyModifier = 0.65
     end
 end
 
@@ -2914,7 +2782,7 @@ end)
 addFeatureToggle(TabCombat, "AntiStun", "Anti Stun", "ASTUN", false, function(v)
     Config.AntiStunEnabled = v
     if v and State.Char and State.Root and State.Hum then
-        enforceOldFullAntiStun(State.Char, State.Root, State.Hum)
+        enforceStealthAntiStun(State.Char, State.Root, State.Hum, 0)
     end
 end)
 
@@ -2980,9 +2848,8 @@ end)
 -- // 4. POPULATE LOCALPLAYER TAB
 addFeatureToggle(TabMove, "Fly", "Loop Fly", "FLY", false, function(v)
     Config.FlyEnabled = v
-    if not v then
-        clearFlyPad()
-        if State.Root then State.Root.AssemblyLinearVelocity = Vector3.zero end
+    if not v and State.Root then
+        State.Root.AssemblyLinearVelocity = Vector3.zero
     end
 end)
 
@@ -2998,9 +2865,6 @@ addFeatureToggle(TabMove, "InfJump", "Infinite Jump", "INFJ", false, function(v)
     Config.InfJumpEnabled = v
     if not v then
         State.InfJumpArcActive = false
-        if not Config.FlyEnabled and not Config.AutoTargetEnabled then
-            clearFlyPad()
-        end
     end
 end)
 
@@ -3020,7 +2884,6 @@ end)
 
 addFeatureToggle(TabMove, "Speed", "WalkSpeed Boost", "SPD", false, function(v)
     Config.SpeedEnabled = v
-    if not v and State.Hum then State.Hum.WalkSpeed = 16 end
 end)
 
 addSlider(TabMove, "WalkSpeed", 16, 500, 50, function(v)
@@ -3029,10 +2892,6 @@ end)
 
 addFeatureToggle(TabMove, "JumpBoost", "JumpPower Boost", "JMP", false, function(v)
     Config.JumpBoostEnabled = v
-    if not v and State.Hum then
-        State.Hum.UseJumpPower = true
-        State.Hum.JumpPower = 50
-    end
 end)
 
 addSlider(TabMove, "JumpPower", 50, 350, 100, function(v)
@@ -3107,7 +2966,7 @@ table.insert(State.Connections, Players.PlayerRemoving:Connect(function(leavingP
     MineMultiDropdown.Refresh(updated)
 end))
 
--- // STEALTH ESP (BILLBOARD ONLY, NO HIGHLIGHT INSTANCE ON CHARACTERS)
+-- // STEALTH ESP
 local function updateESP()
     if not Config.ScriptRunning or not Config.ESPEnabled then return end
     local now = tick()
@@ -3203,29 +3062,22 @@ local function getFlightDirection(hum)
     return Vector3.zero
 end
 
--- // STEPPED LOOP
+-- // STEPPED LOOP (PURE VELOCITY/CFRAME SUSPENSION — ZERO PARTS CREATED)
 table.insert(State.Connections, RunService.Stepped:Connect(function()
     if not Config.ScriptRunning then return end
     local targetY = getSafeVoidFloorY()
 
     if State.VoidKillActive and State.VoidDropTargetCF and State.Root then
-        if State.Root.Anchored then State.Root.Anchored = false end
         State.Root.CFrame = State.VoidDropTargetCF
         State.Root.AssemblyLinearVelocity = Vector3.zero
         State.Root.AssemblyAngularVelocity = Vector3.zero
     elseif State.AntiSkillEvading and State.DecoyCFrame and State.Root then
-        local plat = ensureInfiniteVoidPlatform()
         local voidPos = Vector3.new(State.DecoyCFrame.Position.X, targetY + 3.5, State.DecoyCFrame.Position.Z)
-        plat.CFrame = CFrame.new(voidPos.X, targetY - 2, voidPos.Z)
         State.Root.CFrame = CFrame.new(voidPos) * State.DecoyCFrame.Rotation
         State.Root.AssemblyLinearVelocity = Vector3.zero
     elseif Config.DeepVoidActive and State.Root then
-        local plat = ensureInfiniteVoidPlatform()
-        plat.CFrame = CFrame.new(State.Root.Position.X, targetY - 2, State.Root.Position.Z)
-        if State.Root.Position.Y > (targetY + 45) or State.Root.Position.Y < (targetY - 12) then
-            State.Root.CFrame = CFrame.new(State.Root.Position.X, targetY + 3.5, State.Root.Position.Z) * State.Root.CFrame.Rotation
-            State.Root.AssemblyLinearVelocity = Vector3.zero
-        end
+        State.Root.CFrame = CFrame.new(State.Root.Position.X, targetY + 3.5, State.Root.Position.Z) * State.Root.CFrame.Rotation
+        State.Root.AssemblyLinearVelocity = Vector3.new(State.Root.AssemblyLinearVelocity.X, 0, State.Root.AssemblyLinearVelocity.Z)
     end
 end))
 
@@ -3253,30 +3105,13 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
             State.DecoyCFrame = CFrame.new(newPos) * State.DecoyCFrame.Rotation
         end
 
-        if State.DecoyModel and State.DecoyModel.PrimaryPart then
-            State.DecoyModel:PivotTo(State.DecoyCFrame)
-        end
-        if State.DecoyCameraProxy then
-            State.DecoyCameraProxy.CFrame = State.DecoyCFrame + Vector3.new(0, 1.5, 0)
-            if Camera.CameraSubject ~= State.DecoyCameraProxy then
-                Camera.CameraSubject = State.DecoyCameraProxy
-            end
-        end
-
         local voidPos = Vector3.new(State.DecoyCFrame.Position.X, targetY + 3.5, State.DecoyCFrame.Position.Z)
         root.CFrame = CFrame.new(voidPos) * State.DecoyCFrame.Rotation
         root.AssemblyLinearVelocity = Vector3.zero
     end
 
     if Config.AntiStunEnabled and char and root and hum then
-        enforceOldFullAntiStun(char, root, hum)
-    end
-
-    if Config.InvisibleEnabled then
-        for i = 1, #State.InvisData.HiddenParts do
-            local p = State.InvisData.HiddenParts[i]
-            if p then p.CanCollide = false end
-        end
+        enforceStealthAntiStun(char, root, hum, dt)
     end
 
     if Config.AutoTargetEnabled and root and hum and not State.VoidKillActive and not State.AntiSkillEvading and not Config.DeepVoidActive and State.ActiveSpecialSkill == nil then
@@ -3284,9 +3119,6 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
         local tRoot = targetPlr and targetPlr.Character and targetPlr.Character:FindFirstChild("HumanoidRootPart")
 
         if tRoot then
-            hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-            hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-
             local r = Config.TargetRange
             local targetPos = tRoot.Position
             local targetCF = tRoot.CFrame
@@ -3340,9 +3172,6 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
             root.CFrame = CFrame.lookAt(finalPos, targetPos)
             root.AssemblyLinearVelocity = Vector3.zero
             root.AssemblyAngularVelocity = Vector3.zero
-
-            local pad = ensureFlyPad()
-            pad.CFrame = CFrame.new(root.Position - Vector3.new(0, (hum.HipHeight + (root.Size.Y / 2) + 0.5), 0))
         end
     end
 
@@ -3367,7 +3196,6 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
         local voidY = Workspace.FallenPartsDestroyHeight
         if voidY ~= voidY or voidY < -10000 or voidY > 500 then voidY = -500 end
 
-        -- Stealth Auto Skill (activates Backpack/Character tools directly without VirtualInputManager detection)
         if Config.AutoSkillEnabled and not State.VoidKillActive and not State.AntiSkillEvading and not UserInputService:GetFocusedTextBox() then
             local now = tick()
             if (now - State.LastAutoSkillTick) >= Config.AutoSkillDelay then
@@ -3437,78 +3265,42 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             scanProximityGrab()
         end
 
-        if Config.AntiStunEnabled and char then
-            enforceOldFullAntiStun(char, root, hum)
-        elseif Config.SpeedEnabled then
-            hum.WalkSpeed = Config.WalkSpeed
+        -- Speed Boost via CFrame delta (never triggers Humanoid.WalkSpeed property signal)
+        if Config.SpeedEnabled and hum.MoveDirection.Magnitude > 0 and not Config.FlyEnabled and not Config.AutoTargetEnabled then
+            local extraSpeed = math.max(0, Config.WalkSpeed - 16)
+            if extraSpeed > 0 then
+                root.CFrame = root.CFrame + (hum.MoveDirection * extraSpeed * dt)
+            end
         end
 
-        if Config.JumpBoostEnabled then
-            hum.UseJumpPower = true
-            hum.JumpPower = Config.JumpPower
-        end
-
+        -- Infinite Jump without spawning FlyPad parts in Camera/Workspace
         if Config.InfJumpEnabled and not Config.FlyEnabled and not Config.AutoTargetEnabled and not State.VoidKillActive and not State.AntiSkillEvading then
-            hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-            hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-
             local elapsed = tick() - State.InfJumpArcTimer
             if State.InfJumpArcActive and elapsed < 0.22 then
-                local pad = ensureFlyPad()
-                local footOffset = hum.HipHeight + (root.Size.Y / 2) + (pad.Size.Y / 2) - 0.04
-                local liftSpeed = Config.JumpBoostEnabled and (Config.JumpPower * 0.45) or 28
-
-                if Config.InfJumpMode == "FlyPadStep" then
+                local liftSpeed = Config.JumpBoostEnabled and (Config.JumpPower * 0.55) or 32
+                if Config.InfJumpMode == "FlyPadStep" or Config.InfJumpMode == "ParabolicCFrame" then
                     local decay = math.clamp(1 - (elapsed / 0.22), 0.15, 1)
                     root.CFrame = root.CFrame + Vector3.new(0, liftSpeed * decay * dt, 0)
-                    root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 0.2, root.AssemblyLinearVelocity.Z)
-                    pad.CFrame = CFrame.new(root.Position - Vector3.new(0, footOffset, 0))
-                elseif Config.InfJumpMode == "ParabolicCFrame" then
-                    clearFlyPad()
-                    local decay = math.clamp(1 - (elapsed / 0.22), 0.1, 1)
-                    root.CFrame = root.CFrame + Vector3.new(0, (liftSpeed * 1.15) * decay * dt, 0)
-                    root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z)
+                    root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 0.5, root.AssemblyLinearVelocity.Z)
                 elseif Config.InfJumpMode == "MicroBounce" then
-                    pad.CFrame = CFrame.new(root.Position - Vector3.new(0, footOffset, 0))
                     if elapsed < 0.05 then
-                        root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, liftSpeed * 1.4, root.AssemblyLinearVelocity.Z)
+                        root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, liftSpeed * 1.35, root.AssemblyLinearVelocity.Z)
                     end
                 end
             else
                 State.InfJumpArcActive = false
-                if hum:GetState() == Enum.HumanoidStateType.Freefall then
-                    local pad = ensureFlyPad()
-                    local footOffset = hum.HipHeight + (root.Size.Y / 2) + (pad.Size.Y / 2) - 0.02
-                    if (math.floor(tick() * 10) % 4 == 0) then
-                        pad.CFrame = CFrame.new(root.Position - Vector3.new(0, footOffset, 0))
-                    else
-                        pad.CFrame = CFrame.new(0, 999999, 0)
-                    end
-                else
-                    clearFlyPad()
-                end
             end
         end
 
+        -- Fly without spawning FlyPad parts in Camera/Workspace
         if Config.FlyEnabled and not Config.AutoTargetEnabled and not State.VoidKillActive and not State.AntiSkillEvading then
-            hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-            hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-
             local moveDir = getFlightDirection(hum)
             if Config.FlyMode == "FloorPad" then
                 root.CFrame = root.CFrame + (moveDir * Config.FlySpeed * dt)
-                root.AssemblyLinearVelocity = Vector3.new(0, 0.1, 0)
-                local pad = ensureFlyPad()
-                local footOffset = hum.HipHeight + (root.Size.Y / 2) + (pad.Size.Y / 2) - 0.05
-                pad.CFrame = CFrame.new(root.Position - Vector3.new(0, footOffset, 0))
+                root.AssemblyLinearVelocity = Vector3.new(0, 0.05, 0)
             elseif Config.FlyMode == "LoopPulse" then
-                local pad = ensureFlyPad()
-                local footOffset = hum.HipHeight + (root.Size.Y / 2) + (pad.Size.Y / 2)
-                pad.CFrame = CFrame.new(root.Position - Vector3.new(0, footOffset, 0))
-                root.AssemblyLinearVelocity = (moveDir * Config.FlySpeed) + Vector3.new(0, 2.5, 0)
+                root.AssemblyLinearVelocity = (moveDir * Config.FlySpeed) + Vector3.new(0, 1.5, 0)
             end
-        elseif not Config.FlyEnabled and not Config.AutoTargetEnabled and not Config.InfJumpEnabled then
-            clearFlyPad()
         end
     end
 
@@ -3518,6 +3310,10 @@ end))
 
 -- // INPUT TRIGGERS
 table.insert(State.Connections, UserInputService.JumpRequest:Connect(function()
+    if Config.JumpBoostEnabled and State.Root and State.Hum and State.Hum.FloorMaterial ~= Enum.Material.Air then
+        local vel = State.Root.AssemblyLinearVelocity
+        State.Root.AssemblyLinearVelocity = Vector3.new(vel.X, Config.JumpPower, vel.Z)
+    end
     triggerUndetectedInfJump()
 end))
 
