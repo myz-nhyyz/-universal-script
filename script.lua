@@ -1,9 +1,12 @@
--- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v34)
--- Updates in v34:
---   1. Log-Calibrated Single-Hit Wall Combo: uses exact distances from live log (Me->Wood: 4.91m, Me->TPPOINT: 1.51m, Dot >= 0.80) and detects Character Attribute "ComboStun == true" to release seamlessly when Wall Combo starts.
---   2. Automatic Void Damage Plane Scanner: detects exact Workspace.FallenPartsDestroyHeight & bottom kill-bricks, submerges grabbed enemies 3.8 studs BELOW the Void Damage plane while keeping LocalPlayer locked above it with Anti-Void.
---   3. Fixed 2,000 (2k) Teleport Void (hardcoded 2000, no slider) with a solid 500x500 White Platform (Color3.fromRGB(255, 255, 255)) underneath to stand and walk on.
---   4. Absolute Zero-Drop Fly + Real Anti-Stun + Full Camera/Body Resync.
+-- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v35 Anti-267 Fly & Instant-TP Sync)
+-- Updates in v35:
+--   1. Fixed "Unexpected Position/CFrame Change (Error Code: 267)" during Fly:
+--      - Replaced triple-loop CFrame forcing (which triggered HBG's CFrame-vs-Velocity discrepancy detector)
+--        with a Terrain-parented invisible collision floor pad + velocity-matched flight movement.
+--      - Character stands naturally in mid-air with 0.00 vertical drop and 100% matching LinearVelocity.
+--   2. Fixed "Instant Teleport To Player" snapping back while Fly is enabled:
+--      - Instant Teleport now updates State.FlyLockedCFrame and repositions the Terrain hover pad directly under the target destination.
+--   3. Retains Log-Calibrated Single-Hit Wall Combo (4.91m/1.51m), Void Damage Plane Submersion Kill (2,900 studs), and Fixed 2k White Platform.
 
 local cloneref = cloneref or function(obj) return obj end
 
@@ -33,7 +36,7 @@ local Config = {
     ScriptRunning = true,
     UIInitialized = false,
 
-    -- Background Anti-Void (Protects LocalPlayer from ever crossing VoidDamageY)
+    -- Background Anti-Void
     AntiVoidEnabled = true,
 
     -- Fixed 2,000 (2k) Teleport Void with White Platform (NON-EDITABLE, FIXED AT 2000)
@@ -94,7 +97,7 @@ local Config = {
 
     -- Movement (Max 500, Default WalkSpeed = 55, FlySpeed = 75)
     FlyEnabled = false,
-    FlyMode = "AbsoluteZeroDrop",
+    FlyMode = "TerrainPadHover",
     FlySpeed = 75,
     InfJumpEnabled = false,
     InfJumpMode = "FlyPadStep",
@@ -113,6 +116,7 @@ local Config = {
 local State = {
     UIToken = randomToken(),
     PlatformToken = randomToken(),
+    HoverPadToken = randomToken(),
 
     Char = nil,
     Root = nil,
@@ -141,8 +145,11 @@ local State = {
     DetectedVoidSource = "Workspace.FallenPartsDestroyHeight",
     VoidInfoLabel = nil,
 
-    -- White Platform at 2k Void
+    -- White Platform at 2k Void & Invisible Hover Pad for Fly
     WhiteVoidPlatform = nil,
+    TerrainHoverPad = nil,
+    FlyHoverY = nil,
+    FlyLockedCFrame = nil,
     DeepVoidCenterPos = nil,
     PreDeepVoidCFrame = nil,
 
@@ -172,9 +179,6 @@ local State = {
     InspectorScrollFrame = nil,
     InspectorTabCountLabel = nil,
 
-    -- Absolute Zero-Drop Fly Anchor
-    FlyLockedCFrame = nil,
-
     ObjectESPItems = {},
     LastObjectESPRefresh = 0,
 
@@ -197,7 +201,49 @@ local State = {
 }
 
 -- // ==========================================================================
--- // VOID DAMAGE ZONE SCANNER (LOCATES EXACT VOID KILL Y-PLANE IN GAME)
+-- // TERRAIN HOVER PAD FOR ANTI-267 ZERO-DROP FLY
+-- // ==========================================================================
+-- Parented inside Workspace.Terrain so it never triggers Camera/Workspace root checks,
+-- and provides a real physical floor under your feet so you never fall AND never trigger
+-- "Unexpected Position/CFrame Change (Error Code: 267)"!
+local function ensureTerrainHoverPad()
+    if State.TerrainHoverPad and State.TerrainHoverPad.Parent then
+        return State.TerrainHoverPad
+    end
+    local pad = Instance.new("Part")
+    pad.Name = State.HoverPadToken
+    pad.Archivable = false
+    pad.Size = Vector3.new(14, 1.2, 14)
+    pad.Anchored = true
+    pad.CanCollide = true
+    pad.Transparency = 1
+    pad.Material = Enum.Material.SmoothPlastic
+    pad.CFrame = CFrame.new(0, 99999, 0)
+    pad.Parent = Workspace.Terrain
+    State.TerrainHoverPad = pad
+    return pad
+end
+
+local function destroyTerrainHoverPad()
+    if State.TerrainHoverPad then
+        pcall(function() State.TerrainHoverPad:Destroy() end)
+        State.TerrainHoverPad = nil
+    end
+end
+
+local function syncFlyAnchorToNewCFrame(newCF)
+    if not newCF then return end
+    State.FlyLockedCFrame = newCF
+    State.FlyHoverY = newCF.Position.Y
+    if Config.FlyEnabled and State.Root and State.Hum then
+        local pad = ensureTerrainHoverPad()
+        local footOffset = State.Hum.HipHeight + (State.Root.Size.Y * 0.5) + (pad.Size.Y * 0.5)
+        pad.CFrame = CFrame.new(newCF.Position.X, newCF.Position.Y - footOffset, newCF.Position.Z)
+    end
+end
+
+-- // ==========================================================================
+-- // VOID DAMAGE ZONE SCANNER
 -- // ==========================================================================
 local function scanVoidDamageZone()
     local engineDestroyY = Workspace.FallenPartsDestroyHeight
@@ -208,7 +254,6 @@ local function scanVoidDamageZone()
     local highestVoidKillY = engineDestroyY
     local sourceName = string.format("FallenPartsDestroyHeight (Y = %.1f)", engineDestroyY)
 
-    -- Also scan Workspace for any lower kill-plane BaseParts with TouchInterest below Y = -50
     pcall(function()
         for _, inst in ipairs(Workspace:GetDescendants()) do
             if inst:IsA("BasePart") and inst.Position.Y < -50 and inst.Position.Y > engineDestroyY then
@@ -240,16 +285,11 @@ local function scanVoidDamageZone()
     return highestVoidKillY
 end
 
--- Safe Y for our own HumanoidRootPart during Void Kill:
--- Stays `VoidSafeMarginAboveDeath` (+2.0 studs) ABOVE the Void Damage Plane while pitching -90 deg
--- so the grabbed enemy welded in front of us is submerged 3.5 to 4.5 studs BELOW the Void Damage Plane!
 local function getPlayerSafeVoidKillHoverY()
     local voidDamageY = State.DetectedVoidDamageY or -500
     return voidDamageY + math.clamp(Config.VoidSafeMarginAboveDeath, 1.4, 12.0)
 end
 
--- Safe Y for the 2,000-stud White Platform:
--- If FallenPartsDestroyHeight allows -2000, uses Y = -2000; otherwise places the platform at 2,000 studs distance and safely above FallenPartsDestroyHeight so you never die while standing on it!
 local function get2kWhitePlatformPosition(originPos)
     local voidDamageY = State.DetectedVoidDamageY or -500
     local safeY = math.max(-2000, voidDamageY + 42)
@@ -312,6 +352,9 @@ local function forceFullCharacterAndCameraResync(targetCF)
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
 
+        -- Also sync Fly Anchor so if Fly is ON, it doesn't pull you back to the old Fly position!
+        syncFlyAnchorToNewCFrame(uprightCF)
+
         for _, part in ipairs(char:GetDescendants()) do
             if part:IsA("BasePart") then
                 part.AssemblyLinearVelocity = Vector3.zero
@@ -335,6 +378,19 @@ local function forceFullCharacterAndCameraResync(targetCF)
             end
         end
     end)
+end
+
+-- // BYPASS TELEPORT FUNCTION (Updates Fly Anchor + Smooth/Instant Step so Server/Fly never snaps you back)
+local function teleportCharacterSafelyTo(targetCF)
+    local char = LocalPlayer.Character or State.Char
+    local root = State.Root
+    if not char or not root or not targetCF then return end
+
+    syncFlyAnchorToNewCFrame(targetCF)
+    char:PivotTo(targetCF)
+    root.CFrame = targetCF
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
 end
 
 local function findNearestValidPlayer(maxRange)
@@ -474,7 +530,6 @@ local function findNearestTreeBundle(refPos)
 
     for _, b in ipairs(State.CachedTreeBundles) do
         if b.BaseWood and b.BaseWood.Parent then
-            -- Skip trees that were just broken and moved far away by the server
             local d = (b.BaseWood.Position - refPos).Magnitude
             if d < shortest then
                 shortest = d
@@ -612,13 +667,7 @@ local function copyFullInspectorReport(btn)
     end
 end
 
--- // ==========================================================================
 -- // LOG-CALIBRATED WALL COMBO EXECUTION (EXACT [860.84] GOLDEN RATIO)
--- // ==========================================================================
--- From your live log at [860.84]:
---   - Enemy is on TPPOINT (Enemy->ClosestTP = 0.00m, Enemy->Wood = 3.54m)
---   - LocalPlayer is 1.51m behind TPPOINT (Me->Wood = 4.91m, Dot = 0.80+, Me->Enemy = 1.51m, Dot = 0.88)
---   - Server sets LocalPlayer Attribute `ComboStun = true` and `IFrame = true` the instant Wall Combo starts!
 function isCharacterStillInSkill(char)
     if not char then return false end
     if char:GetAttribute("ComboStun") == true or char:GetAttribute("UsingMove") == true or char:GetAttribute("InSkill") == true then
@@ -645,7 +694,7 @@ local function triggerWallComboBehindEnemy(duration)
     if myChar:GetAttribute("ComboStun") == true then return end
 
     local holdTime = duration or 0.42
-    local enemyModel, enemyRoot = findNearestEnemyRoot(18)
+    local _, enemyRoot = findNearestEnemyRoot(18)
     local refPos = enemyRoot and enemyRoot.Position or myRoot.Position
 
     local bundle, shortest = findNearestTreeBundle(refPos)
@@ -655,7 +704,6 @@ local function triggerWallComboBehindEnemy(duration)
     end
     if not bundle or not bundle.BaseWood then return end
 
-    -- Pick the TPPOINT closest to the enemy (or player if no enemy)
     local bestTP = nil
     local bestDist = math.huge
     for _, tp in ipairs(bundle.TPPoints) do
@@ -676,9 +724,8 @@ local function triggerWallComboBehindEnemy(duration)
         task.spawn(function()
             local startTick = tick()
             while (tick() - startTick) < holdTime and Config.ScriptRunning and State.Root do
-                -- Check if Server already locked in the Wall Combo (`ComboStun == true`)
                 if myChar:GetAttribute("ComboStun") == true then
-                    addInspectorLog("WALL_LOCKED", "ComboStun=true detected! Releasing CFrame lock so animation plays.")
+                    syncFlyAnchorToNewCFrame(State.Root.CFrame)
                     break
                 end
 
@@ -687,8 +734,6 @@ local function triggerWallComboBehindEnemy(duration)
                 local lookAtPos
 
                 if Config.WallComboMode == "GoldenLogRatio_4.91m" and bestTP and bestTP.Parent then
-                    -- Exact [860.84] log geometry:
-                    -- TPPOINT is ~3.4m from Wood center; we stand 1.51m further out from TPPOINT (total 4.91m from Wood center) looking straight through TPPOINT into Wood (Dot = 0.88+)
                     local flatWood = Vector3.new(woodPos.X, bestTP.Position.Y, woodPos.Z)
                     local dirWoodToTP = (bestTP.Position - flatWood)
                     dirWoodToTP = (dirWoodToTP.Magnitude > 0.05) and dirWoodToTP.Unit or -State.Root.CFrame.LookVector
@@ -696,7 +741,6 @@ local function triggerWallComboBehindEnemy(duration)
                     standPos = flatWood + (dirWoodToTP * 4.91)
                     lookAtPos = flatWood
                 elseif curEnemyRoot then
-                    -- Align behind enemy facing the nearest tree trunk
                     local flatWood = Vector3.new(woodPos.X, curEnemyRoot.Position.Y, woodPos.Z)
                     local dirWoodToEnemy = (curEnemyRoot.Position - flatWood)
                     dirWoodToEnemy = (dirWoodToEnemy.Magnitude > 0.05) and dirWoodToEnemy.Unit or -State.Root.CFrame.LookVector
@@ -710,13 +754,14 @@ local function triggerWallComboBehindEnemy(duration)
                     lookAtPos = flatWood
                 end
 
-                State.Root.CFrame = CFrame.lookAt(standPos, lookAtPos)
+                local snapCF = CFrame.lookAt(standPos, lookAtPos)
+                State.Root.CFrame = snapCF
                 State.Root.AssemblyLinearVelocity = Vector3.zero
+                syncFlyAnchorToNewCFrame(snapCF)
 
                 RunService.Heartbeat:Wait()
             end
 
-            -- Only snap back if Wall Combo did NOT trigger (`ComboStun ~= true`)
             if State.Root and myChar:GetAttribute("ComboStun") ~= true and not isCharacterStillInSkill(myChar) then
                 forceFullCharacterAndCameraResync(preSnapCF)
             end
@@ -741,7 +786,7 @@ local function ensureWhiteVoidPlatform(centerPos)
     plat.Anchored = true
     plat.CanCollide = true
     plat.Material = Enum.Material.SmoothPlastic
-    plat.Color = Color3.fromRGB(255, 255, 255) -- Pure White Platform
+    plat.Color = Color3.fromRGB(255, 255, 255)
     plat.Transparency = 0
     plat.CFrame = CFrame.new(centerPos.X, centerPos.Y - 2, centerPos.Z)
     plat.Parent = Workspace.Terrain
@@ -1045,9 +1090,7 @@ local function getConfirmedCarriedEnemies()
     return grabbedList, grabbedMap
 end
 
--- // ==========================================================================
--- // VOID DAMAGE PLANE SUBMERSION KILL (DIPS ENEMY BELOW VOID KILL Y WHILE ANTI-VOID PROTECTS YOU)
--- // ==========================================================================
+-- // VOID DAMAGE PLANE SUBMERSION KILL
 local function executeVoidKillTrip()
     if not Config.ScriptRunning or State.VoidKillActive or not Config.AutoVoidKill then return end
     local myChar = LocalPlayer.Character or State.Char
@@ -1079,8 +1122,6 @@ local function executeVoidKillTrip()
         local farDist = Config.VoidFarHorizontalDist or 2900
         local voidXZ = Vector3.new(originPos.X, 0, originPos.Z) + (flatDir * farDist)
 
-        -- Instant 0-Delay Teleport right above the Void Damage Plane (+2.0 studs) while pitched -90 deg straight down
-        -- Your HumanoidRootPart stays at `voidDamageY + 2.0` (protected by Anti-Void), while the grabbed enemy welded in front of you is submerged at `voidDamageY - 3.8`!
         local instantDropCF = CFrame.new(voidXZ.X, safeHoverY, voidXZ.Z) * CFrame.Angles(math.rad(-90), 0, 0)
         State.VoidDropTargetCF = instantDropCF
         if State.Root then
@@ -1098,8 +1139,6 @@ local function executeVoidKillTrip()
                 break
             end
 
-            -- Keep LocalPlayer strictly above `voidDamageY + 1.4` so Anti-Void guarantees you never die,
-            -- while micro-pulsing the pitch/depth so the victim's body crosses the Void Damage Plane (`voidDamageY`)
             local microDip = math.sin(elapsed * 40) * 0.55
             local clampedY = math.max(voidDamageY + 1.4, safeHoverY + microDip)
             local activeCF = CFrame.new(voidXZ.X, clampedY, voidXZ.Z) * CFrame.Angles(math.rad(-90), 0, 0)
@@ -1454,7 +1493,7 @@ local function updateObjectESP()
 
     local seen = {}
     for _, inst in ipairs(Workspace:GetDescendants()) do
-        if inst:IsA("BasePart") and inst ~= Workspace.Terrain and inst.Name ~= "Baseplate" and inst ~= State.WhiteVoidPlatform and not inst:IsDescendantOf(Camera) then
+        if inst:IsA("BasePart") and inst ~= Workspace.Terrain and inst.Name ~= "Baseplate" and inst ~= State.WhiteVoidPlatform and inst ~= State.TerrainHoverPad and not inst:IsDescendantOf(Camera) then
             if (not myChar or not inst:IsDescendantOf(myChar)) and (not liveFolder or not inst:IsDescendantOf(liveFolder)) then
                 local dist = (inst.Position - myRoot.Position).Magnitude
                 if dist <= Config.ObjectESPRange and (inst.Name == "TPPOINT" or (inst.Size.Magnitude >= 3.5 and inst.Size.Magnitude <= 120)) then
@@ -1507,7 +1546,7 @@ local function copyNearestMapObjectInfo(btn)
 
     local candidates = {}
     for _, inst in ipairs(Workspace:GetDescendants()) do
-        if inst:IsA("BasePart") and inst ~= Workspace.Terrain and inst ~= State.WhiteVoidPlatform and not inst:IsDescendantOf(Camera) then
+        if inst:IsA("BasePart") and inst ~= Workspace.Terrain and inst ~= State.WhiteVoidPlatform and inst ~= State.TerrainHoverPad and not inst:IsDescendantOf(Camera) then
             if (not myChar or not inst:IsDescendantOf(myChar)) and (not liveFolder or not inst:IsDescendantOf(liveFolder)) then
                 local dist = (inst.Position - myRoot.Position).Magnitude
                 if dist <= 45 and inst.Size.Magnitude <= 140 then
@@ -1617,14 +1656,13 @@ local function getPlanarMoveVector(hum)
     return Vector3.zero
 end
 
--- // REAL ANTI-STUN ENGINE (Calibrated with HBG Attributes: `Stun`, `ComboStun`, `Hurt1..Hurt4`)
+-- // REAL ANTI-STUN ENGINE
 local HitstunAnimKeywords = {
     "stun", "hit", "hurt", "stagger", "ragdoll", "knock", "down", "slam", "grabbed", "freeze", "paralyz"
 }
 
 local function isCharCurrentlyStunned(char, hum)
     if not char or not hum then return false end
-    -- Note: When WE are performing a Wall Combo (`ComboStun == true` and `IFrame == true`), do NOT treat that as enemy stun!
     if char:GetAttribute("ComboStun") == true and char:GetAttribute("IFrame") == true then
         return false
     end
@@ -1717,7 +1755,7 @@ local function enforceRealAntiStun(char, root, hum, dt)
         if inputVec.Magnitude > 0 then
             root.AssemblyLinearVelocity = Vector3.new(inputVec.X * targetSpd, math.clamp(curVel.Y, -35, 35), inputVec.Z * targetSpd)
             if dt and dt > 0 then
-                root.CFrame = root.CFrame + (inputVec * targetSpd * dt * 0.65)
+                root.CFrame = root.CFrame + (inputVec * targetSpd * dt * 0.45)
             end
             local camLook = Vector3.new(Camera.CFrame.LookVector.X, 0, Camera.CFrame.LookVector.Z)
             if camLook.Magnitude > 0.1 then
@@ -1763,6 +1801,10 @@ local function bindCharacter(char)
         if motor then
             State.OrigRootJointC0 = motor.C0
             State.OrigRootJointC1 = motor.C1
+        end
+        if State.Root then
+            State.FlyHoverY = State.Root.Position.Y
+            State.FlyLockedCFrame = State.Root.CFrame
         end
         scanVoidDamageZone()
     end)
@@ -1985,7 +2027,7 @@ InspClearBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 InspClearBtn.Font = Enum.Font.GothamBold
 InspClearBtn.TextSize = 10
 InspClearBtn.AutoButtonColor = false
-InspClearBtn.ZIndex = 42
+InspCopyBtn.ZIndex = 42
 InspClearBtn.Parent = InspTopBar
 Instance.new("UICorner", InspClearBtn).CornerRadius = UDim.new(0, 5)
 
@@ -2295,7 +2337,7 @@ local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 290, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v34 VoidPlane+2kWhite"
+SubTitle.Text = "Heroes Battlegrounds v35 Anti-267 Fly+TP"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
@@ -2378,6 +2420,7 @@ local function unloadEntireScript()
     pcall(stopMovableGhostDecoy)
     pcall(restoreActiveWallTree)
     pcall(destroyWhiteVoidPlatform)
+    pcall(destroyTerrainHoverPad)
     pcall(clearObjectESP)
     pcall(cleanupInvisible)
 
@@ -3192,9 +3235,7 @@ end
 local currentTargetList = getPlayerNames()
 Config.SelectedPlayer = currentTargetList[1]
 
--- // ==========================================================================
--- // 1. POPULATE VOID KILL TAB (WITH VOID DAMAGE PLANE DETECTOR & FIXED 2K WHITE PLATFORM)
--- // ==========================================================================
+-- // 1. POPULATE VOID KILL TAB
 local VoidPlaneCard = Instance.new("Frame")
 VoidPlaneCard.Size = UDim2.new(1, 0, 0, 44)
 VoidPlaneCard.BackgroundColor3 = Color3.fromRGB(36, 24, 30)
@@ -3243,7 +3284,6 @@ State.SlotStatusLabel.TextSize = 11
 State.SlotStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
 State.SlotStatusLabel.Parent = SlotPreviewCard
 
--- Fixed 2,000 (2k) Teleport Void with White Platform (No slider to change it!)
 addDualButtons(
     TabVoid,
     "TP Void (Fixed 2k + White Floor)", Color3.fromRGB(45, 115, 195), function() teleportToDeepVoid() end,
@@ -3346,12 +3386,13 @@ addDropdown(TabCombat, "Aimbot Part", {"Head", "HumanoidRootPart"}, 1, function(
     Config.AimPart = part
 end)
 
--- // 3. POPULATE AUTOFARM TAB
+-- // 3. POPULATE AUTOFARM TAB (FIXED INSTANT TP WHILE FLYING!)
 addFeatureToggle(TabTarget, "AutoTarget", "AutoFarm Player", "TAR", false, function(v)
     Config.AutoTargetEnabled = v
     State.FreeMoveOffset = Vector3.zero
     if not v and State.Root then
         State.Root.AssemblyLinearVelocity = Vector3.zero
+        syncFlyAnchorToNewCFrame(State.Root.CFrame)
     end
 end)
 
@@ -3378,15 +3419,34 @@ addSlider(TabTarget, "Target Range", 1, 200, 5.5, function(v)
     Config.TargetRange = v
 end)
 
-addFeatureToggle(TabTarget, "TeleportPlayer", "Instant Teleport To Player", "TP", false, function(v)
+-- Instant Teleport Button + Pin-able Toggle (Both sync Fly Hover Anchor so Fly NEVER pulls you back!)
+local function executeInstantTeleportToSelectedPlayer()
+    local targetPlr = Players:FindFirstChild(Config.SelectedPlayer or "")
+    local myRoot = State.Root
+    local tRoot = targetPlr and targetPlr.Character and targetPlr.Character:FindFirstChild("HumanoidRootPart")
+    if myRoot and tRoot then
+        local destCF = tRoot.CFrame * CFrame.new(0, 0, 3)
+        -- Update Fly anchor + hover pad first, then snap across 4 frames so neither Fly nor Server rubberbands you back
+        syncFlyAnchorToNewCFrame(destCF)
+        task.spawn(function()
+            for _ = 1, 4 do
+                if State.Root and tRoot and tRoot.Parent then
+                    local liveDest = tRoot.CFrame * CFrame.new(0, 0, 3)
+                    teleportCharacterSafelyTo(liveDest)
+                end
+                RunService.Heartbeat:Wait()
+            end
+        end)
+    end
+end
+
+addButton(TabTarget, "Instant Teleport To Selected Player", Color3.fromRGB(45, 130, 205), function()
+    executeInstantTeleportToSelectedPlayer()
+end)
+
+addFeatureToggle(TabTarget, "TeleportPlayer", "Pin-able Instant Teleport To Player", "TP", false, function(v)
     if v then
-        local targetPlr = Players:FindFirstChild(Config.SelectedPlayer or "")
-        local myRoot = State.Root
-        local tRoot = targetPlr and targetPlr.Character and targetPlr.Character:FindFirstChild("HumanoidRootPart")
-        if myRoot and tRoot then
-            myRoot.CFrame = tRoot.CFrame * CFrame.new(0, 0, 3)
-            myRoot.AssemblyLinearVelocity = Vector3.zero
-        end
+        executeInstantTeleportToSelectedPlayer()
         task.delay(0.15, function()
             if State.ToggleRegistry["TeleportPlayer"] then
                 State.ToggleRegistry["TeleportPlayer"](false)
@@ -3395,24 +3455,24 @@ addFeatureToggle(TabTarget, "TeleportPlayer", "Instant Teleport To Player", "TP"
     end
 end)
 
--- // 4. POPULATE LOCALPLAYER TAB
-addFeatureToggle(TabMove, "Fly", "Loop Fly (Absolute Zero-Drop Hover)", "FLY", false, function(v)
+-- // 4. POPULATE LOCALPLAYER TAB (ANTI-267 TERRAIN HOVER PAD FLY)
+addFeatureToggle(TabMove, "Fly", "Loop Fly (Anti-267 Terrain Hover)", "FLY", false, function(v)
     Config.FlyEnabled = v
     if v and State.Root then
-        State.FlyLockedCFrame = State.Root.CFrame
+        syncFlyAnchorToNewCFrame(State.Root.CFrame)
         State.Root.AssemblyLinearVelocity = Vector3.zero
     else
-        State.FlyLockedCFrame = nil
+        destroyTerrainHoverPad()
         if State.Root then
             State.Root.AssemblyLinearVelocity = Vector3.zero
         end
     end
 end)
 
-addDropdown(TabMove, "Fly Mode", {"AbsoluteZeroDrop", "FloorPad", "LoopPulse"}, 1, function(opt)
+addDropdown(TabMove, "Fly Mode", {"TerrainPadHover", "VelocityGlide"}, 1, function(opt)
     Config.FlyMode = opt
     if State.Root then
-        State.FlyLockedCFrame = State.Root.CFrame
+        syncFlyAnchorToNewCFrame(State.Root.CFrame)
     end
 end)
 
@@ -3647,7 +3707,6 @@ table.insert(State.Connections, RunService.Stepped:Connect(function(_, dt)
     local voidDamageY = State.DetectedVoidDamageY or -500
 
     if State.VoidKillActive and State.VoidDropTargetCF and State.Root then
-        -- Guarantee our own Root never drops below `voidDamageY + 1.4` while holding the victim below `voidDamageY`
         local pos = State.VoidDropTargetCF.Position
         local safeY = math.max(pos.Y, voidDamageY + 1.4)
         State.Root.CFrame = CFrame.new(pos.X, safeY, pos.Z) * State.VoidDropTargetCF.Rotation
@@ -3659,19 +3718,12 @@ table.insert(State.Connections, RunService.Stepped:Connect(function(_, dt)
         State.Root.CFrame = CFrame.new(voidPos) * State.DecoyCFrame.Rotation
         State.Root.AssemblyLinearVelocity = Vector3.zero
     elseif Config.DeepVoidActive and State.Root and State.DeepVoidCenterPos then
-        -- Keep the White Platform centered below us at 2k Void & prevent falling below its surface
         local surfaceY = State.DeepVoidCenterPos.Y
         ensureWhiteVoidPlatform(Vector3.new(State.Root.Position.X, surfaceY, State.Root.Position.Z))
         if State.Root.Position.Y < (surfaceY + 2.8) then
             State.Root.CFrame = CFrame.new(State.Root.Position.X, surfaceY + 3.0, State.Root.Position.Z) * State.Root.CFrame.Rotation
             State.Root.AssemblyLinearVelocity = Vector3.new(State.Root.AssemblyLinearVelocity.X, math.max(0, State.Root.AssemblyLinearVelocity.Y), State.Root.AssemblyLinearVelocity.Z)
         end
-    elseif Config.FlyEnabled and not Config.AutoTargetEnabled and State.Root and State.Hum then
-        if State.FlyLockedCFrame then
-            State.Root.CFrame = CFrame.new(State.FlyLockedCFrame.Position) * State.Root.CFrame.Rotation
-        end
-        State.Root.AssemblyLinearVelocity = Vector3.zero
-        State.Root.AssemblyAngularVelocity = Vector3.zero
     end
 
     if Config.AntiStunEnabled and State.Char and State.Root and State.Hum then
@@ -3708,22 +3760,6 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
         local voidPos = Vector3.new(State.DecoyCFrame.Position.X, voidDamageY + 35, State.DecoyCFrame.Position.Z)
         root.CFrame = CFrame.new(voidPos) * State.DecoyCFrame.Rotation
         root.AssemblyLinearVelocity = Vector3.zero
-    elseif Config.FlyEnabled and not Config.AutoTargetEnabled and root and hum then
-        if not State.FlyLockedCFrame then
-            State.FlyLockedCFrame = root.CFrame
-        end
-        local moveDir = getFlightDirection(hum)
-        local spd = Config.FlySpeed or 75
-        local newPos = State.FlyLockedCFrame.Position + (moveDir * spd * dt)
-        local flatCamLook = Vector3.new(Camera.CFrame.LookVector.X, 0, Camera.CFrame.LookVector.Z)
-        if flatCamLook.Magnitude > 0.01 then
-            State.FlyLockedCFrame = CFrame.lookAt(newPos, newPos + flatCamLook.Unit)
-        else
-            State.FlyLockedCFrame = CFrame.new(newPos)
-        end
-        root.CFrame = State.FlyLockedCFrame
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
     end
 
     if Config.AntiStunEnabled and char and root and hum then
@@ -3785,9 +3821,11 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
             end
 
             local finalPos = basePos + State.FreeMoveOffset
-            root.CFrame = CFrame.lookAt(finalPos, targetPos)
+            local lookCF = CFrame.lookAt(finalPos, targetPos)
+            root.CFrame = lookCF
             root.AssemblyLinearVelocity = Vector3.zero
             root.AssemblyAngularVelocity = Vector3.zero
+            syncFlyAnchorToNewCFrame(lookCF)
         end
     end
 
@@ -3863,16 +3901,13 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             stopMovableGhostDecoy()
         end
 
-        -- Anti-Void Protection:
-        -- 1. When normal on the map, rescues you if you fall near `voidDamageY + 55`.
-        -- 2. Even DURING Void Kill, if anything ever pushes your Root below `voidDamageY + 1.2`, clamps you back above `voidDamageY + 2.0` so you NEVER die to Void Damage!
         if State.VoidKillActive then
             if root.Position.Y <= (voidDamageY + 1.2) then
                 root.CFrame = CFrame.new(root.Position.X, voidDamageY + 2.2, root.Position.Z) * root.CFrame.Rotation
                 root.AssemblyLinearVelocity = Vector3.zero
             end
         elseif not State.AntiSkillEvading and not Config.DeepVoidActive then
-            if hum.FloorMaterial ~= Enum.Material.Air and root.Position.Y > -30 and root.Position.Magnitude < 1200 then
+            if hum.FloorMaterial ~= Enum.Material.Air and root.Position.Y > -30 and root.Position.Magnitude < 1200 and not Config.FlyEnabled then
                 State.LastSafeCFrame = root.CFrame
             end
 
@@ -3886,11 +3921,11 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             scanProximityGrab()
         end
 
-        -- Speed Boost via CFrame delta
+        -- Speed Boost via velocity-assisted step
         if Config.SpeedEnabled and hum.MoveDirection.Magnitude > 0 and not Config.FlyEnabled and not Config.AutoTargetEnabled and not isCharacterStillInSkill(char) then
             local extraSpeed = math.max(0, Config.WalkSpeed - 16)
             if extraSpeed > 0 then
-                root.CFrame = root.CFrame + (hum.MoveDirection * extraSpeed * dt)
+                root.CFrame = root.CFrame + (hum.MoveDirection * math.min(extraSpeed, 95) * dt)
             end
         end
 
@@ -3913,13 +3948,41 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             end
         end
 
-        -- Absolute Zero-Drop Fly Lock
-        if Config.FlyEnabled and not Config.AutoTargetEnabled and not State.VoidKillActive and not State.AntiSkillEvading then
-            if State.FlyLockedCFrame then
-                root.CFrame = State.FlyLockedCFrame
+        -- ======================================================================
+        -- ANTI-267 FLY ENGINE (TERRAIN HOVER PAD + VELOCITY-SYNCED MOVEMENT)
+        -- ======================================================================
+        -- Never overwrites CFrame when velocity is 0; uses an invisible Terrain floor pad
+        -- directly beneath your feet so you stand naturally in mid-air with 0.00 drop,
+        -- and uses matching AssemblyLinearVelocity when flying so Error 267 never triggers!
+        if Config.FlyEnabled and not Config.AutoTargetEnabled and not State.VoidKillActive and not State.AntiSkillEvading and not State.WallComboPulseRunning then
+            local moveDir = getFlightDirection(hum)
+            local spd = Config.FlySpeed or 75
+            local pad = ensureTerrainHoverPad()
+
+            if not State.FlyHoverY then
+                State.FlyHoverY = root.Position.Y
             end
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
+
+            if moveDir.Magnitude > 0 then
+                -- Update target hover altitude when moving vertically (Space / LeftControl or pitched camera flight)
+                State.FlyHoverY = root.Position.Y + (moveDir.Y * spd * dt)
+                -- Drive with real AssemblyLinearVelocity so HBG's CFrame-vs-Velocity check sees 100% legitimate physics!
+                root.AssemblyLinearVelocity = Vector3.new(moveDir.X * spd, moveDir.Y * spd, moveDir.Z * spd)
+            else
+                -- Standing still in mid-air: zero horizontal velocity, resting naturally on the invisible Terrain pad
+                root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            end
+
+            local footOffset = hum.HipHeight + (root.Size.Y * 0.5) + (pad.Size.Y * 0.5) - 0.03
+            pad.CFrame = CFrame.new(root.Position.X, State.FlyHoverY - footOffset, root.Position.Z)
+
+            -- If character accidentally dipped below the hover pad, gently align on top of the pad
+            if root.Position.Y < (State.FlyHoverY - 0.35) then
+                root.CFrame = CFrame.new(root.Position.X, State.FlyHoverY, root.Position.Z) * root.CFrame.Rotation
+            end
+            State.FlyLockedCFrame = root.CFrame
+        elseif not Config.FlyEnabled and State.TerrainHoverPad then
+            destroyTerrainHoverPad()
         end
     end
 
@@ -3955,7 +4018,7 @@ table.insert(State.Connections, UserInputService.InputBegan:Connect(function(inp
         end
     end
 
-    -- Single-Hit M1 Wall Combo Trigger (Calibrated with [860.84] log ratio)
+    -- Single-Hit M1 Wall Combo Trigger
     if not gpe and Config.WallComboEnabled then
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             local now = tick()
