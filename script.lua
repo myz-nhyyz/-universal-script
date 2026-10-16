@@ -1,8 +1,9 @@
--- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v33)
--- Updates in v33:
---   1. Dedicated On-Screen Live Wall Combo Inspector Panel + "Wall Log" Sidebar Tab (enabled by default so you can see & copy exact HBG single-hit Wall Combo mechanics immediately).
---   2. Deep Inspection of LocalPlayer, Nearest Enemy, and Nearest Tree (tracks Animations, Attributes, Welds/Constraints, BodyMovers, Tools, and exact Wood/TPPOINT distances & angles on every M1 click).
---   3. Single-Hit M1 Wall Combo (triggers on 1st M1 hit near any tree or from afar) + Absolute Zero-Drop Fly + Instant 2,900-Stud Void Kill with Full Camera/Body Resync.
+-- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v34)
+-- Updates in v34:
+--   1. Log-Calibrated Single-Hit Wall Combo: uses exact distances from live log (Me->Wood: 4.91m, Me->TPPOINT: 1.51m, Dot >= 0.80) and detects Character Attribute "ComboStun == true" to release seamlessly when Wall Combo starts.
+--   2. Automatic Void Damage Plane Scanner: detects exact Workspace.FallenPartsDestroyHeight & bottom kill-bricks, submerges grabbed enemies 3.8 studs BELOW the Void Damage plane while keeping LocalPlayer locked above it with Anti-Void.
+--   3. Fixed 2,000 (2k) Teleport Void (hardcoded 2000, no slider) with a solid 500x500 White Platform (Color3.fromRGB(255, 255, 255)) underneath to stand and walk on.
+--   4. Absolute Zero-Drop Fly + Real Anti-Stun + Full Camera/Body Resync.
 
 local cloneref = cloneref or function(obj) return obj end
 
@@ -32,14 +33,16 @@ local Config = {
     ScriptRunning = true,
     UIInitialized = false,
 
-    -- Background Anti-Void
+    -- Background Anti-Void (Protects LocalPlayer from ever crossing VoidDamageY)
     AntiVoidEnabled = true,
 
-    -- Instant 2,900-Stud Void Kill
+    -- Fixed 2,000 (2k) Teleport Void with White Platform (NON-EDITABLE, FIXED AT 2000)
     DeepVoidActive = false,
-    VoidKillDepth = 445,
+    FixedTeleportVoidDist = 2000,
+
+    -- Auto Void Kill (2,900 studs horizontal + submerges victim below detected VoidDamageY)
     VoidFarHorizontalDist = 2900,
-    VoidEdgeOffset = 2.2,
+    VoidSafeMarginAboveDeath = 2.0,
     AutoVoidKill = false,
     VoidMaxHoldTime = 1.45,
 
@@ -68,13 +71,12 @@ local Config = {
     AntiSkillRange = 16,
 
     WallComboEnabled = false,
-    WallComboMode = "SingleHitSnapToTPPOINT",
-    WallBehindEnemyOffset = 3.6,
+    WallComboMode = "GoldenLogRatio_4.91m",
     WallComboKey = Enum.KeyCode.V,
 
-    -- Live Wall Combo Inspector (ON by default so you see it immediately!)
-    WallInspectorEnabled = true,
-    ShowFloatingInspector = true,
+    -- Live Wall Combo Inspector
+    WallInspectorEnabled = false,
+    ShowFloatingInspector = false,
 
     ObjectESPEnabled = false,
     ObjectESPRange = 45,
@@ -110,6 +112,7 @@ local Config = {
 
 local State = {
     UIToken = randomToken(),
+    PlatformToken = randomToken(),
 
     Char = nil,
     Root = nil,
@@ -133,6 +136,16 @@ local State = {
     CurrentSkillAnimTrack = nil,
     SlotStatusLabel = nil,
 
+    -- Detected Void Damage Plane Info
+    DetectedVoidDamageY = -500,
+    DetectedVoidSource = "Workspace.FallenPartsDestroyHeight",
+    VoidInfoLabel = nil,
+
+    -- White Platform at 2k Void
+    WhiteVoidPlatform = nil,
+    DeepVoidCenterPos = nil,
+    PreDeepVoidCFrame = nil,
+
     PhantomShotStage = 0,
     PhantomShotLastTick = 0,
     ActiveSpecialSkill = nil,
@@ -143,9 +156,6 @@ local State = {
     VoidKillActive = false,
     VoidDropTargetCF = nil,
     VoidReturnCFrame = nil,
-
-    DeepVoidStandCF = nil,
-    PreDeepVoidCFrame = nil,
 
     AntiSkillEvading = false,
     DecoyCFrame = nil,
@@ -186,23 +196,66 @@ local State = {
     Connections = {},
 }
 
-local function getRawDestroyHeight()
-    local destroyY = Workspace.FallenPartsDestroyHeight
-    if destroyY ~= destroyY or destroyY < -10000 or destroyY > 500 then
-        destroyY = -500
+-- // ==========================================================================
+-- // VOID DAMAGE ZONE SCANNER (LOCATES EXACT VOID KILL Y-PLANE IN GAME)
+-- // ==========================================================================
+local function scanVoidDamageZone()
+    local engineDestroyY = Workspace.FallenPartsDestroyHeight
+    if engineDestroyY ~= engineDestroyY or engineDestroyY < -50000 or engineDestroyY > 500 then
+        engineDestroyY = -500
     end
-    return destroyY
+
+    local highestVoidKillY = engineDestroyY
+    local sourceName = string.format("FallenPartsDestroyHeight (Y = %.1f)", engineDestroyY)
+
+    -- Also scan Workspace for any lower kill-plane BaseParts with TouchInterest below Y = -50
+    pcall(function()
+        for _, inst in ipairs(Workspace:GetDescendants()) do
+            if inst:IsA("BasePart") and inst.Position.Y < -50 and inst.Position.Y > engineDestroyY then
+                local hasTouch = inst:FindFirstChildOfClass("TouchTransmitter") ~= nil
+                local lowerName = string.lower(inst.Name)
+                if hasTouch and (string.find(lowerName, "void", 1, true) or string.find(lowerName, "kill", 1, true) or string.find(lowerName, "death", 1, true) or inst.Size.X > 400 or inst.Size.Z > 400) then
+                    local topSurfaceY = inst.Position.Y + (inst.Size.Y * 0.5)
+                    if topSurfaceY > highestVoidKillY and topSurfaceY < -60 then
+                        highestVoidKillY = topSurfaceY
+                        sourceName = string.format("KillBrick:%s (Y = %.1f)", inst.Name, topSurfaceY)
+                    end
+                end
+            end
+        end
+    end)
+
+    State.DetectedVoidDamageY = highestVoidKillY
+    State.DetectedVoidSource = sourceName
+
+    if State.VoidInfoLabel and State.VoidInfoLabel.Parent then
+        State.VoidInfoLabel.Text = string.format(
+            "Void Damage Plane: %s\nEnemy Plunge Y: %.1f  |  Your Safe Anti-Void Y: %.1f",
+            sourceName,
+            highestVoidKillY - 3.8,
+            highestVoidKillY + Config.VoidSafeMarginAboveDeath
+        )
+    end
+
+    return highestVoidKillY
 end
 
-local function getSafeVoidFloorY()
-    local destroyY = getRawDestroyHeight()
-    local desiredY = -math.abs(Config.VoidKillDepth)
-    return math.max(desiredY, destroyY + 25)
+-- Safe Y for our own HumanoidRootPart during Void Kill:
+-- Stays `VoidSafeMarginAboveDeath` (+2.0 studs) ABOVE the Void Damage Plane while pitching -90 deg
+-- so the grabbed enemy welded in front of us is submerged 3.5 to 4.5 studs BELOW the Void Damage Plane!
+local function getPlayerSafeVoidKillHoverY()
+    local voidDamageY = State.DetectedVoidDamageY or -500
+    return voidDamageY + math.clamp(Config.VoidSafeMarginAboveDeath, 1.4, 12.0)
 end
 
-local function getKillZoneVoidY()
-    local destroyY = getRawDestroyHeight()
-    return destroyY + math.clamp(Config.VoidEdgeOffset, 1.2, 14.0)
+-- Safe Y for the 2,000-stud White Platform:
+-- If FallenPartsDestroyHeight allows -2000, uses Y = -2000; otherwise places the platform at 2,000 studs distance and safely above FallenPartsDestroyHeight so you never die while standing on it!
+local function get2kWhitePlatformPosition(originPos)
+    local voidDamageY = State.DetectedVoidDamageY or -500
+    local safeY = math.max(-2000, voidDamageY + 42)
+    local baseX = originPos and originPos.X or 0
+    local baseZ = originPos and originPos.Z or 0
+    return Vector3.new(baseX + 2000, safeY, baseZ + 2000)
 end
 
 local function getRootMotor(char)
@@ -421,6 +474,7 @@ local function findNearestTreeBundle(refPos)
 
     for _, b in ipairs(State.CachedTreeBundles) do
         if b.BaseWood and b.BaseWood.Parent then
+            -- Skip trees that were just broken and moved far away by the server
             local d = (b.BaseWood.Position - refPos).Magnitude
             if d < shortest then
                 shortest = d
@@ -432,13 +486,11 @@ local function findNearestTreeBundle(refPos)
     return bestBundle, shortest
 end
 
--- // ==========================================================================
--- // LIVE WALL COMBO INSPECTOR ENGINE (RECORDS EVERYTHING WHEN YOU HIT NEAR A TREE)
--- // ==========================================================================
+-- // LIVE WALL COMBO INSPECTOR ENGINE
 local function refreshInspectorDisplay()
     local count = #State.InspectorLogs
     if State.InspectorTabCountLabel and State.InspectorTabCountLabel.Parent then
-        State.InspectorTabCountLabel.Text = string.format("Recorded Events: %d (Stand near a Tree & punch 1 hit!)", count)
+        State.InspectorTabCountLabel.Text = string.format("Recorded Events: %d", count)
     end
     if State.InspectorLogTextLabel and State.InspectorLogTextLabel.Parent then
         local startIdx = math.max(1, count - 28)
@@ -448,7 +500,7 @@ local function refreshInspectorDisplay()
         end
         State.InspectorLogTextLabel.Text = (#slice > 0)
             and table.concat(slice, "\n")
-            or "Waiting for M1 / Wall Combo near a Tree...\n(Stand next to a Tree and punch 1 time!)"
+            or "Waiting for M1 / Wall Combo near a Tree..."
         if State.InspectorScrollFrame then
             State.InspectorScrollFrame.CanvasPosition = Vector2.new(0, 99999)
         end
@@ -506,32 +558,8 @@ local function snapshotFullWallComboState(triggerReason)
         "%s | Me->Wood:%.2fm(Dot:%.2f) | ClosestTP:%.2fm | %s | TPs:[%s]",
         triggerReason, woodDist or -1, dotToWood, closestTPDist, enemyInfo, table.concat(tpDetails, ", ")
     ))
-
-    -- Also check if Character or Tree has any special attributes/children right now
-    if State.Char then
-        local attrs = State.Char:GetAttributes()
-        local attrList = {}
-        for k, v in pairs(attrs) do
-            table.insert(attrList, tostring(k) .. "=" .. tostring(v))
-        end
-        if #attrList > 0 then
-            addInspectorLog("MY_ATTRS", table.concat(attrList, ", "))
-        end
-    end
-
-    if bundle and bundle.Model then
-        local treeAttrs = bundle.Model:GetAttributes()
-        local tList = {}
-        for k, v in pairs(treeAttrs) do
-            table.insert(tList, tostring(k) .. "=" .. tostring(v))
-        end
-        if #tList > 0 then
-            addInspectorLog("TREE_ATTRS", table.concat(tList, ", "))
-        end
-    end
 end
 
--- Attach live listeners to the nearest enemy so we see what welds/animations/tags appear on them during a 1-hit Wall Combo!
 local function updateWatchedEnemyForInspector()
     if not Config.WallInspectorEnabled then return end
     local enemyModel, _ = findNearestEnemyRoot(25)
@@ -548,31 +576,13 @@ local function updateWatchedEnemyForInspector()
 
     table.insert(State.EnemyWatchConnections, enemyModel.DescendantAdded:Connect(function(inst)
         if not Config.WallInspectorEnabled then return end
-        local extra = ""
-        if inst:IsA("Weld") or inst:IsA("WeldConstraint") or inst:IsA("Motor6D") or inst:IsA("JointInstance") then
-            local p0 = inst.Part0 and inst.Part0:GetFullName() or "nil"
-            local p1 = inst.Part1 and inst.Part1:GetFullName() or "nil"
-            extra = string.format(" (Part0=%s, Part1=%s)", p0, p1)
-        elseif inst:IsA("ObjectValue") or inst:IsA("StringValue") or inst:IsA("BoolValue") or inst:IsA("NumberValue") then
-            extra = " (Value=" .. tostring(inst.Value) .. ")"
-        end
-        addInspectorLog("ENEMY_ADD", string.format("%s [%s] in %s%s", inst.Name, inst.ClassName, inst.Parent and inst.Parent.Name or "?", extra))
+        addInspectorLog("ENEMY_ADD", string.format("%s [%s] in %s", inst.Name, inst.ClassName, inst.Parent and inst.Parent.Name or "?"))
     end))
 
     table.insert(State.EnemyWatchConnections, enemyModel.AttributeChanged:Connect(function(attr)
         if not Config.WallInspectorEnabled then return end
         addInspectorLog("ENEMY_ATTR", string.format("%s = %s", tostring(attr), tostring(enemyModel:GetAttribute(attr))))
     end))
-
-    local eHum = enemyModel:FindFirstChildOfClass("Humanoid")
-    local eAnim = eHum and eHum:FindFirstChildOfClass("Animator")
-    if eAnim then
-        table.insert(State.EnemyWatchConnections, eAnim.AnimationPlayed:Connect(function(track)
-            if not Config.WallInspectorEnabled then return end
-            local id = track.Animation and track.Animation.AnimationId or "nil"
-            addInspectorLog("ENEMY_ANIM", string.format("%s (%s)", tostring(track.Name), tostring(id)))
-        end))
-    end
 end
 
 local function copyFullInspectorReport(btn)
@@ -603,23 +613,22 @@ local function copyFullInspectorReport(btn)
 end
 
 -- // ==========================================================================
--- // SINGLE-HIT WALL COMBO EXECUTION (WORKS ON 1ST M1 HIT)
+-- // LOG-CALIBRATED WALL COMBO EXECUTION (EXACT [860.84] GOLDEN RATIO)
 -- // ==========================================================================
--- Since HBG triggers Wall Combo on ANY single M1 hit when you/enemy are positioned at a Tree's TPPOINT / Wood:
---   1. "SingleHitSnapToTPPOINT" (Server-Valid): The instant you click M1 (or press V) while an enemy is near you,
---      snaps you to the nearest Tree's TPPOINT facing the enemy/tree so your 1st M1 registers as a Wall Combo!
---   2. "PullTreeAndTPPOINTToMe": Pulls all 4 Tree.Wood segments + all 4 TPPOINTs directly onto your position & behind the enemy on every M1 click.
---   3. "BothSnapAndPull": Combines both simultaneously.
+-- From your live log at [860.84]:
+--   - Enemy is on TPPOINT (Enemy->ClosestTP = 0.00m, Enemy->Wood = 3.54m)
+--   - LocalPlayer is 1.51m behind TPPOINT (Me->Wood = 4.91m, Dot = 0.80+, Me->Enemy = 1.51m, Dot = 0.88)
+--   - Server sets LocalPlayer Attribute `ComboStun = true` and `IFrame = true` the instant Wall Combo starts!
 function isCharacterStillInSkill(char)
     if not char then return false end
+    if char:GetAttribute("ComboStun") == true or char:GetAttribute("UsingMove") == true or char:GetAttribute("InSkill") == true then
+        return true
+    end
     for _, child in ipairs(char:GetChildren()) do
         local n = string.lower(child.Name)
         if n == "usingmove" or n == "skill" or n == "casting" or n == "action" or n == "move" or n == "inmove" then
             return true
         end
-    end
-    if char:GetAttribute("UsingMove") == true or char:GetAttribute("InSkill") == true then
-        return true
     end
     local track = State.CurrentSkillAnimTrack
     if track and track.IsPlaying then
@@ -633,144 +642,82 @@ local function triggerWallComboBehindEnemy(duration)
     local myRoot = State.Root
     if not myChar or not myRoot then return end
     if State.WallComboPulseRunning then return end
+    if myChar:GetAttribute("ComboStun") == true then return end
 
-    local holdTime = duration or 0.48
-    local bundle, shortest = findNearestTreeBundle(myRoot.Position)
+    local holdTime = duration or 0.42
+    local enemyModel, enemyRoot = findNearestEnemyRoot(18)
+    local refPos = enemyRoot and enemyRoot.Position or myRoot.Position
+
+    local bundle, shortest = findNearestTreeBundle(refPos)
     if not bundle or not bundle.BaseWood or not bundle.BaseWood.Parent then
         scanRealTreeWoods()
-        bundle, shortest = findNearestTreeBundle(myRoot.Position)
+        bundle, shortest = findNearestTreeBundle(refPos)
     end
     if not bundle or not bundle.BaseWood then return end
 
-    snapshotFullWallComboState("TriggerWallCombo[" .. tostring(Config.WallComboMode) .. "]")
-
-    -- Mode A: Pull Tree.Wood + TPPOINTs directly to Enemy/Player on every single M1 hit
-    if Config.WallComboMode == "PullTreeAndTPPOINTToMe" or Config.WallComboMode == "BothSnapAndPull" then
-        State.ActiveTreeBundle = bundle
-        local baseOrigCF = bundle.BaseWood.CFrame
-        local woodRelOffsets = {}
-        for _, w in ipairs(bundle.Woods) do
-            if w and w.Parent then
-                bundle.SavedCFrames[w] = w.CFrame
-                woodRelOffsets[w] = baseOrigCF:ToObjectSpace(w.CFrame)
+    -- Pick the TPPOINT closest to the enemy (or player if no enemy)
+    local bestTP = nil
+    local bestDist = math.huge
+    for _, tp in ipairs(bundle.TPPoints) do
+        if tp and tp.Parent then
+            local d = (tp.Position - refPos).Magnitude
+            if d < bestDist then
+                bestDist = d
+                bestTP = tp
             end
-        end
-        for _, tp in ipairs(bundle.TPPoints) do
-            if tp and tp.Parent then
-                bundle.SavedCFrames[tp] = tp.CFrame
-            end
-        end
-
-        task.spawn(function()
-            local startTick = tick()
-            while (tick() - startTick) < holdTime and Config.ScriptRunning and State.Root do
-                local _, curEnemyRoot = findNearestEnemyRoot(18)
-                local baseWood = bundle.BaseWood
-                if not baseWood or not baseWood.Parent then break end
-
-                local halfThickness = math.max(baseWood.Size.Y, baseWood.Size.Z) * 0.5
-                local centerDistBehindEnemy = math.max(Config.WallBehindEnemyOffset, halfThickness + 1.2)
-
-                local targetBaseWoodCF
-                local contactPos
-
-                if curEnemyRoot then
-                    local flatMe = Vector3.new(State.Root.Position.X, curEnemyRoot.Position.Y, State.Root.Position.Z)
-                    local dirMeToEnemy = (curEnemyRoot.Position - flatMe)
-                    dirMeToEnemy = (dirMeToEnemy.Magnitude > 0.1) and dirMeToEnemy.Unit or State.Root.CFrame.LookVector
-                    local trunkCenterPos = curEnemyRoot.Position + (dirMeToEnemy * centerDistBehindEnemy)
-                    contactPos = curEnemyRoot.Position
-                    targetBaseWoodCF = CFrame.lookAt(trunkCenterPos, curEnemyRoot.Position) * CFrame.Angles(0, 0, math.rad(90))
-                else
-                    local lookVec = State.Root.CFrame.LookVector
-                    local trunkCenterPos = State.Root.Position + (lookVec * (centerDistBehindEnemy + 2.2))
-                    contactPos = State.Root.Position + (lookVec * 1.8)
-                    targetBaseWoodCF = CFrame.lookAt(trunkCenterPos, State.Root.Position) * CFrame.Angles(0, 0, math.rad(90))
-                end
-
-                pcall(function()
-                    for _, w in ipairs(bundle.Woods) do
-                        if w and w.Parent then
-                            local rel = woodRelOffsets[w] or CFrame.identity
-                            w.CFrame = targetBaseWoodCF * rel
-                        end
-                    end
-                    for idx, tp in ipairs(bundle.TPPoints) do
-                        if tp and tp.Parent then
-                            if idx == 1 then
-                                tp.CFrame = State.Root.CFrame
-                            elseif idx == 2 and curEnemyRoot then
-                                tp.CFrame = curEnemyRoot.CFrame
-                            else
-                                tp.CFrame = CFrame.new(contactPos)
-                            end
-                        end
-                    end
-                end)
-                RunService.Heartbeat:Wait()
-            end
-            if Config.WallComboMode == "PullTreeAndTPPOINTToMe" then
-                restoreActiveWallTree()
-            end
-        end)
-
-        if Config.WallComboMode == "PullTreeAndTPPOINTToMe" then
-            return
         end
     end
 
-    -- Mode B: SingleHitSnapToTPPOINT (Snaps you to the nearest real Tree TPPOINT on 1st M1 hit)
-    if shortest <= 260 then
+    if shortest <= 240 then
         State.WallComboPulseRunning = true
         local preSnapCF = myRoot.CFrame
         local woodPos = bundle.BaseWood.Position
 
-        local bestTP = nil
-        local bestDist = math.huge
-        for _, tp in ipairs(bundle.TPPoints) do
-            if tp and tp.Parent then
-                local d = (tp.Position - myRoot.Position).Magnitude
-                if d < bestDist then
-                    bestDist = d
-                    bestTP = tp
-                end
-            end
-        end
-
         task.spawn(function()
             local startTick = tick()
             while (tick() - startTick) < holdTime and Config.ScriptRunning and State.Root do
+                -- Check if Server already locked in the Wall Combo (`ComboStun == true`)
+                if myChar:GetAttribute("ComboStun") == true then
+                    addInspectorLog("WALL_LOCKED", "ComboStun=true detected! Releasing CFrame lock so animation plays.")
+                    break
+                end
+
+                local _, curEnemyRoot = findNearestEnemyRoot(20)
                 local standPos
                 local lookAtPos
 
-                if bestTP and bestTP.Parent then
-                    local dirTPToWood = Vector3.new(woodPos.X - bestTP.Position.X, 0, woodPos.Z - bestTP.Position.Z)
-                    dirTPToWood = (dirTPToWood.Magnitude > 0.05) and dirTPToWood.Unit or State.Root.CFrame.LookVector
-                    -- Stand right at TPPOINT facing Wood
-                    standPos = Vector3.new(bestTP.Position.X, bestTP.Position.Y + 2.2, bestTP.Position.Z) - (dirTPToWood * 1.2)
-                    lookAtPos = Vector3.new(woodPos.X, standPos.Y, woodPos.Z)
+                if Config.WallComboMode == "GoldenLogRatio_4.91m" and bestTP and bestTP.Parent then
+                    -- Exact [860.84] log geometry:
+                    -- TPPOINT is ~3.4m from Wood center; we stand 1.51m further out from TPPOINT (total 4.91m from Wood center) looking straight through TPPOINT into Wood (Dot = 0.88+)
+                    local flatWood = Vector3.new(woodPos.X, bestTP.Position.Y, woodPos.Z)
+                    local dirWoodToTP = (bestTP.Position - flatWood)
+                    dirWoodToTP = (dirWoodToTP.Magnitude > 0.05) and dirWoodToTP.Unit or -State.Root.CFrame.LookVector
+
+                    standPos = flatWood + (dirWoodToTP * 4.91)
+                    lookAtPos = flatWood
+                elseif curEnemyRoot then
+                    -- Align behind enemy facing the nearest tree trunk
+                    local flatWood = Vector3.new(woodPos.X, curEnemyRoot.Position.Y, woodPos.Z)
+                    local dirWoodToEnemy = (curEnemyRoot.Position - flatWood)
+                    dirWoodToEnemy = (dirWoodToEnemy.Magnitude > 0.05) and dirWoodToEnemy.Unit or -State.Root.CFrame.LookVector
+                    standPos = curEnemyRoot.Position + (dirWoodToEnemy * 1.51)
+                    lookAtPos = curEnemyRoot.Position
                 else
-                    local dirToWood = Vector3.new(woodPos.X - State.Root.Position.X, 0, woodPos.Z - State.Root.Position.Z)
-                    dirToWood = (dirToWood.Magnitude > 0.1) and dirToWood.Unit or State.Root.CFrame.LookVector
-                    standPos = Vector3.new(woodPos.X, bundle.BaseWood.Position.Y, woodPos.Z) - (dirToWood * 3.8)
-                    lookAtPos = Vector3.new(woodPos.X, standPos.Y, woodPos.Z)
+                    local flatWood = Vector3.new(woodPos.X, State.Root.Position.Y, woodPos.Z)
+                    local dirWoodToMe = (State.Root.Position - flatWood)
+                    dirWoodToMe = (dirWoodToMe.Magnitude > 0.05) and dirWoodToMe.Unit or -State.Root.CFrame.LookVector
+                    standPos = flatWood + (dirWoodToMe * 4.91)
+                    lookAtPos = flatWood
                 end
 
                 State.Root.CFrame = CFrame.lookAt(standPos, lookAtPos)
                 State.Root.AssemblyLinearVelocity = Vector3.zero
 
-                if isCharacterStillInSkill(myChar) and (tick() - startTick) > 0.08 then
-                    addInspectorLog("SUCCESS", "Single-Hit Wall Combo locked in by Server!")
-                    break
-                end
-
                 RunService.Heartbeat:Wait()
             end
 
-            if Config.WallComboMode == "BothSnapAndPull" then
-                restoreActiveWallTree()
-            end
-            if State.Root and not isCharacterStillInSkill(myChar) then
+            -- Only snap back if Wall Combo did NOT trigger (`ComboStun ~= true`)
+            if State.Root and myChar:GetAttribute("ComboStun") ~= true and not isCharacterStillInSkill(myChar) then
                 forceFullCharacterAndCameraResync(preSnapCF)
             end
             State.WallComboPulseRunning = false
@@ -778,33 +725,66 @@ local function triggerWallComboBehindEnemy(duration)
     end
 end
 
--- // DEEP VOID SUSPENSION
+-- // ==========================================================================
+-- // FIXED 2,000 (2K) TELEPORT VOID WITH SOLID WHITE PLATFORM
+-- // ==========================================================================
+local function ensureWhiteVoidPlatform(centerPos)
+    if State.WhiteVoidPlatform and State.WhiteVoidPlatform.Parent then
+        State.WhiteVoidPlatform.CFrame = CFrame.new(centerPos.X, centerPos.Y - 2, centerPos.Z)
+        return State.WhiteVoidPlatform
+    end
+
+    local plat = Instance.new("Part")
+    plat.Name = State.PlatformToken
+    plat.Archivable = false
+    plat.Size = Vector3.new(500, 4, 500)
+    plat.Anchored = true
+    plat.CanCollide = true
+    plat.Material = Enum.Material.SmoothPlastic
+    plat.Color = Color3.fromRGB(255, 255, 255) -- Pure White Platform
+    plat.Transparency = 0
+    plat.CFrame = CFrame.new(centerPos.X, centerPos.Y - 2, centerPos.Z)
+    plat.Parent = Workspace.Terrain
+
+    State.WhiteVoidPlatform = plat
+    return plat
+end
+
+local function destroyWhiteVoidPlatform()
+    if State.WhiteVoidPlatform then
+        pcall(function() State.WhiteVoidPlatform:Destroy() end)
+        State.WhiteVoidPlatform = nil
+    end
+end
+
 local function teleportToDeepVoid()
     local myRoot = State.Root
     if not myRoot then return end
 
-    Config.DeepVoidActive = true
-    local targetY = getSafeVoidFloorY()
+    scanVoidDamageZone()
 
-    if myRoot.Position.Y > -80 then
+    if not Config.DeepVoidActive and myRoot.Position.Y > -50 and myRoot.Position.Magnitude < 1200 then
         State.PreDeepVoidCFrame = myRoot.CFrame
     end
 
-    local targetPos = Vector3.new(myRoot.Position.X, targetY + 3.5, myRoot.Position.Z)
-    State.DeepVoidStandCF = CFrame.new(targetPos)
+    Config.DeepVoidActive = true
+    local refOrigin = (State.PreDeepVoidCFrame and State.PreDeepVoidCFrame.Position) or Vector3.new(0, 50, 0)
+    local platformSurfacePos = get2kWhitePlatformPosition(refOrigin)
+    State.DeepVoidCenterPos = platformSurfacePos
 
-    task.spawn(function()
-        for _ = 1, 18 do
-            if not Config.DeepVoidActive or not State.Root then break end
-            State.Root.CFrame = State.DeepVoidStandCF
-            State.Root.AssemblyLinearVelocity = Vector3.zero
-            RunService.Heartbeat:Wait()
-        end
-    end)
+    ensureWhiteVoidPlatform(platformSurfacePos)
+    local standCF = CFrame.new(platformSurfacePos + Vector3.new(0, 3.2, 0))
+
+    for _ = 1, 8 do
+        forceFullCharacterAndCameraResync(standCF)
+    end
 end
 
 local function teleportBackFromDeepVoid()
     Config.DeepVoidActive = false
+    State.DeepVoidCenterPos = nil
+    destroyWhiteVoidPlatform()
+
     local returnCF = State.PreDeepVoidCFrame or State.LastSafeCFrame or CFrame.new(0, 65, 0)
     for _ = 1, 12 do
         forceFullCharacterAndCameraResync(returnCF + Vector3.new(0, 4, 0))
@@ -1065,7 +1045,9 @@ local function getConfirmedCarriedEnemies()
     return grabbedList, grabbedMap
 end
 
--- // INSTANT 2900-STUD VOID KILL + GUARANTEED VISUAL/CAMERA RESYNC
+-- // ==========================================================================
+-- // VOID DAMAGE PLANE SUBMERSION KILL (DIPS ENEMY BELOW VOID KILL Y WHILE ANTI-VOID PROTECTS YOU)
+-- // ==========================================================================
 local function executeVoidKillTrip()
     if not Config.ScriptRunning or State.VoidKillActive or not Config.AutoVoidKill then return end
     local myChar = LocalPlayer.Character or State.Char
@@ -1083,8 +1065,8 @@ local function executeVoidKillTrip()
     end
 
     task.spawn(function()
-        local destroyY = getRawDestroyHeight()
-        local safeEdgeY = getKillZoneVoidY()
+        local voidDamageY = scanVoidDamageZone()
+        local safeHoverY = getPlayerSafeVoidKillHoverY()
         local originPos = State.VoidReturnCFrame.Position
 
         local flatDir = Vector3.new(originPos.X, 0, originPos.Z)
@@ -1097,7 +1079,9 @@ local function executeVoidKillTrip()
         local farDist = Config.VoidFarHorizontalDist or 2900
         local voidXZ = Vector3.new(originPos.X, 0, originPos.Z) + (flatDir * farDist)
 
-        local instantDropCF = CFrame.new(voidXZ.X, safeEdgeY, voidXZ.Z) * CFrame.Angles(math.rad(-90), 0, 0)
+        -- Instant 0-Delay Teleport right above the Void Damage Plane (+2.0 studs) while pitched -90 deg straight down
+        -- Your HumanoidRootPart stays at `voidDamageY + 2.0` (protected by Anti-Void), while the grabbed enemy welded in front of you is submerged at `voidDamageY - 3.8`!
+        local instantDropCF = CFrame.new(voidXZ.X, safeHoverY, voidXZ.Z) * CFrame.Angles(math.rad(-90), 0, 0)
         State.VoidDropTargetCF = instantDropCF
         if State.Root then
             State.Root.CFrame = instantDropCF
@@ -1106,7 +1090,7 @@ local function executeVoidKillTrip()
         end
 
         local dropStartTick = tick()
-        local minStayInVoid = 0.28
+        local minStayInVoid = 0.25
 
         while Config.ScriptRunning and Config.AutoVoidKill and State.Root and State.Hum and State.Hum.Health > 0 do
             local elapsed = tick() - dropStartTick
@@ -1114,8 +1098,10 @@ local function executeVoidKillTrip()
                 break
             end
 
-            local microDip = math.sin(elapsed * 35) * 0.65
-            local clampedY = math.max(destroyY + 1.35, safeEdgeY + microDip)
+            -- Keep LocalPlayer strictly above `voidDamageY + 1.4` so Anti-Void guarantees you never die,
+            -- while micro-pulsing the pitch/depth so the victim's body crosses the Void Damage Plane (`voidDamageY`)
+            local microDip = math.sin(elapsed * 40) * 0.55
+            local clampedY = math.max(voidDamageY + 1.4, safeHoverY + microDip)
             local activeCF = CFrame.new(voidXZ.X, clampedY, voidXZ.Z) * CFrame.Angles(math.rad(-90), 0, 0)
             State.VoidDropTargetCF = activeCF
 
@@ -1468,7 +1454,7 @@ local function updateObjectESP()
 
     local seen = {}
     for _, inst in ipairs(Workspace:GetDescendants()) do
-        if inst:IsA("BasePart") and inst ~= Workspace.Terrain and inst.Name ~= "Baseplate" and not inst:IsDescendantOf(Camera) then
+        if inst:IsA("BasePart") and inst ~= Workspace.Terrain and inst.Name ~= "Baseplate" and inst ~= State.WhiteVoidPlatform and not inst:IsDescendantOf(Camera) then
             if (not myChar or not inst:IsDescendantOf(myChar)) and (not liveFolder or not inst:IsDescendantOf(liveFolder)) then
                 local dist = (inst.Position - myRoot.Position).Magnitude
                 if dist <= Config.ObjectESPRange and (inst.Name == "TPPOINT" or (inst.Size.Magnitude >= 3.5 and inst.Size.Magnitude <= 120)) then
@@ -1521,7 +1507,7 @@ local function copyNearestMapObjectInfo(btn)
 
     local candidates = {}
     for _, inst in ipairs(Workspace:GetDescendants()) do
-        if inst:IsA("BasePart") and inst ~= Workspace.Terrain and not inst:IsDescendantOf(Camera) then
+        if inst:IsA("BasePart") and inst ~= Workspace.Terrain and inst ~= State.WhiteVoidPlatform and not inst:IsDescendantOf(Camera) then
             if (not myChar or not inst:IsDescendantOf(myChar)) and (not liveFolder or not inst:IsDescendantOf(liveFolder)) then
                 local dist = (inst.Position - myRoot.Position).Magnitude
                 if dist <= 45 and inst.Size.Magnitude <= 140 then
@@ -1631,13 +1617,21 @@ local function getPlanarMoveVector(hum)
     return Vector3.zero
 end
 
--- // REAL ANTI-STUN ENGINE
+-- // REAL ANTI-STUN ENGINE (Calibrated with HBG Attributes: `Stun`, `ComboStun`, `Hurt1..Hurt4`)
 local HitstunAnimKeywords = {
     "stun", "hit", "hurt", "stagger", "ragdoll", "knock", "down", "slam", "grabbed", "freeze", "paralyz"
 }
 
 local function isCharCurrentlyStunned(char, hum)
     if not char or not hum then return false end
+    -- Note: When WE are performing a Wall Combo (`ComboStun == true` and `IFrame == true`), do NOT treat that as enemy stun!
+    if char:GetAttribute("ComboStun") == true and char:GetAttribute("IFrame") == true then
+        return false
+    end
+    local stunAttr = char:GetAttribute("Stun")
+    if typeof(stunAttr) == "number" and stunAttr > 0 then
+        return true
+    end
     if hum.WalkSpeed < 14 or hum.PlatformStand or hum.Sit then
         return true
     end
@@ -1649,7 +1643,6 @@ local function isCharCurrentlyStunned(char, hum)
         return true
     end
     if char:GetAttribute("Stunned") == true
-        or char:GetAttribute("Stun") == true
         or char:GetAttribute("Ragdoll") == true
         or char:GetAttribute("Hitstun") == true
         or char:GetAttribute("NoMove") == true then
@@ -1673,6 +1666,9 @@ end
 
 local function enforceRealAntiStun(char, root, hum, dt)
     if not char or not root or not hum then return end
+    if char:GetAttribute("ComboStun") == true and char:GetAttribute("IFrame") == true then
+        return
+    end
 
     if not isCharacterStillInSkill(char) then
         if root.Anchored then root.Anchored = false end
@@ -1768,6 +1764,7 @@ local function bindCharacter(char)
             State.OrigRootJointC0 = motor.C0
             State.OrigRootJointC1 = motor.C1
         end
+        scanVoidDamageZone()
     end)
 
     task.delay(0.8, function()
@@ -1810,15 +1807,7 @@ local function bindCharacter(char)
         end
 
         if Config.WallInspectorEnabled then
-            local extra = ""
-            if inst:IsA("Weld") or inst:IsA("WeldConstraint") or inst:IsA("Motor6D") or inst:IsA("JointInstance") then
-                local p0 = inst.Part0 and inst.Part0:GetFullName() or "nil"
-                local p1 = inst.Part1 and inst.Part1:GetFullName() or "nil"
-                extra = string.format(" (Part0=%s, Part1=%s)", p0, p1)
-            elseif inst:IsA("ObjectValue") or inst:IsA("StringValue") or inst:IsA("BoolValue") or inst:IsA("NumberValue") then
-                extra = " (Value=" .. tostring(inst.Value) .. ")"
-            end
-            addInspectorLog("MY_ADD", string.format("%s [%s] in %s%s", inst.Name, inst.ClassName, inst.Parent and inst.Parent.Name or "?", extra))
+            addInspectorLog("MY_ADD", string.format("%s [%s] in %s", inst.Name, inst.ClassName, inst.Parent and inst.Parent.Name or "?"))
         end
 
         if Config.AutoVoidKill and not State.VoidKillActive and State.ActiveSpecialSkill == nil then
@@ -1935,9 +1924,7 @@ pcall(function()
 end)
 ScreenGui.Parent = getGuiParent()
 
--- // ==========================================================================
--- // FLOATING ON-SCREEN LIVE WALL COMBO INSPECTOR WINDOW (VISIBLE IMMEDIATELY!)
--- // ==========================================================================
+-- // FLOATING ON-SCREEN LIVE WALL COMBO INSPECTOR WINDOW
 local InspectorFloatWin = Instance.new("Frame")
 InspectorFloatWin.Name = "WallInspectorFloating"
 InspectorFloatWin.Size = UDim2.new(0, 390, 0, 225)
@@ -2035,7 +2022,7 @@ InspTextLbl.Size = UDim2.new(1, -10, 0, 0)
 InspTextLbl.Position = UDim2.new(0, 5, 0, 4)
 InspTextLbl.AutomaticSize = Enum.AutomaticSize.Y
 InspTextLbl.BackgroundTransparency = 1
-InspTextLbl.Text = "Inspector Ready! Stand next to a Tree and punch 1 hit (M1) to record how HBG triggers Wall Combo."
+InspTextLbl.Text = "Inspector Ready."
 InspTextLbl.TextColor3 = Color3.fromRGB(185, 245, 195)
 InspTextLbl.Font = Enum.Font.Code
 InspTextLbl.TextSize = 10
@@ -2308,7 +2295,7 @@ local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 290, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v33 LiveWallLog"
+SubTitle.Text = "Heroes Battlegrounds v34 VoidPlane+2kWhite"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
@@ -2390,6 +2377,7 @@ local function unloadEntireScript()
 
     pcall(stopMovableGhostDecoy)
     pcall(restoreActiveWallTree)
+    pcall(destroyWhiteVoidPlatform)
     pcall(clearObjectESP)
     pcall(cleanupInvisible)
 
@@ -2451,7 +2439,7 @@ local SectionHeader = Instance.new("TextLabel")
 SectionHeader.Size = UDim2.new(1, 0, 0, 32)
 SectionHeader.Position = UDim2.new(0, 4, 0, 0)
 SectionHeader.BackgroundTransparency = 1
-SectionHeader.Text = "Wall Log"
+SectionHeader.Text = "Void Kill"
 SectionHeader.TextColor3 = Color3.fromRGB(245, 247, 252)
 SectionHeader.Font = Enum.Font.GothamBold
 SectionHeader.TextSize = 20
@@ -3139,12 +3127,12 @@ local function addSlider(parent, label, minVal, maxVal, defaultVal, callback)
     end))
 end
 
--- // CREATE SIDEBAR TABS (FIRST TAB IS "Wall Log" SO YOU SEE IT RIGHT AWAY!)
-local TabWallLog = createTab("Wall Log", "🔍")
-local TabCombat  = createTab("Combat", "⚔")
+-- // CREATE SIDEBAR TABS
 local TabVoid    = createTab("Void Kill", "🌀")
+local TabCombat  = createTab("Combat", "⚔")
 local TabTarget  = createTab("AutoFarm", "◇")
 local TabMove    = createTab("LocalPlayer", "👤")
+local TabWallLog = createTab("Wall Log", "🔍")
 local TabServer  = createTab("Server", "🌐")
 local TabVisual  = createTab("Settings", "⚙")
 
@@ -3205,61 +3193,96 @@ local currentTargetList = getPlayerNames()
 Config.SelectedPlayer = currentTargetList[1]
 
 -- // ==========================================================================
--- // 0. POPULATE "Wall Log" TAB (FIRST TAB IN MENU!)
+-- // 1. POPULATE VOID KILL TAB (WITH VOID DAMAGE PLANE DETECTOR & FIXED 2K WHITE PLATFORM)
 -- // ==========================================================================
-local InspInfoCard = Instance.new("Frame")
-InspInfoCard.Size = UDim2.new(1, 0, 0, 44)
-InspInfoCard.BackgroundColor3 = Color3.fromRGB(36, 32, 18)
-InspInfoCard.BackgroundTransparency = 0.15
-InspInfoCard.BorderSizePixel = 0
-InspInfoCard.Parent = TabWallLog
-Instance.new("UICorner", InspInfoCard).CornerRadius = UDim.new(0, 6)
+local VoidPlaneCard = Instance.new("Frame")
+VoidPlaneCard.Size = UDim2.new(1, 0, 0, 44)
+VoidPlaneCard.BackgroundColor3 = Color3.fromRGB(36, 24, 30)
+VoidPlaneCard.BackgroundTransparency = 0.15
+VoidPlaneCard.BorderSizePixel = 0
+VoidPlaneCard.Parent = TabVoid
+Instance.new("UICorner", VoidPlaneCard).CornerRadius = UDim.new(0, 6)
 
-local InspInfoStroke = Instance.new("UIStroke", InspInfoCard)
-InspInfoStroke.Color = Color3.fromRGB(255, 195, 65)
-InspInfoStroke.Thickness = 1
+local VoidPlaneStroke = Instance.new("UIStroke", VoidPlaneCard)
+VoidPlaneStroke.Color = Color3.fromRGB(255, 95, 115)
+VoidPlaneStroke.Transparency = 0.3
+VoidPlaneStroke.Thickness = 1
 
-State.InspectorTabCountLabel = Instance.new("TextLabel")
-State.InspectorTabCountLabel.Size = UDim2.new(1, -20, 1, 0)
-State.InspectorTabCountLabel.Position = UDim2.new(0, 10, 0, 0)
-State.InspectorTabCountLabel.BackgroundTransparency = 1
-State.InspectorTabCountLabel.Text = "Recorded Events: 0 (Stand near a Tree & punch 1 hit!)"
-State.InspectorTabCountLabel.TextColor3 = Color3.fromRGB(255, 225, 115)
-State.InspectorTabCountLabel.Font = Enum.Font.GothamBold
-State.InspectorTabCountLabel.TextSize = 11
-State.InspectorTabCountLabel.TextXAlignment = Enum.TextXAlignment.Left
-State.InspectorTabCountLabel.Parent = InspInfoCard
+State.VoidInfoLabel = Instance.new("TextLabel")
+State.VoidInfoLabel.Size = UDim2.new(1, -20, 1, -6)
+State.VoidInfoLabel.Position = UDim2.new(0, 10, 0, 3)
+State.VoidInfoLabel.BackgroundTransparency = 1
+State.VoidInfoLabel.Text = "Scanning Void Damage Plane..."
+State.VoidInfoLabel.TextColor3 = Color3.fromRGB(255, 195, 205)
+State.VoidInfoLabel.Font = Enum.Font.GothamBold
+State.VoidInfoLabel.TextSize = 10
+State.VoidInfoLabel.TextXAlignment = Enum.TextXAlignment.Left
+State.VoidInfoLabel.Parent = VoidPlaneCard
 
-addFeatureToggle(TabWallLog, "WallInspector", "Enable Wall Combo Inspector Recording", "WLOG", true, function(v)
-    Config.WallInspectorEnabled = v
-end)
+local SlotPreviewCard = Instance.new("Frame")
+SlotPreviewCard.Size = UDim2.new(1, 0, 0, 44)
+SlotPreviewCard.BackgroundColor3 = Color3.fromRGB(28, 32, 42)
+SlotPreviewCard.BackgroundTransparency = 0.15
+SlotPreviewCard.BorderSizePixel = 0
+SlotPreviewCard.Parent = TabVoid
+Instance.new("UICorner", SlotPreviewCard).CornerRadius = UDim.new(0, 6)
 
-addFeatureToggle(TabWallLog, "ShowFloatingInspector", "Show Floating On-Screen Log Window", "WWIN", true, function(v)
-    Config.ShowFloatingInspector = v
-    InspectorFloatWin.Visible = v
-end)
+local SlotPreviewStroke = Instance.new("UIStroke", SlotPreviewCard)
+SlotPreviewStroke.Color = Color3.fromRGB(65, 165, 245)
+SlotPreviewStroke.Transparency = 0.35
+SlotPreviewStroke.Thickness = 1
 
+State.SlotStatusLabel = Instance.new("TextLabel")
+State.SlotStatusLabel.Size = UDim2.new(1, -20, 1, -8)
+State.SlotStatusLabel.Position = UDim2.new(0, 10, 0, 4)
+State.SlotStatusLabel.BackgroundTransparency = 1
+State.SlotStatusLabel.Text = "Slot 1: Unscanned  |  Slot 2: Unscanned\nSlot 3: Unscanned  |  Slot 4: Unscanned"
+State.SlotStatusLabel.TextColor3 = Color3.fromRGB(165, 225, 255)
+State.SlotStatusLabel.Font = Enum.Font.GothamSemibold
+State.SlotStatusLabel.TextSize = 11
+State.SlotStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+State.SlotStatusLabel.Parent = SlotPreviewCard
+
+-- Fixed 2,000 (2k) Teleport Void with White Platform (No slider to change it!)
 addDualButtons(
-    TabWallLog,
-    "Copy Full Wall Combo Log", Color3.fromRGB(45, 145, 85), function(btn)
-        copyFullInspectorReport(btn)
-    end,
-    "Clear Recorded Log", Color3.fromRGB(135, 55, 55), function()
-        State.InspectorLogs = {}
-        refreshInspectorDisplay()
-    end
+    TabVoid,
+    "TP Void (Fixed 2k + White Floor)", Color3.fromRGB(45, 115, 195), function() teleportToDeepVoid() end,
+    "TP Back (Full Resync)", Color3.fromRGB(55, 135, 95), function() teleportBackFromDeepVoid() end
 )
 
-addButton(TabWallLog, "Snapshot Nearest Tree & TPPOINT Now", Color3.fromRGB(55, 110, 185), function(btn)
-    snapshotFullWallComboState("ManualTreeSnapshot")
-    btn.Text = "Snapshot Added To Log!"
-    task.delay(1.2, function()
-        if btn and btn.Parent then btn.Text = "Snapshot Nearest Tree & TPPOINT Now" end
+addFeatureToggle(TabVoid, "AutoVoidKill", "Auto Void Kill (Submerge Enemy Into Void Damage Y)", "VOIDK", false, function(v)
+    Config.AutoVoidKill = v
+    if not v then
+        State.VoidKillActive = false
+        State.VoidDropTargetCF = nil
+        State.ActiveSpecialSkill = nil
+        if State.LastSafeCFrame then
+            forceFullCharacterAndCameraResync(State.LastSafeCFrame + Vector3.new(0, 3, 0))
+        end
+    else
+        scanVoidDamageZone()
+        scanHotbarSkills1To4()
+    end
+end)
+
+addButton(TabVoid, "Rescan Void Damage Zone Now", Color3.fromRGB(135, 55, 75), function(btn)
+    local y = scanVoidDamageZone()
+    btn.Text = string.format("Detected Void Kill Plane: Y = %.1f", y)
+    task.delay(1.8, function()
+        if btn and btn.Parent then btn.Text = "Rescan Void Damage Zone Now" end
     end)
 end)
 
--- // 1. POPULATE COMBAT TAB
-addFeatureToggle(TabCombat, "WallCombo", "Auto Wall Combo (Single 1-Hit M1 Trigger)", "WALLC", false, function(v)
+local MineMultiDropdown = addMultiDropdown(TabVoid, "Mine Multi Targets", currentTargetList, function(selectedMap)
+    Config.MineSelectedTargets = selectedMap
+end)
+
+addSlider(TabVoid, "Void Hold Duration", 0.35, 3.00, 1.45, function(v)
+    Config.VoidMaxHoldTime = v
+end)
+
+-- // 2. POPULATE COMBAT TAB
+addFeatureToggle(TabCombat, "WallCombo", "Auto Wall Combo (Log-Calibrated 4.91m/1.51m)", "WALLC", false, function(v)
     Config.WallComboEnabled = v
     if v then
         scanRealTreeWoods()
@@ -3268,17 +3291,13 @@ addFeatureToggle(TabCombat, "WallCombo", "Auto Wall Combo (Single 1-Hit M1 Trigg
     end
 end)
 
-addDropdown(TabCombat, "Wall Combo Mode", {"SingleHitSnapToTPPOINT", "PullTreeAndTPPOINTToMe", "BothSnapAndPull"}, 1, function(mode)
+addDropdown(TabCombat, "Wall Combo Mode", {"GoldenLogRatio_4.91m", "BehindEnemyToTree"}, 1, function(mode)
     Config.WallComboMode = mode
     restoreActiveWallTree()
 end)
 
-addSlider(TabCombat, "Tree Behind Offset", 2.0, 8.0, 3.6, function(v)
-    Config.WallBehindEnemyOffset = v
-end)
-
 addButton(TabCombat, "Trigger Wall Combo Now (Key: V)", Color3.fromRGB(45, 130, 85), function()
-    triggerWallComboBehindEnemy(0.50)
+    triggerWallComboBehindEnemy(0.45)
 end)
 
 addFeatureToggle(TabCombat, "ObjectESP", "Tree And Map Object ESP", "OBJESP", false, function(v)
@@ -3313,7 +3332,7 @@ addSlider(TabCombat, "Anti Skill Range", 8, 35, 16, function(v)
     Config.AntiSkillRange = v
 end)
 
-addFeatureToggle(TabCombat, "AntiStun", "Real Anti Stun (Stop HitAnim + Anti-Knockback)", "ASTUN", false, function(v)
+addFeatureToggle(TabCombat, "AntiStun", "Real Anti Stun (Stop Hurt1-4 + Anti-Knockback)", "ASTUN", false, function(v)
     Config.AntiStunEnabled = v
 end)
 
@@ -3325,67 +3344,6 @@ end)
 
 addDropdown(TabCombat, "Aimbot Part", {"Head", "HumanoidRootPart"}, 1, function(part)
     Config.AimPart = part
-end)
-
--- // 2. POPULATE VOID KILL TAB
-local SlotPreviewCard = Instance.new("Frame")
-SlotPreviewCard.Size = UDim2.new(1, 0, 0, 48)
-SlotPreviewCard.BackgroundColor3 = Color3.fromRGB(28, 32, 42)
-SlotPreviewCard.BackgroundTransparency = 0.15
-SlotPreviewCard.BorderSizePixel = 0
-SlotPreviewCard.Parent = TabVoid
-Instance.new("UICorner", SlotPreviewCard).CornerRadius = UDim.new(0, 6)
-
-local SlotPreviewStroke = Instance.new("UIStroke", SlotPreviewCard)
-SlotPreviewStroke.Color = Color3.fromRGB(65, 165, 245)
-SlotPreviewStroke.Transparency = 0.35
-SlotPreviewStroke.Thickness = 1
-
-State.SlotStatusLabel = Instance.new("TextLabel")
-State.SlotStatusLabel.Size = UDim2.new(1, -20, 1, -8)
-State.SlotStatusLabel.Position = UDim2.new(0, 10, 0, 4)
-State.SlotStatusLabel.BackgroundTransparency = 1
-State.SlotStatusLabel.Text = "Slot 1: Unscanned  |  Slot 2: Unscanned\nSlot 3: Unscanned  |  Slot 4: Unscanned"
-State.SlotStatusLabel.TextColor3 = Color3.fromRGB(165, 225, 255)
-State.SlotStatusLabel.Font = Enum.Font.GothamSemibold
-State.SlotStatusLabel.TextSize = 11
-State.SlotStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
-State.SlotStatusLabel.Parent = SlotPreviewCard
-
-addDualButtons(
-    TabVoid,
-    "Teleport Void", Color3.fromRGB(45, 115, 195), function() teleportToDeepVoid() end,
-    "Teleport Back (Resync)", Color3.fromRGB(55, 135, 95), function() teleportBackFromDeepVoid() end
-)
-
-addFeatureToggle(TabVoid, "AutoVoidKill", "Auto Void Kill (Instant 2,900 Studs + Resync)", "VOIDK", false, function(v)
-    Config.AutoVoidKill = v
-    if not v then
-        State.VoidKillActive = false
-        State.VoidDropTargetCF = nil
-        State.ActiveSpecialSkill = nil
-        if State.LastSafeCFrame then
-            forceFullCharacterAndCameraResync(State.LastSafeCFrame + Vector3.new(0, 3, 0))
-        end
-    else
-        scanHotbarSkills1To4()
-    end
-end)
-
-addSlider(TabVoid, "Void Far Distance (Studs)", 0, 10000, 2900, function(v)
-    Config.VoidFarHorizontalDist = v
-end)
-
-addSlider(TabVoid, "Void Death-Line Margin", 1.2, 14.0, 2.2, function(v)
-    Config.VoidEdgeOffset = v
-end)
-
-local MineMultiDropdown = addMultiDropdown(TabVoid, "Mine Multi Targets", currentTargetList, function(selectedMap)
-    Config.MineSelectedTargets = selectedMap
-end)
-
-addSlider(TabVoid, "Void Hold Duration", 0.35, 3.00, 1.45, function(v)
-    Config.VoidMaxHoldTime = v
 end)
 
 -- // 3. POPULATE AUTOFARM TAB
@@ -3437,7 +3395,7 @@ addFeatureToggle(TabTarget, "TeleportPlayer", "Instant Teleport To Player", "TP"
     end
 end)
 
--- // 4. POPULATE LOCALPLAYER TAB (ABSOLUTE ZERO-DROP FLY LOCKED AT EXACT CFrame)
+-- // 4. POPULATE LOCALPLAYER TAB
 addFeatureToggle(TabMove, "Fly", "Loop Fly (Absolute Zero-Drop Hover)", "FLY", false, function(v)
     Config.FlyEnabled = v
     if v and State.Root then
@@ -3499,7 +3457,47 @@ addSlider(TabMove, "JumpPower", 50, 350, 100, function(v)
     Config.JumpPower = v
 end)
 
--- // 5. POPULATE SERVER TAB
+-- // 5. POPULATE WALL LOG TAB
+local InspInfoCard = Instance.new("Frame")
+InspInfoCard.Size = UDim2.new(1, 0, 0, 44)
+InspInfoCard.BackgroundColor3 = Color3.fromRGB(36, 32, 18)
+InspInfoCard.BackgroundTransparency = 0.15
+InspInfoCard.BorderSizePixel = 0
+InspInfoCard.Parent = TabWallLog
+Instance.new("UICorner", InspInfoCard).CornerRadius = UDim.new(0, 6)
+
+State.InspectorTabCountLabel = Instance.new("TextLabel")
+State.InspectorTabCountLabel.Size = UDim2.new(1, -20, 1, 0)
+State.InspectorTabCountLabel.Position = UDim2.new(0, 10, 0, 0)
+State.InspectorTabCountLabel.BackgroundTransparency = 1
+State.InspectorTabCountLabel.Text = "Recorded Events: 0"
+State.InspectorTabCountLabel.TextColor3 = Color3.fromRGB(255, 225, 115)
+State.InspectorTabCountLabel.Font = Enum.Font.GothamBold
+State.InspectorTabCountLabel.TextSize = 11
+State.InspectorTabCountLabel.TextXAlignment = Enum.TextXAlignment.Left
+State.InspectorTabCountLabel.Parent = InspInfoCard
+
+addFeatureToggle(TabWallLog, "WallInspector", "Enable Wall Combo Inspector Recording", "WLOG", false, function(v)
+    Config.WallInspectorEnabled = v
+end)
+
+addFeatureToggle(TabWallLog, "ShowFloatingInspector", "Show Floating On-Screen Log Window", "WWIN", false, function(v)
+    Config.ShowFloatingInspector = v
+    InspectorFloatWin.Visible = v
+end)
+
+addDualButtons(
+    TabWallLog,
+    "Copy Full Wall Combo Log", Color3.fromRGB(45, 145, 85), function(btn)
+        copyFullInspectorReport(btn)
+    end,
+    "Clear Recorded Log", Color3.fromRGB(135, 55, 55), function()
+        State.InspectorLogs = {}
+        refreshInspectorDisplay()
+    end
+)
+
+-- // 6. POPULATE SERVER TAB
 addButton(TabServer, "Rejoin Server", Color3.fromRGB(45, 110, 185), function()
     rejoinCurrentServer()
 end)
@@ -3516,7 +3514,7 @@ addButton(TabServer, "Join Job ID", Color3.fromRGB(65, 95, 165), function(btn)
     joinServerByJobId(btn)
 end)
 
--- // 6. POPULATE SETTINGS TAB
+-- // 7. POPULATE SETTINGS TAB
 addFeatureToggle(TabVisual, "ESP", "Player ESP", "ESP", false, function(v)
     Config.ESPEnabled = v
     if not v then
@@ -3541,6 +3539,7 @@ Config.AntiVoidEnabled = true
 Config.AutoVoidKill = false
 Config.UIInitialized = true
 task.defer(scanRealTreeWoods)
+task.defer(scanVoidDamageZone)
 
 table.insert(State.Connections, Players.PlayerAdded:Connect(function()
     task.wait(0.2)
@@ -3625,7 +3624,7 @@ local function getFlightDirection(hum)
     if UserInputService:IsKeyDown(Enum.KeyCode.Space) then moveDir = moveDir + Vector3.new(0, 1, 0) end
     if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then moveDir = moveDir - Vector3.new(0, 1, 0) end
 
-    if moveDir.Magnitude == 0 and hum and hum.MoveDirection.Magnitude > 0 then
+    if moveDir.Magnitude == 0 and hum.MoveDirection.Magnitude > 0 then
         local flatLook = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z)
         if flatLook.Magnitude > 0.01 then
             flatLook = flatLook.Unit
@@ -3642,24 +3641,32 @@ local function getFlightDirection(hum)
     return Vector3.zero
 end
 
--- // STEPPED LOOP (Runs before physics step so gravity is 100% cancelled in Fly Mode!)
+-- // STEPPED LOOP
 table.insert(State.Connections, RunService.Stepped:Connect(function(_, dt)
     if not Config.ScriptRunning then return end
-    local targetY = getSafeVoidFloorY()
+    local voidDamageY = State.DetectedVoidDamageY or -500
 
     if State.VoidKillActive and State.VoidDropTargetCF and State.Root then
-        State.Root.CFrame = State.VoidDropTargetCF
+        -- Guarantee our own Root never drops below `voidDamageY + 1.4` while holding the victim below `voidDamageY`
+        local pos = State.VoidDropTargetCF.Position
+        local safeY = math.max(pos.Y, voidDamageY + 1.4)
+        State.Root.CFrame = CFrame.new(pos.X, safeY, pos.Z) * State.VoidDropTargetCF.Rotation
         State.Root.AssemblyLinearVelocity = Vector3.zero
         State.Root.AssemblyAngularVelocity = Vector3.zero
     elseif State.AntiSkillEvading and State.DecoyCFrame and State.Root then
-        local voidPos = Vector3.new(State.DecoyCFrame.Position.X, targetY + 3.5, State.DecoyCFrame.Position.Z)
+        local safeY = voidDamageY + 35
+        local voidPos = Vector3.new(State.DecoyCFrame.Position.X, safeY, State.DecoyCFrame.Position.Z)
         State.Root.CFrame = CFrame.new(voidPos) * State.DecoyCFrame.Rotation
         State.Root.AssemblyLinearVelocity = Vector3.zero
-    elseif Config.DeepVoidActive and State.Root then
-        State.Root.CFrame = CFrame.new(State.Root.Position.X, targetY + 3.5, State.Root.Position.Z) * State.Root.CFrame.Rotation
-        State.Root.AssemblyLinearVelocity = Vector3.new(State.Root.AssemblyLinearVelocity.X, 0, State.Root.AssemblyLinearVelocity.Z)
+    elseif Config.DeepVoidActive and State.Root and State.DeepVoidCenterPos then
+        -- Keep the White Platform centered below us at 2k Void & prevent falling below its surface
+        local surfaceY = State.DeepVoidCenterPos.Y
+        ensureWhiteVoidPlatform(Vector3.new(State.Root.Position.X, surfaceY, State.Root.Position.Z))
+        if State.Root.Position.Y < (surfaceY + 2.8) then
+            State.Root.CFrame = CFrame.new(State.Root.Position.X, surfaceY + 3.0, State.Root.Position.Z) * State.Root.CFrame.Rotation
+            State.Root.AssemblyLinearVelocity = Vector3.new(State.Root.AssemblyLinearVelocity.X, math.max(0, State.Root.AssemblyLinearVelocity.Y), State.Root.AssemblyLinearVelocity.Z)
+        end
     elseif Config.FlyEnabled and not Config.AutoTargetEnabled and State.Root and State.Hum then
-        -- Pre-physics anchor lock so gravity NEVER pulls character down between frames
         if State.FlyLockedCFrame then
             State.Root.CFrame = CFrame.new(State.FlyLockedCFrame.Position) * State.Root.CFrame.Rotation
         end
@@ -3678,10 +3685,12 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
     local char = State.Char
     local root = State.Root
     local hum = State.Hum
-    local targetY = getSafeVoidFloorY()
+    local voidDamageY = State.DetectedVoidDamageY or -500
 
     if State.VoidKillActive and State.VoidDropTargetCF and root then
-        root.CFrame = State.VoidDropTargetCF
+        local pos = State.VoidDropTargetCF.Position
+        local safeY = math.max(pos.Y, voidDamageY + 1.4)
+        root.CFrame = CFrame.new(pos.X, safeY, pos.Z) * State.VoidDropTargetCF.Rotation
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
     elseif State.AntiSkillEvading and State.DecoyCFrame and root and hum then
@@ -3696,7 +3705,7 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
             State.DecoyCFrame = CFrame.new(newPos) * State.DecoyCFrame.Rotation
         end
 
-        local voidPos = Vector3.new(State.DecoyCFrame.Position.X, targetY + 3.5, State.DecoyCFrame.Position.Z)
+        local voidPos = Vector3.new(State.DecoyCFrame.Position.X, voidDamageY + 35, State.DecoyCFrame.Position.Z)
         root.CFrame = CFrame.new(voidPos) * State.DecoyCFrame.Rotation
         root.AssemblyLinearVelocity = Vector3.zero
     elseif Config.FlyEnabled and not Config.AutoTargetEnabled and root and hum then
@@ -3797,15 +3806,13 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
     local char = State.Char
     local root = State.Root
     local hum = State.Hum
-    local targetY = getSafeVoidFloorY()
+    local voidDamageY = State.DetectedVoidDamageY or -500
 
     if Config.WallInspectorEnabled then
         updateWatchedEnemyForInspector()
     end
 
     if root and hum and hum.Health > 0 then
-        local voidY = getRawDestroyHeight()
-
         if Config.AutoSkillEnabled and not State.VoidKillActive and not State.AntiSkillEvading and not isCharacterStillInSkill(char) and not UserInputService:GetFocusedTextBox() then
             local now = tick()
             if (now - State.LastAutoSkillTick) >= Config.AutoSkillDelay then
@@ -3844,7 +3851,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             if dangerNear and not State.AntiSkillEvading then
                 State.AntiSkillEvading = true
                 spawnMovableGhostDecoy(root.CFrame)
-                local voidPos = Vector3.new(State.DecoyCFrame.Position.X, targetY + 3.5, State.DecoyCFrame.Position.Z)
+                local voidPos = Vector3.new(State.DecoyCFrame.Position.X, voidDamageY + 35, State.DecoyCFrame.Position.Z)
                 root.CFrame = CFrame.new(voidPos) * State.DecoyCFrame.Rotation
                 root.AssemblyLinearVelocity = Vector3.zero
             elseif not dangerNear and State.AntiSkillEvading then
@@ -3856,12 +3863,20 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             stopMovableGhostDecoy()
         end
 
-        if not State.VoidKillActive and not State.AntiSkillEvading and not Config.DeepVoidActive then
+        -- Anti-Void Protection:
+        -- 1. When normal on the map, rescues you if you fall near `voidDamageY + 55`.
+        -- 2. Even DURING Void Kill, if anything ever pushes your Root below `voidDamageY + 1.2`, clamps you back above `voidDamageY + 2.0` so you NEVER die to Void Damage!
+        if State.VoidKillActive then
+            if root.Position.Y <= (voidDamageY + 1.2) then
+                root.CFrame = CFrame.new(root.Position.X, voidDamageY + 2.2, root.Position.Z) * root.CFrame.Rotation
+                root.AssemblyLinearVelocity = Vector3.zero
+            end
+        elseif not State.AntiSkillEvading and not Config.DeepVoidActive then
             if hum.FloorMaterial ~= Enum.Material.Air and root.Position.Y > -30 and root.Position.Magnitude < 1200 then
                 State.LastSafeCFrame = root.CFrame
             end
 
-            if Config.AntiVoidEnabled and root.Position.Y < (voidY + 65) then
+            if Config.AntiVoidEnabled and root.Position.Y < (voidDamageY + 55) then
                 local safeCF = (State.LastSafeCFrame and State.LastSafeCFrame.Position.Y > -20) and (State.LastSafeCFrame + Vector3.new(0, 5, 0)) or CFrame.new(0, 60, 0)
                 forceFullCharacterAndCameraResync(safeCF)
             end
@@ -3898,7 +3913,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             end
         end
 
-        -- Post-Heartbeat Fly Lock (Guarantees 0.00 vertical drop even when standing completely still in mid-air)
+        -- Absolute Zero-Drop Fly Lock
         if Config.FlyEnabled and not Config.AutoTargetEnabled and not State.VoidKillActive and not State.AntiSkillEvading then
             if State.FlyLockedCFrame then
                 root.CFrame = State.FlyLockedCFrame
@@ -3932,7 +3947,6 @@ table.insert(State.Connections, UserInputService.InputBegan:Connect(function(inp
         onSkillSlotTriggered(slotStr)
     end
 
-    -- Log every M1 click / Q press in the Live Wall Combo Inspector when near a Tree or Enemy
     if not gpe and Config.WallInspectorEnabled then
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             snapshotFullWallComboState("M1_Clicked")
@@ -3941,22 +3955,22 @@ table.insert(State.Connections, UserInputService.InputBegan:Connect(function(inp
         end
     end
 
-    -- Single-Hit M1 Wall Combo Trigger
+    -- Single-Hit M1 Wall Combo Trigger (Calibrated with [860.84] log ratio)
     if not gpe and Config.WallComboEnabled then
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             local now = tick()
-            if (now - State.LastM1HitCheckTick) >= 0.30 then
+            if (now - State.LastM1HitCheckTick) >= 0.28 then
                 State.LastM1HitCheckTick = now
                 local _, eRoot = findNearestEnemyRoot(16)
                 if eRoot then
-                    triggerWallComboBehindEnemy(0.45)
+                    triggerWallComboBehindEnemy(0.42)
                 end
             end
         end
     end
 
     if not gpe and input.KeyCode == Config.WallComboKey then
-        triggerWallComboBehindEnemy(0.55)
+        triggerWallComboBehindEnemy(0.48)
     end
 
     if not gpe and input.KeyCode == Enum.KeyCode.Space and Config.InfJumpEnabled then
