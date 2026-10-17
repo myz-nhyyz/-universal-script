@@ -1,10 +1,8 @@
--- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v37)
--- Updates in v37:
---   1. Fixed R6/R15 Invisible Ground Pad Fly slow-drop bug:
---      - In R6 rigs, Humanoid.HipHeight is 0 while the legs are 2.0 studs tall, which previously placed the pad 2 studs below your feet.
---      - v37 calculates exact R6 Leg bottom offset (3.0 studs from HRP center) and locks State.FlyAltitudeY strictly so you stand 100% motionless in mid-air with 0.00 vertical drift.
---   2. Locked High Place Carry coordinate to Vector3.new(35.79, 1668.56, -207.31).
---   3. Added 3rd separate Grab-Carry mode: "Auto Carry Ultra-Far (10M - 100M Studs)" with slider from 10,000,000 to 100,000,000 studs (default 50,000,000 studs).
+-- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v38)
+-- Updates in v38:
+--   1. High Place Carry altitude increased to Y = 1700: Vector3.new(35.79, 1700.00, -207.31).
+--   2. Ultra-Far Carry distance increased to 1 Billion (1B) - 10 Billion (10B) studs (1e9 to 1e10 studs).
+--   3. Retains True Zero-Drop R6/R15 Invisible Ground Pad Fly, Y = -500 Auto Void Kill, Fixed 2k White Floor, and Public Server Finder.
 
 local cloneref = cloneref or function(obj) return obj end
 
@@ -44,15 +42,15 @@ local Config = {
     DeepVoidActive = false,
 
     -- 3 Separate Grab-Carry Modes:
-    --   1. AutoVoidKill (Y = -500)
-    --   2. AutoHighPlaceCarry -> Vector3.new(35.79, 1668.56, -207.31)
-    --   3. AutoUltraFarCarry  -> 10,000,000 to 100,000,000 studs away
+    --   1. AutoVoidKill       -> Y = -500
+    --   2. AutoHighPlaceCarry -> Vector3.new(35.79, 1700.00, -207.31)
+    --   3. AutoUltraFarCarry  -> 1 Billion (1B) to 10 Billion (10B) studs away
     AutoVoidKill = false,
     AutoHighPlaceCarry = false,
     AutoUltraFarCarry = false,
 
-    HighPlaceTargetPos = Vector3.new(35.79, 1668.56, -207.31),
-    UltraFarDistanceMillions = 50, -- 50 Million studs default (Slider: 10M to 100M)
+    HighPlaceTargetPos = Vector3.new(35.79, 1700.00, -207.31),
+    UltraFarDistanceBillions = 1, -- Default 1B studs (Slider: 1B to 10B studs)
     VoidMaxHoldTime = 1.45,
 
     MineSelectedTargets = {},
@@ -175,7 +173,6 @@ local State = {
 -- // ==========================================================================
 -- // EXACT R6 / R15 FOOT BOTTOM OFFSET & SOLID ZERO-DROP GROUND PAD
 -- // ==========================================================================
--- Fixes the R6 HipHeight=0 bug where the pad was placed 2 studs below your feet!
 local function getExactFootBottomOffset(char, root, hum)
     if not root or not hum then return 3.0 end
     if hum.RigType == Enum.HumanoidRigType.R6 then
@@ -203,7 +200,7 @@ local function ensureInvisibleGroundPad()
     pad.CanCollide = true
     pad.Transparency = 1
     pad.Material = Enum.Material.Plastic
-    pad.CustomPhysicalProperties = PhysicalProperties.new(10, 1, 0, 1, 1) -- Zero bounce / elasticity
+    pad.CustomPhysicalProperties = PhysicalProperties.new(10, 1, 0, 1, 1)
     pad.CFrame = CFrame.new(0, 99999, 0)
     pad.Parent = Workspace.Terrain
     State.InvisibleGroundPad = pad
@@ -705,8 +702,8 @@ end
 -- // ==========================================================================
 -- // TRIPLE GRAB-CARRY EXECUTION ENGINE:
 -- //   1. AutoVoidKill       -> Submerges enemy below Y = -500 at 2,900 studs
--- //   2. AutoHighPlaceCarry -> Carries enemy to Vector3.new(35.79, 1668.56, -207.31)
--- //   3. AutoUltraFarCarry  -> Carries enemy 10,000,000 - 100,000,000 studs away into Null Zone
+-- //   2. AutoHighPlaceCarry -> Carries enemy to Vector3.new(35.79, 1700.00, -207.31)
+-- //   3. AutoUltraFarCarry  -> Carries enemy 1B to 10B (1,000,000,000 - 10,000,000,000) studs away
 -- // ==========================================================================
 local function executeGrabCarryTrip()
     if not Config.ScriptRunning or State.VoidKillActive or not isAnyGrabCarryModeActive() then return end
@@ -726,7 +723,7 @@ local function executeGrabCarryTrip()
 
     task.spawn(function()
         if Config.AutoHighPlaceCarry then
-            -- MODE 2: HIGH PLACE CARRY -> Vector3.new(35.79, 1668.56, -207.31)
+            -- MODE 2: HIGH PLACE CARRY -> Vector3.new(35.79, 1700.00, -207.31)
             local highPos = Config.HighPlaceTargetPos
             local targetCF = CFrame.new(highPos)
             State.VoidDropTargetCF = targetCF
@@ -759,8 +756,8 @@ local function executeGrabCarryTrip()
             end
 
         elseif Config.AutoUltraFarCarry then
-            -- MODE 3: ULTRA-FAR CARRY (10,000,000 to 100,000,000 STUDS NULL-ZONE BANISH)
-            local studDist = math.clamp(Config.UltraFarDistanceMillions or 50, 10, 100) * 1000000
+            -- MODE 3: ULTRA-FAR CARRY (1B to 10B STUDS -> 1,000,000,000 to 10,000,000,000 STUDS)
+            local studDist = math.clamp(Config.UltraFarDistanceBillions or 1, 1, 10) * 1000000000
             local originPos = State.VoidReturnCFrame.Position
             local flatDir = Vector3.new(originPos.X, 0, originPos.Z)
             if flatDir.Magnitude < 1 then
@@ -769,7 +766,7 @@ local function executeGrabCarryTrip()
                 flatDir = flatDir.Unit
             end
 
-            local farPos = Vector3.new(flatDir.X * studDist, math.max(originPos.Y + 250, 500), flatDir.Z * studDist)
+            local farPos = Vector3.new(flatDir.X * studDist, 1700, flatDir.Z * studDist)
             local targetCF = CFrame.new(farPos)
             State.VoidDropTargetCF = targetCF
 
@@ -1802,7 +1799,7 @@ local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 290, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v37 ZeroDrop+100M"
+SubTitle.Text = "Heroes Battlegrounds v38 1.7kHigh+10B"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
@@ -2746,8 +2743,8 @@ addFeatureToggle(TabVoid, "AutoVoidKill", "1. Auto Void Kill (Drop Enemy Below Y
     end
 end)
 
--- Mode 2: Auto Carry To High Place -> Vector3.new(35.79, 1668.56, -207.31)
-addFeatureToggle(TabVoid, "AutoHighPlaceCarry", "2. Auto Carry To High Place (35.79, 1668.56, -207.31)", "HIGHC", false, function(v)
+-- Mode 2: Auto Carry To High Place -> Vector3.new(35.79, 1700.00, -207.31)
+addFeatureToggle(TabVoid, "AutoHighPlaceCarry", "2. Auto Carry High Place (35.79, 1700.00, -207.31)", "HIGHC", false, function(v)
     Config.AutoHighPlaceCarry = v
     if v then
         if Config.AutoVoidKill and State.ToggleRegistry["AutoVoidKill"] then
@@ -2766,8 +2763,8 @@ addFeatureToggle(TabVoid, "AutoHighPlaceCarry", "2. Auto Carry To High Place (35
     end
 end)
 
--- Mode 3: Auto Carry Ultra-Far (10,000,000 to 100,000,000 Studs)
-addFeatureToggle(TabVoid, "AutoUltraFarCarry", "3. Auto Carry Ultra-Far (10M - 100M Studs)", "FARC", false, function(v)
+-- Mode 3: Auto Carry Ultra-Far (1B to 10B Studs)
+addFeatureToggle(TabVoid, "AutoUltraFarCarry", "3. Auto Carry Ultra-Far (1B - 10B Studs)", "FARC", false, function(v)
     Config.AutoUltraFarCarry = v
     if v then
         if Config.AutoVoidKill and State.ToggleRegistry["AutoVoidKill"] then
@@ -2786,8 +2783,8 @@ addFeatureToggle(TabVoid, "AutoUltraFarCarry", "3. Auto Carry Ultra-Far (10M - 1
     end
 end)
 
-addSlider(TabVoid, "Ultra-Far Distance (Million Studs)", 10, 100, 50, function(v)
-    Config.UltraFarDistanceMillions = v
+addSlider(TabVoid, "Ultra-Far Distance (Billion Studs)", 1, 10, 1, function(v)
+    Config.UltraFarDistanceBillions = v
 end)
 
 local MineMultiDropdown = addMultiDropdown(TabVoid, "Mine Multi Targets", currentTargetList, function(selectedMap)
@@ -3116,7 +3113,7 @@ local function getFlightDirection(hum)
     return Vector3.zero
 end
 
--- // STEPPED LOOP (Runs right before internal Roblox physics step!)
+-- // STEPPED LOOP
 table.insert(State.Connections, RunService.Stepped:Connect(function(_, dt)
     if not Config.ScriptRunning then return end
     local voidDamageY = getVoidKillPlaneY()
@@ -3144,7 +3141,6 @@ table.insert(State.Connections, RunService.Stepped:Connect(function(_, dt)
             State.Root.AssemblyLinearVelocity = Vector3.new(State.Root.AssemblyLinearVelocity.X, 0, State.Root.AssemblyLinearVelocity.Z)
         end
     elseif Config.FlyEnabled and not Config.AutoTargetEnabled and State.Root and State.Hum then
-        -- Lock pad flush under R6/R15 feet and clamp downward velocity before physics step
         if not State.FlyAltitudeY then
             State.FlyAltitudeY = State.Root.Position.Y
         end
@@ -3378,11 +3374,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             end
         end
 
-        -- ======================================================================
         -- TRUE ZERO-DROP R6/R15 INVISIBLE GROUND PAD FLY + LOOP FLY
-        -- ======================================================================
-        -- 1. Uses exact R6 Leg Height (3.0 studs) so the pad's top surface is flush with the soles of your feet.
-        -- 2. Never overwrites State.FlyAltitudeY with a falling root.Position.Y! State.FlyAltitudeY ONLY changes when moveDir.Y ~= 0.
         if Config.FlyEnabled and not Config.AutoTargetEnabled and not State.VoidKillActive and not State.AntiSkillEvading then
             local moveDir = getFlightDirection(hum)
             local spd = Config.FlySpeed or 75
@@ -3395,7 +3387,6 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
                 State.FlyAltitudeY = State.FlyAltitudeY + (moveDir.Y * spd * dt)
             end
 
-            -- Position the 36x4x36 invisible ground pad flush at `State.FlyAltitudeY - footBottomOffset`
             updateGroundPadUnderCharacter(char, root, hum, State.FlyAltitudeY)
 
             if Config.FlyMode == "InvisibleGroundPad" then
@@ -3405,7 +3396,6 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
                     root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
                 end
 
-                -- Keep character standing on top of the locked altitude pad with 0.00 drop
                 if math.abs(root.Position.Y - State.FlyAltitudeY) > 0.04 then
                     root.CFrame = CFrame.new(root.Position.X, State.FlyAltitudeY, root.Position.Z) * root.CFrame.Rotation
                 end
