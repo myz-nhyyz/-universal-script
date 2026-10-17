@@ -1,10 +1,10 @@
--- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v36 Clean)
--- Changes in v36:
---   1. Completely removed Wall Combo, Object ESP, and all Inspector/Copy/Delete Log UI & logic.
---   2. Fixed "TP Void (2k + White Floor)" button & locked Void Kill plane at Y = -500 (with Anti-Void protection keeping you at Y = -497.8 while submerging grabbed enemies below Y = -500).
---   3. Added 2 separate toggles in Void Kill tab: "Auto Void Kill (Y = -500)" and "Auto Carry To High Place", plus a "Scan & Copy Current Coordinate" button so you can scan any high spot in HBG and send the coordinates.
---   4. Rebuilt Fly with "InvisibleGroundPad" (creates an invisible physical floor pad directly under your feet so the game sees FloorMaterial ~= Air / grounded at all times) + "LoopFly" mode.
---   5. Added "Join Lowest Ping Server (Public)" and "Join Lowest Player Server (Public)" in the Server tab.
+-- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v37)
+-- Updates in v37:
+--   1. Fixed R6/R15 Invisible Ground Pad Fly slow-drop bug:
+--      - In R6 rigs, Humanoid.HipHeight is 0 while the legs are 2.0 studs tall, which previously placed the pad 2 studs below your feet.
+--      - v37 calculates exact R6 Leg bottom offset (3.0 studs from HRP center) and locks State.FlyAltitudeY strictly so you stand 100% motionless in mid-air with 0.00 vertical drift.
+--   2. Locked High Place Carry coordinate to Vector3.new(35.79, 1668.56, -207.31).
+--   3. Added 3rd separate Grab-Carry mode: "Auto Carry Ultra-Far (10M - 100M Studs)" with slider from 10,000,000 to 100,000,000 studs (default 50,000,000 studs).
 
 local cloneref = cloneref or function(obj) return obj end
 
@@ -43,10 +43,16 @@ local Config = {
     VoidSafeMarginAboveDeath = 2.2,
     DeepVoidActive = false,
 
-    -- Two Separate Grab-Carry Modes (Void Kill vs High Place Carry)
+    -- 3 Separate Grab-Carry Modes:
+    --   1. AutoVoidKill (Y = -500)
+    --   2. AutoHighPlaceCarry -> Vector3.new(35.79, 1668.56, -207.31)
+    --   3. AutoUltraFarCarry  -> 10,000,000 to 100,000,000 studs away
     AutoVoidKill = false,
     AutoHighPlaceCarry = false,
-    HighPlaceTargetPos = Vector3.new(0, 650, 0), -- Updates automatically when you press Scan Coordinate!
+    AutoUltraFarCarry = false,
+
+    HighPlaceTargetPos = Vector3.new(35.79, 1668.56, -207.31),
+    UltraFarDistanceMillions = 50, -- 50 Million studs default (Slider: 10M to 100M)
     VoidMaxHoldTime = 1.45,
 
     MineSelectedTargets = {},
@@ -126,7 +132,6 @@ local State = {
     LastSkillCastTick = 0,
     CurrentSkillAnimTrack = nil,
     SlotStatusLabel = nil,
-    CoordStatusLabel = nil,
 
     -- White Platform at 2k Void & Invisible Ground Pad for Fly
     WhiteVoidPlatform = nil,
@@ -168,8 +173,24 @@ local State = {
 }
 
 -- // ==========================================================================
--- // INVISIBLE GROUND PAD UNDER FEET (MAKES GAME THINK YOU ARE ON THE GROUND)
+-- // EXACT R6 / R15 FOOT BOTTOM OFFSET & SOLID ZERO-DROP GROUND PAD
 -- // ==========================================================================
+-- Fixes the R6 HipHeight=0 bug where the pad was placed 2 studs below your feet!
+local function getExactFootBottomOffset(char, root, hum)
+    if not root or not hum then return 3.0 end
+    if hum.RigType == Enum.HumanoidRigType.R6 then
+        local leftLeg = char and char:FindFirstChild("Left Leg")
+        local rightLeg = char and char:FindFirstChild("Right Leg")
+        local legHeight = (leftLeg and leftLeg:IsA("BasePart") and leftLeg.Size.Y)
+            or (rightLeg and rightLeg:IsA("BasePart") and rightLeg.Size.Y)
+            or 2.0
+        return (root.Size.Y * 0.5) + legHeight
+    else
+        local hip = (hum.HipHeight > 0.1) and hum.HipHeight or 2.0
+        return (root.Size.Y * 0.5) + hip
+    end
+end
+
 local function ensureInvisibleGroundPad()
     if State.InvisibleGroundPad and State.InvisibleGroundPad.Parent then
         return State.InvisibleGroundPad
@@ -177,11 +198,12 @@ local function ensureInvisibleGroundPad()
     local pad = Instance.new("Part")
     pad.Name = State.GroundPadToken
     pad.Archivable = false
-    pad.Size = Vector3.new(16, 1.5, 16)
+    pad.Size = Vector3.new(36, 4, 36)
     pad.Anchored = true
     pad.CanCollide = true
     pad.Transparency = 1
     pad.Material = Enum.Material.Plastic
+    pad.CustomPhysicalProperties = PhysicalProperties.new(10, 1, 0, 1, 1) -- Zero bounce / elasticity
     pad.CFrame = CFrame.new(0, 99999, 0)
     pad.Parent = Workspace.Terrain
     State.InvisibleGroundPad = pad
@@ -195,13 +217,21 @@ local function destroyInvisibleGroundPad()
     end
 end
 
+local function updateGroundPadUnderCharacter(char, root, hum, lockedRootY)
+    if not root or not hum then return end
+    local pad = ensureInvisibleGroundPad()
+    local footBottomDist = getExactFootBottomOffset(char, root, hum)
+    local padTopY = lockedRootY - footBottomDist + 0.03
+    local padCenterY = padTopY - (pad.Size.Y * 0.5)
+    pad.CFrame = CFrame.new(root.Position.X, padCenterY, root.Position.Z)
+    pad.AssemblyLinearVelocity = Vector3.zero
+end
+
 local function syncFlyAltitudeToCFrame(newCF)
     if not newCF then return end
     State.FlyAltitudeY = newCF.Position.Y
     if Config.FlyEnabled and State.Root and State.Hum then
-        local pad = ensureInvisibleGroundPad()
-        local footOffset = State.Hum.HipHeight + (State.Root.Size.Y * 0.5) + (pad.Size.Y * 0.5) - 0.05
-        pad.CFrame = CFrame.new(newCF.Position.X, State.FlyAltitudeY - footOffset, newCF.Position.Z)
+        updateGroundPadUnderCharacter(State.Char, State.Root, State.Hum, State.FlyAltitudeY)
     end
 end
 
@@ -218,7 +248,7 @@ local function getVoidKillPlaneY()
 end
 
 local function getPlayerSafeVoidKillHoverY()
-    return getVoidKillPlaneY() + Config.VoidSafeMarginAboveDeath -- e.g. -497.8 (You stay safe, enemy hangs at -503.5)
+    return getVoidKillPlaneY() + Config.VoidSafeMarginAboveDeath
 end
 
 local function ensureWhiteVoidPlatform(surfaceCenterPos)
@@ -234,7 +264,7 @@ local function ensureWhiteVoidPlatform(surfaceCenterPos)
     plat.Anchored = true
     plat.CanCollide = true
     plat.Material = Enum.Material.SmoothPlastic
-    plat.Color = Color3.fromRGB(255, 255, 255) -- Pure White Floor
+    plat.Color = Color3.fromRGB(255, 255, 255)
     plat.Transparency = 0
     plat.CFrame = CFrame.new(surfaceCenterPos.X, surfaceCenterPos.Y - 3, surfaceCenterPos.Z)
     plat.Parent = Workspace.Terrain
@@ -331,21 +361,19 @@ local function forceFullCharacterAndCameraResync(targetCF)
     end)
 end
 
--- // FIXED 2,000-STUD TELEPORT VOID WITH WHITE PLATFORM (WORKS 100% EVEN WHEN FLY OR ANTIVOID IS ON)
+-- // FIXED 2,000-STUD TELEPORT VOID WITH WHITE PLATFORM
 local function teleportToDeepVoid()
     local myRoot = State.Root
     if not myRoot then return end
 
-    -- Save return position if we are currently on the normal map
     if not Config.DeepVoidActive and myRoot.Position.Y > -100 and myRoot.Position.Magnitude < 1400 then
         State.PreDeepVoidCFrame = myRoot.CFrame
     end
 
     Config.DeepVoidActive = true
 
-    -- Fixed 2,000 studs out from map origin, with White Platform safely above the Y = -500 kill plane (at Y = -450)
     local voidKillY = getVoidKillPlaneY()
-    local platformSurfaceY = math.max(-2000, voidKillY + 50) -- Y = -450 when FallenPartsDestroyHeight is -500
+    local platformSurfaceY = math.max(-2000, voidKillY + 50)
     local platformCenter = Vector3.new(2000, platformSurfaceY, 2000)
 
     ensureWhiteVoidPlatform(platformCenter)
@@ -556,7 +584,7 @@ function isCharacterStillInSkill(char)
 end
 
 local function isAnyGrabCarryModeActive()
-    return Config.AutoVoidKill or Config.AutoHighPlaceCarry
+    return Config.AutoVoidKill or Config.AutoHighPlaceCarry or Config.AutoUltraFarCarry
 end
 
 -- // STRICT PHYSICAL GRAB DETECTION
@@ -675,9 +703,10 @@ local function getConfirmedCarriedEnemies()
 end
 
 -- // ==========================================================================
--- // DUAL GRAB-CARRY EXECUTION:
--- //   Mode 1: Auto Void Kill (Y = -500) -> Submerges victim below Y = -500 at 2,900 studs
--- //   Mode 2: Auto Carry To High Place -> Carries victim up to Config.HighPlaceTargetPos
+-- // TRIPLE GRAB-CARRY EXECUTION ENGINE:
+-- //   1. AutoVoidKill       -> Submerges enemy below Y = -500 at 2,900 studs
+-- //   2. AutoHighPlaceCarry -> Carries enemy to Vector3.new(35.79, 1668.56, -207.31)
+-- //   3. AutoUltraFarCarry  -> Carries enemy 10,000,000 - 100,000,000 studs away into Null Zone
 -- // ==========================================================================
 local function executeGrabCarryTrip()
     if not Config.ScriptRunning or State.VoidKillActive or not isAnyGrabCarryModeActive() then return end
@@ -687,19 +716,17 @@ local function executeGrabCarryTrip()
     if not myChar or not myRoot or not myHum or myHum.Health <= 0 then return end
 
     State.VoidKillActive = true
-    if State.LastSafeCFrame and State.LastSafeCFrame.Position.Y > -20 then
+    if State.LastSafeCFrame and State.LastSafeCFrame.Position.Y > -20 and State.LastSafeCFrame.Position.Magnitude < 2000 then
         State.VoidReturnCFrame = State.LastSafeCFrame
-    elseif myRoot.Position.Y > -20 then
+    elseif myRoot.Position.Y > -20 and myRoot.Position.Magnitude < 2000 then
         State.VoidReturnCFrame = myRoot.CFrame
     else
         State.VoidReturnCFrame = CFrame.new(0, 55, 0)
     end
 
-    local useHighPlaceMode = Config.AutoHighPlaceCarry and not Config.AutoVoidKill
-
     task.spawn(function()
-        if useHighPlaceMode then
-            -- HIGH PLACE CARRY MODE: Instantly carries grabbed enemy to the scanned High Place coordinate!
+        if Config.AutoHighPlaceCarry then
+            -- MODE 2: HIGH PLACE CARRY -> Vector3.new(35.79, 1668.56, -207.31)
             local highPos = Config.HighPlaceTargetPos
             local targetCF = CFrame.new(highPos)
             State.VoidDropTargetCF = targetCF
@@ -730,8 +757,51 @@ local function executeGrabCarryTrip()
 
                 RunService.Heartbeat:Wait()
             end
+
+        elseif Config.AutoUltraFarCarry then
+            -- MODE 3: ULTRA-FAR CARRY (10,000,000 to 100,000,000 STUDS NULL-ZONE BANISH)
+            local studDist = math.clamp(Config.UltraFarDistanceMillions or 50, 10, 100) * 1000000
+            local originPos = State.VoidReturnCFrame.Position
+            local flatDir = Vector3.new(originPos.X, 0, originPos.Z)
+            if flatDir.Magnitude < 1 then
+                flatDir = Vector3.new(0.7071, 0, 0.7071)
+            else
+                flatDir = flatDir.Unit
+            end
+
+            local farPos = Vector3.new(flatDir.X * studDist, math.max(originPos.Y + 250, 500), flatDir.Z * studDist)
+            local targetCF = CFrame.new(farPos)
+            State.VoidDropTargetCF = targetCF
+
+            if State.Root then
+                State.Root.CFrame = targetCF
+                State.Root.AssemblyLinearVelocity = Vector3.zero
+                State.Root.AssemblyAngularVelocity = Vector3.zero
+            end
+
+            local holdStart = tick()
+            local minHold = 0.30
+
+            while Config.ScriptRunning and Config.AutoUltraFarCarry and State.Root and State.Hum and State.Hum.Health > 0 do
+                local elapsed = tick() - holdStart
+                if elapsed >= Config.VoidMaxHoldTime then
+                    break
+                end
+
+                State.Root.CFrame = targetCF
+                State.Root.AssemblyLinearVelocity = Vector3.zero
+                State.Root.AssemblyAngularVelocity = Vector3.zero
+
+                local carriedList = getConfirmedCarriedEnemies()
+                if elapsed >= minHold and (#carriedList == 0 and not isCharacterStillInSkill(State.Char)) then
+                    break
+                end
+
+                RunService.Heartbeat:Wait()
+            end
+
         else
-            -- VOID KILL MODE (Y = -500): Teleports 2,900 studs out and submerges enemy below Y = -500 while keeping you at Y = -497.8
+            -- MODE 1: VOID KILL (Y = -500)
             local voidDamageY = getVoidKillPlaneY()
             local safeHoverY = getPlayerSafeVoidKillHoverY()
             local originPos = State.VoidReturnCFrame.Position
@@ -1097,9 +1167,7 @@ local function stopMovableGhostDecoy()
     State.DecoyCFrame = nil
 end
 
--- // ==========================================================================
--- // PUBLIC SERVER HOP FUNCTIONS (LOWEST PING & LOWEST PLAYERS — NO PRIVATE SERVERS)
--- // ==========================================================================
+-- // PUBLIC SERVER HOP FUNCTIONS (LOWEST PING & LOWEST PLAYERS)
 local function rejoinCurrentServer()
     TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
 end
@@ -1116,7 +1184,6 @@ local function joinBestPublicServerByMode(mode, btn, defaultText)
         if ok and res and type(res.data) == "table" then
             local candidates = {}
             for _, srv in ipairs(res.data) do
-                -- Strictly public servers with available slots, active players >= 1, and not our current JobId
                 if type(srv) == "table"
                     and type(srv.id) == "string"
                     and srv.id ~= game.JobId
@@ -1735,7 +1802,7 @@ local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 290, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v36 DualCarry+GroundFly"
+SubTitle.Text = "Heroes Battlegrounds v37 ZeroDrop+100M"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
@@ -1804,6 +1871,7 @@ local function unloadEntireScript()
     Config.AutoTargetEnabled = false
     Config.AutoVoidKill = false
     Config.AutoHighPlaceCarry = false
+    Config.AutoUltraFarCarry = false
     Config.AntiVoidEnabled = false
     Config.DeepVoidActive = false
     Config.AntiStunEnabled = false
@@ -2561,7 +2629,7 @@ local function addSlider(parent, label, minVal, maxVal, defaultVal, callback)
     end))
 end
 
--- // CREATE SIDEBAR TABS (WALL COMBO & LOG TABS REMOVED!)
+-- // CREATE SIDEBAR TABS
 local TabVoid   = createTab("Void Kill", "🌀")
 local TabCombat = createTab("Combat", "⚔")
 local TabTarget = createTab("AutoFarm", "◇")
@@ -2626,7 +2694,7 @@ local currentTargetList = getPlayerNames()
 Config.SelectedPlayer = currentTargetList[1]
 
 -- // ==========================================================================
--- // 1. POPULATE VOID KILL TAB (2 SEPARATE MODES: VOID KILL Y=-500 & HIGH PLACE CARRY + COORD SCANNER)
+-- // 1. POPULATE VOID KILL TAB (3 SEPARATE GRAB-CARRY MODES)
 -- // ==========================================================================
 local SlotPreviewCard = Instance.new("Frame")
 SlotPreviewCard.Size = UDim2.new(1, 0, 0, 44)
@@ -2652,93 +2720,74 @@ State.SlotStatusLabel.TextSize = 11
 State.SlotStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
 State.SlotStatusLabel.Parent = SlotPreviewCard
 
--- Fixed 2,000-stud White Platform Void Teleport
 addDualButtons(
     TabVoid,
     "TP Void (2k White Floor)", Color3.fromRGB(45, 115, 195), function() teleportToDeepVoid() end,
     "TP Back (Full Resync)", Color3.fromRGB(55, 135, 95), function() teleportBackFromDeepVoid() end
 )
 
--- Separate Toggle 1: Auto Void Kill (Y = -500)
-addFeatureToggle(TabVoid, "AutoVoidKill", "Auto Void Kill (Drop Enemy Below Y = -500)", "VOIDK", false, function(v)
+-- Mode 1: Auto Void Kill (Y = -500)
+addFeatureToggle(TabVoid, "AutoVoidKill", "1. Auto Void Kill (Drop Enemy Below Y = -500)", "VOIDK", false, function(v)
     Config.AutoVoidKill = v
     if v then
-        -- Turn off High Place Carry if Void Kill is turned on so they stay separate
         if Config.AutoHighPlaceCarry and State.ToggleRegistry["AutoHighPlaceCarry"] then
             Config.AutoHighPlaceCarry = false
             State.ToggleRegistry["AutoHighPlaceCarry"](false, true)
         end
+        if Config.AutoUltraFarCarry and State.ToggleRegistry["AutoUltraFarCarry"] then
+            Config.AutoUltraFarCarry = false
+            State.ToggleRegistry["AutoUltraFarCarry"](false, true)
+        end
         scanHotbarSkills1To4()
-    elseif not Config.AutoHighPlaceCarry then
+    elseif not isAnyGrabCarryModeActive() then
         State.VoidKillActive = false
         State.VoidDropTargetCF = nil
         State.ActiveSpecialSkill = nil
     end
 end)
 
--- Separate Toggle 2: Auto Carry To High Place
-addFeatureToggle(TabVoid, "AutoHighPlaceCarry", "Auto Carry To High Place (Bring Enemy Up)", "HIGHC", false, function(v)
+-- Mode 2: Auto Carry To High Place -> Vector3.new(35.79, 1668.56, -207.31)
+addFeatureToggle(TabVoid, "AutoHighPlaceCarry", "2. Auto Carry To High Place (35.79, 1668.56, -207.31)", "HIGHC", false, function(v)
     Config.AutoHighPlaceCarry = v
     if v then
         if Config.AutoVoidKill and State.ToggleRegistry["AutoVoidKill"] then
             Config.AutoVoidKill = false
             State.ToggleRegistry["AutoVoidKill"](false, true)
         end
+        if Config.AutoUltraFarCarry and State.ToggleRegistry["AutoUltraFarCarry"] then
+            Config.AutoUltraFarCarry = false
+            State.ToggleRegistry["AutoUltraFarCarry"](false, true)
+        end
         scanHotbarSkills1To4()
-    elseif not Config.AutoVoidKill then
+    elseif not isAnyGrabCarryModeActive() then
         State.VoidKillActive = false
         State.VoidDropTargetCF = nil
         State.ActiveSpecialSkill = nil
     end
 end)
 
--- Coordinate Scanner Card & Button for High Place
-local CoordCard = Instance.new("Frame")
-CoordCard.Size = UDim2.new(1, 0, 0, 38)
-CoordCard.BackgroundColor3 = Color3.fromRGB(28, 36, 32)
-CoordCard.BackgroundTransparency = 0.15
-CoordCard.BorderSizePixel = 0
-CoordCard.Parent = TabVoid
-Instance.new("UICorner", CoordCard).CornerRadius = UDim.new(0, 6)
-
-local CoordStroke = Instance.new("UIStroke", CoordCard)
-CoordStroke.Color = Color3.fromRGB(85, 215, 135)
-CoordStroke.Transparency = 0.35
-CoordStroke.Thickness = 1
-
-State.CoordStatusLabel = Instance.new("TextLabel")
-State.CoordStatusLabel.Size = UDim2.new(1, -20, 1, 0)
-State.CoordStatusLabel.Position = UDim2.new(0, 10, 0, 0)
-State.CoordStatusLabel.BackgroundTransparency = 1
-State.CoordStatusLabel.Text = string.format("High Place Target: Vector3.new(%.1f, %.1f, %.1f)", Config.HighPlaceTargetPos.X, Config.HighPlaceTargetPos.Y, Config.HighPlaceTargetPos.Z)
-State.CoordStatusLabel.TextColor3 = Color3.fromRGB(165, 245, 195)
-State.CoordStatusLabel.Font = Enum.Font.GothamBold
-State.CoordStatusLabel.TextSize = 11
-State.CoordStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
-State.CoordStatusLabel.Parent = CoordCard
-
-addButton(TabVoid, "📍 Scan & Copy My Current Coordinate (For High Place)", Color3.fromRGB(45, 140, 85), function(btn)
-    local myRoot = State.Root
-    if not myRoot then return end
-    local pos = myRoot.Position
-    Config.HighPlaceTargetPos = pos
-    local coordCode = string.format("Vector3.new(%.2f, %.2f, %.2f)", pos.X, pos.Y, pos.Z)
-    if State.CoordStatusLabel and State.CoordStatusLabel.Parent then
-        State.CoordStatusLabel.Text = "High Place Target: " .. coordCode
+-- Mode 3: Auto Carry Ultra-Far (10,000,000 to 100,000,000 Studs)
+addFeatureToggle(TabVoid, "AutoUltraFarCarry", "3. Auto Carry Ultra-Far (10M - 100M Studs)", "FARC", false, function(v)
+    Config.AutoUltraFarCarry = v
+    if v then
+        if Config.AutoVoidKill and State.ToggleRegistry["AutoVoidKill"] then
+            Config.AutoVoidKill = false
+            State.ToggleRegistry["AutoVoidKill"](false, true)
+        end
+        if Config.AutoHighPlaceCarry and State.ToggleRegistry["AutoHighPlaceCarry"] then
+            Config.AutoHighPlaceCarry = false
+            State.ToggleRegistry["AutoHighPlaceCarry"](false, true)
+        end
+        scanHotbarSkills1To4()
+    elseif not isAnyGrabCarryModeActive() then
+        State.VoidKillActive = false
+        State.VoidDropTargetCF = nil
+        State.ActiveSpecialSkill = nil
     end
-    pcall(function()
-        if setclipboard then
-            setclipboard(coordCode)
-        elseif toclipboard then
-            toclipboard(coordCode)
-        end
-    end)
-    btn.Text = "Copied: " .. coordCode
-    task.delay(2.2, function()
-        if btn and btn.Parent then
-            btn.Text = "📍 Scan & Copy My Current Coordinate (For High Place)"
-        end
-    end)
+end)
+
+addSlider(TabVoid, "Ultra-Far Distance (Million Studs)", 10, 100, 50, function(v)
+    Config.UltraFarDistanceMillions = v
 end)
 
 local MineMultiDropdown = addMultiDropdown(TabVoid, "Mine Multi Targets", currentTargetList, function(selectedMap)
@@ -2749,7 +2798,7 @@ addSlider(TabVoid, "Carry / Void Hold Duration", 0.35, 3.00, 1.45, function(v)
     Config.VoidMaxHoldTime = v
 end)
 
--- // 2. POPULATE COMBAT TAB (WALL COMBO & OBJECT ESP REMOVED)
+-- // 2. POPULATE COMBAT TAB
 addFeatureToggle(TabCombat, "AutoSkill", "Auto Skill (1 - 4)", "ASKL", false, function(v)
     Config.AutoSkillEnabled = v
     if v then scanHotbarSkills1To4() end
@@ -2854,13 +2903,15 @@ addFeatureToggle(TabTarget, "TeleportPlayer", "Pin-able Instant Teleport To Play
     end
 end)
 
--- // 4. POPULATE LOCALPLAYER TAB (INVISIBLE GROUND PAD FLY + LOOP FLY)
-addFeatureToggle(TabMove, "Fly", "Fly (Invisible Ground Pad Under Feet)", "FLY", false, function(v)
+-- // 4. POPULATE LOCALPLAYER TAB (ZERO-DROP R6/R15 GROUND PAD FLY)
+addFeatureToggle(TabMove, "Fly", "Fly (Zero-Drop Invisible Ground Pad)", "FLY", false, function(v)
     Config.FlyEnabled = v
     if v and State.Root then
-        syncFlyAltitudeToCFrame(State.Root.CFrame)
+        State.FlyAltitudeY = State.Root.Position.Y
+        updateGroundPadUnderCharacter(State.Char, State.Root, State.Hum, State.FlyAltitudeY)
         State.Root.AssemblyLinearVelocity = Vector3.zero
     else
+        State.FlyAltitudeY = nil
         destroyInvisibleGroundPad()
         if State.Root then
             State.Root.AssemblyLinearVelocity = Vector3.zero
@@ -2871,7 +2922,8 @@ end)
 addDropdown(TabMove, "Fly Mode", {"InvisibleGroundPad", "LoopFly"}, 1, function(opt)
     Config.FlyMode = opt
     if State.Root then
-        syncFlyAltitudeToCFrame(State.Root.CFrame)
+        State.FlyAltitudeY = State.Root.Position.Y
+        updateGroundPadUnderCharacter(State.Char, State.Root, State.Hum, State.FlyAltitudeY)
     end
 end)
 
@@ -2916,7 +2968,7 @@ addSlider(TabMove, "JumpPower", 50, 350, 100, function(v)
     Config.JumpPower = v
 end)
 
--- // 5. POPULATE SERVER TAB (LOWEST PING & LOWEST PLAYERS PUBLIC SERVERS)
+-- // 5. POPULATE SERVER TAB
 addButton(TabServer, "Rejoin Current Server", Color3.fromRGB(45, 110, 185), function()
     rejoinCurrentServer()
 end)
@@ -2961,6 +3013,7 @@ end)
 Config.AntiVoidEnabled = true
 Config.AutoVoidKill = false
 Config.AutoHighPlaceCarry = false
+Config.AutoUltraFarCarry = false
 Config.UIInitialized = true
 
 table.insert(State.Connections, Players.PlayerAdded:Connect(function()
@@ -3063,13 +3116,13 @@ local function getFlightDirection(hum)
     return Vector3.zero
 end
 
--- // STEPPED LOOP
+-- // STEPPED LOOP (Runs right before internal Roblox physics step!)
 table.insert(State.Connections, RunService.Stepped:Connect(function(_, dt)
     if not Config.ScriptRunning then return end
     local voidDamageY = getVoidKillPlaneY()
 
     if State.VoidKillActive and State.VoidDropTargetCF and State.Root then
-        if Config.AutoHighPlaceCarry and not Config.AutoVoidKill then
+        if (Config.AutoHighPlaceCarry or Config.AutoUltraFarCarry) and not Config.AutoVoidKill then
             State.Root.CFrame = State.VoidDropTargetCF
         else
             local pos = State.VoidDropTargetCF.Position
@@ -3084,21 +3137,22 @@ table.insert(State.Connections, RunService.Stepped:Connect(function(_, dt)
         State.Root.CFrame = CFrame.new(voidPos) * State.DecoyCFrame.Rotation
         State.Root.AssemblyLinearVelocity = Vector3.zero
     elseif Config.DeepVoidActive and State.Root and State.DeepVoidStandCF then
-        -- Keep the White Platform locked under us at 2k Void so you can stand and walk on it freely
         local surfaceY = State.DeepVoidStandCF.Position.Y - 3.5
         ensureWhiteVoidPlatform(Vector3.new(State.Root.Position.X, surfaceY, State.Root.Position.Z))
         if State.Root.Position.Y < (surfaceY + 2.5) then
             State.Root.CFrame = CFrame.new(State.Root.Position.X, surfaceY + 3.2, State.Root.Position.Z) * State.Root.CFrame.Rotation
             State.Root.AssemblyLinearVelocity = Vector3.new(State.Root.AssemblyLinearVelocity.X, 0, State.Root.AssemblyLinearVelocity.Z)
         end
-    end
-
-    -- Keep Invisible Ground Pad directly under feet before physics step so game ALWAYS sees FloorMaterial ~= Air
-    if Config.FlyEnabled and not Config.AutoTargetEnabled and not State.VoidKillActive and not State.AntiSkillEvading and State.Root and State.Hum then
-        local pad = ensureInvisibleGroundPad()
-        local targetAlt = State.FlyAltitudeY or State.Root.Position.Y
-        local footOffset = State.Hum.HipHeight + (State.Root.Size.Y * 0.5) + (pad.Size.Y * 0.5) - 0.05
-        pad.CFrame = CFrame.new(State.Root.Position.X, targetAlt - footOffset, State.Root.Position.Z)
+    elseif Config.FlyEnabled and not Config.AutoTargetEnabled and State.Root and State.Hum then
+        -- Lock pad flush under R6/R15 feet and clamp downward velocity before physics step
+        if not State.FlyAltitudeY then
+            State.FlyAltitudeY = State.Root.Position.Y
+        end
+        updateGroundPadUnderCharacter(State.Char, State.Root, State.Hum, State.FlyAltitudeY)
+        local curVel = State.Root.AssemblyLinearVelocity
+        if curVel.Y < 0 then
+            State.Root.AssemblyLinearVelocity = Vector3.new(curVel.X, 0, curVel.Z)
+        end
     end
 
     if Config.AntiStunEnabled and State.Char and State.Root and State.Hum then
@@ -3115,7 +3169,7 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
     local voidDamageY = getVoidKillPlaneY()
 
     if State.VoidKillActive and State.VoidDropTargetCF and root then
-        if Config.AutoHighPlaceCarry and not Config.AutoVoidKill then
+        if (Config.AutoHighPlaceCarry or Config.AutoUltraFarCarry) and not Config.AutoVoidKill then
             root.CFrame = State.VoidDropTargetCF
         else
             local pos = State.VoidDropTargetCF.Position
@@ -3276,7 +3330,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             stopMovableGhostDecoy()
         end
 
-        -- Anti-Void Protection (Never interferes when DeepVoidActive == true!)
+        -- Anti-Void Protection
         if State.VoidKillActive and Config.AutoVoidKill then
             if root.Position.Y <= (voidDamageY + 1.2) then
                 root.CFrame = CFrame.new(root.Position.X, voidDamageY + 2.2, root.Position.Z) * root.CFrame.Rotation
@@ -3325,46 +3379,45 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
         end
 
         -- ======================================================================
-        -- INVISIBLE GROUND PAD FLY + LOOP FLY
+        -- TRUE ZERO-DROP R6/R15 INVISIBLE GROUND PAD FLY + LOOP FLY
         -- ======================================================================
-        -- Places an invisible physical pad directly under your feet so FloorMaterial is ALWAYS Plastic (grounded)
-        -- and moves smoothly with velocity + step so anti-cheat sees you walking on ground!
+        -- 1. Uses exact R6 Leg Height (3.0 studs) so the pad's top surface is flush with the soles of your feet.
+        -- 2. Never overwrites State.FlyAltitudeY with a falling root.Position.Y! State.FlyAltitudeY ONLY changes when moveDir.Y ~= 0.
         if Config.FlyEnabled and not Config.AutoTargetEnabled and not State.VoidKillActive and not State.AntiSkillEvading then
             local moveDir = getFlightDirection(hum)
             local spd = Config.FlySpeed or 75
-            local pad = ensureInvisibleGroundPad()
 
             if not State.FlyAltitudeY then
                 State.FlyAltitudeY = root.Position.Y
             end
 
+            if math.abs(moveDir.Y) > 0.01 then
+                State.FlyAltitudeY = State.FlyAltitudeY + (moveDir.Y * spd * dt)
+            end
+
+            -- Position the 36x4x36 invisible ground pad flush at `State.FlyAltitudeY - footBottomOffset`
+            updateGroundPadUnderCharacter(char, root, hum, State.FlyAltitudeY)
+
             if Config.FlyMode == "InvisibleGroundPad" then
                 if moveDir.Magnitude > 0 then
-                    State.FlyAltitudeY = State.FlyAltitudeY + (moveDir.Y * spd * dt)
                     root.AssemblyLinearVelocity = Vector3.new(moveDir.X * spd, moveDir.Y * spd, moveDir.Z * spd)
                 else
                     root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
                 end
 
-                local footOffset = hum.HipHeight + (root.Size.Y * 0.5) + (pad.Size.Y * 0.5) - 0.05
-                pad.CFrame = CFrame.new(root.Position.X, State.FlyAltitudeY - footOffset, root.Position.Z)
-
-                if root.Position.Y < (State.FlyAltitudeY - 0.25) then
+                -- Keep character standing on top of the locked altitude pad with 0.00 drop
+                if math.abs(root.Position.Y - State.FlyAltitudeY) > 0.04 then
                     root.CFrame = CFrame.new(root.Position.X, State.FlyAltitudeY, root.Position.Z) * root.CFrame.Rotation
                 end
             elseif Config.FlyMode == "LoopFly" then
                 if moveDir.Magnitude > 0 then
-                    State.FlyAltitudeY = State.FlyAltitudeY + (moveDir.Y * spd * dt)
-                    local stepVec = Vector3.new(moveDir.X, 0, moveDir.Z) * math.min(spd, 85) * dt
-                    root.CFrame = CFrame.new(root.Position.X + stepVec.X, State.FlyAltitudeY, root.Position.Z + stepVec.Z) * root.CFrame.Rotation
+                    local stepXZ = Vector3.new(moveDir.X, 0, moveDir.Z) * math.min(spd, 85) * dt
+                    root.CFrame = CFrame.new(root.Position.X + stepXZ.X, State.FlyAltitudeY, root.Position.Z + stepXZ.Z) * root.CFrame.Rotation
                     root.AssemblyLinearVelocity = Vector3.new(moveDir.X * 16, 0, moveDir.Z * 16)
                 else
                     root.CFrame = CFrame.new(root.Position.X, State.FlyAltitudeY, root.Position.Z) * root.CFrame.Rotation
                     root.AssemblyLinearVelocity = Vector3.zero
                 end
-
-                local footOffset = hum.HipHeight + (root.Size.Y * 0.5) + (pad.Size.Y * 0.5) - 0.05
-                pad.CFrame = CFrame.new(root.Position.X, State.FlyAltitudeY - footOffset, State.Root.Position.Z)
             end
         elseif not Config.FlyEnabled and State.InvisibleGroundPad then
             destroyInvisibleGroundPad()
