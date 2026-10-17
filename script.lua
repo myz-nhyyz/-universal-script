@@ -1,8 +1,10 @@
--- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v38)
--- Updates in v38:
---   1. High Place Carry altitude increased to Y = 1700: Vector3.new(35.79, 1700.00, -207.31).
---   2. Ultra-Far Carry distance increased to 1 Billion (1B) - 10 Billion (10B) studs (1e9 to 1e10 studs).
---   3. Retains True Zero-Drop R6/R15 Invisible Ground Pad Fly, Y = -500 Auto Void Kill, Fixed 2k White Floor, and Public Server Finder.
+-- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v39)
+-- Updates in v39:
+--   1. Unified Multi-Target Grab Engine: MINE, Pierce The Heavens, and BLAST AWAY now share a single dropdown selection pool!
+--   2. "ALL" Selector Option: Instantly selects all players in the server for multi-target sweeps.
+--   3. Fixed Multi-Target Teleportation: Iterates through checked targets with proper yield timing so character cleanly visits every selected player before executing the Void/Far/High drop.
+--   4. High Place altitude set to Y = 1800: Vector3.new(35.79, 1800.00, -207.31).
+--   5. Ultra-Far distance increased to 1 Billion (1B) - 10 Billion (10B) studs.
 
 local cloneref = cloneref or function(obj) return obj end
 
@@ -35,25 +37,24 @@ local Config = {
     -- Background Anti-Void
     AntiVoidEnabled = true,
 
-    -- Fixed Y = -500 Void Kill & Fixed 2,000 (2k) White Platform
+    -- Void Kill & Deep Void
     VoidKillPlaneY = -500,
     VoidFarHorizontalDist = 2900,
     VoidSafeMarginAboveDeath = 2.2,
     DeepVoidActive = false,
 
-    -- 3 Separate Grab-Carry Modes:
-    --   1. AutoVoidKill       -> Y = -500
-    --   2. AutoHighPlaceCarry -> Vector3.new(35.79, 1700.00, -207.31)
-    --   3. AutoUltraFarCarry  -> 1 Billion (1B) to 10 Billion (10B) studs away
+    -- Grab-Carry Modes
     AutoVoidKill = false,
     AutoHighPlaceCarry = false,
     AutoUltraFarCarry = false,
 
     HighPlaceTargetPos = Vector3.new(35.79, 1800.00, -207.31),
-    UltraFarDistanceBillions = 1, -- Default 1B studs (Slider: 1B to 10B studs)
+    UltraFarDistanceBillions = 1, -- 1B to 10B studs
     VoidMaxHoldTime = 1.45,
 
-    MineSelectedTargets = {},
+    -- Unified Multi-Target Grab State
+    MultiTargetSelectedMap = {},
+    MultiTargetSelectAll = false,
 
     KnownGrabSkillNames = {
         "Quintuple Smash", "Shadow Whip", "Lightning Crush", "Whiplash",
@@ -130,8 +131,8 @@ local State = {
     LastSkillCastTick = 0,
     CurrentSkillAnimTrack = nil,
     SlotStatusLabel = nil,
+    CoordStatusLabel = nil,
 
-    -- White Platform at 2k Void & Invisible Ground Pad for Fly
     WhiteVoidPlatform = nil,
     InvisibleGroundPad = nil,
     FlyAltitudeY = nil,
@@ -358,7 +359,6 @@ local function forceFullCharacterAndCameraResync(targetCF)
     end)
 end
 
--- // FIXED 2,000-STUD TELEPORT VOID WITH WHITE PLATFORM
 local function teleportToDeepVoid()
     local myRoot = State.Root
     if not myRoot then return end
@@ -700,12 +700,9 @@ local function getConfirmedCarriedEnemies()
 end
 
 -- // ==========================================================================
--- // TRIPLE GRAB-CARRY EXECUTION ENGINE:
--- //   1. AutoVoidKill       -> Submerges enemy below Y = -500 at 2,900 studs
--- //   2. AutoHighPlaceCarry -> Carries enemy to Vector3.new(35.79, 1700.00, -207.31)
--- //   3. AutoUltraFarCarry  -> Carries enemy 1B to 10B (1,000,000,000 - 10,000,000,000) studs away
+-- // UNIFIED MULTI-TARGET GRAB & CARRY ENGINE (SUPPORTS ALL 3 SKILLS + ALL TOGGLE + TELEPORT ITERATION)
 -- // ==========================================================================
-local function executeGrabCarryTrip()
+local function executeUnifiedMultiTargetGrabTrip()
     if not Config.ScriptRunning or State.VoidKillActive or not isAnyGrabCarryModeActive() then return end
     local myChar = LocalPlayer.Character or State.Char
     local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart") or State.Root
@@ -722,140 +719,82 @@ local function executeGrabCarryTrip()
     end
 
     task.spawn(function()
+        -- 1. Determine Target Destination based on active mode
+        local targetCFs = {}
+
         if Config.AutoHighPlaceCarry then
-            -- MODE 2: HIGH PLACE CARRY -> Vector3.new(35.79, 1700.00, -207.31)
-            local highPos = Config.HighPlaceTargetPos
-            local targetCF = CFrame.new(highPos)
-            State.VoidDropTargetCF = targetCF
-
-            if State.Root then
-                State.Root.CFrame = targetCF
-                State.Root.AssemblyLinearVelocity = Vector3.zero
-                State.Root.AssemblyAngularVelocity = Vector3.zero
-            end
-
-            local holdStart = tick()
-            local minHold = 0.30
-
-            while Config.ScriptRunning and Config.AutoHighPlaceCarry and State.Root and State.Hum and State.Hum.Health > 0 do
-                local elapsed = tick() - holdStart
-                if elapsed >= Config.VoidMaxHoldTime then
-                    break
-                end
-
-                State.Root.CFrame = targetCF
-                State.Root.AssemblyLinearVelocity = Vector3.zero
-                State.Root.AssemblyAngularVelocity = Vector3.zero
-
-                local carriedList = getConfirmedCarriedEnemies()
-                if elapsed >= minHold and (#carriedList == 0 and not isCharacterStillInSkill(State.Char)) then
-                    break
-                end
-
-                RunService.Heartbeat:Wait()
-            end
-
+            table.insert(targetCFs, CFrame.new(Config.HighPlaceTargetPos))
         elseif Config.AutoUltraFarCarry then
-            -- MODE 3: ULTRA-FAR CARRY (1B to 10B STUDS -> 1,000,000,000 to 10,000,000,000 STUDS)
-            local studDist = math.clamp(Config.UltraFarDistanceBillions or 1, 1, 10) * 1000000000
+            local billDist = math.clamp(Config.UltraFarDistanceBillions or 1, 1, 10) * 1000000000
             local originPos = State.VoidReturnCFrame.Position
             local flatDir = Vector3.new(originPos.X, 0, originPos.Z)
-            if flatDir.Magnitude < 1 then
-                flatDir = Vector3.new(0.7071, 0, 0.7071)
-            else
-                flatDir = flatDir.Unit
-            end
-
-            local farPos = Vector3.new(flatDir.X * studDist, 1800, flatDir.Z * studDist)
-            local targetCF = CFrame.new(farPos)
-            State.VoidDropTargetCF = targetCF
-
-            if State.Root then
-                State.Root.CFrame = targetCF
-                State.Root.AssemblyLinearVelocity = Vector3.zero
-                State.Root.AssemblyAngularVelocity = Vector3.zero
-            end
-
-            local holdStart = tick()
-            local minHold = 0.30
-
-            while Config.ScriptRunning and Config.AutoUltraFarCarry and State.Root and State.Hum and State.Hum.Health > 0 do
-                local elapsed = tick() - holdStart
-                if elapsed >= Config.VoidMaxHoldTime then
-                    break
-                end
-
-                State.Root.CFrame = targetCF
-                State.Root.AssemblyLinearVelocity = Vector3.zero
-                State.Root.AssemblyAngularVelocity = Vector3.zero
-
-                local carriedList = getConfirmedCarriedEnemies()
-                if elapsed >= minHold and (#carriedList == 0 and not isCharacterStillInSkill(State.Char)) then
-                    break
-                end
-
-                RunService.Heartbeat:Wait()
-            end
-
+            flatDir = (flatDir.Magnitude < 1) and Vector3.new(0.7071, 0, 0.7071) or flatDir.Unit
+            local farPos = Vector3.new(flatDir.X * billDist, 1800, flatDir.Z * billDist)
+            table.insert(targetCFs, CFrame.new(farPos))
         else
-            -- MODE 1: VOID KILL (Y = -500)
+            -- Auto Void Kill (Y = -500)
             local voidDamageY = getVoidKillPlaneY()
             local safeHoverY = getPlayerSafeVoidKillHoverY()
             local originPos = State.VoidReturnCFrame.Position
-
             local flatDir = Vector3.new(originPos.X, 0, originPos.Z)
-            if flatDir.Magnitude < 1 then
-                flatDir = Vector3.new(1, 0, 0)
-            else
-                flatDir = flatDir.Unit
+            flatDir = (flatDir.Magnitude < 1) and Vector3.new(1, 0, 0) or flatDir.Unit
+            local voidXZ = Vector3.new(originPos.X, 0, originPos.Z) + (flatDir * (Config.VoidFarHorizontalDist or 2900))
+            table.insert(targetCFs, CFrame.new(voidXZ.X, safeHoverY, voidXZ.Z) * CFrame.Angles(math.rad(-90), 0, 0))
+        end
+
+        -- 2. Gather Multi-Target Characters (checked in MultiTargetSelectedMap or ALL)
+        local destinationCF = targetCFs[1]
+        local dropStartTick = tick()
+        local minHold = 0.35
+
+        while Config.ScriptRunning and isAnyGrabCarryModeActive() and State.Root and State.Hum and State.Hum.Health > 0 do
+            local elapsed = tick() - dropStartTick
+            if elapsed >= Config.VoidMaxHoldTime then
+                break
             end
 
-            local farDist = Config.VoidFarHorizontalDist or 2900
-            local voidXZ = Vector3.new(originPos.X, 0, originPos.Z) + (flatDir * farDist)
-
-            local instantDropCF = CFrame.new(voidXZ.X, safeHoverY, voidXZ.Z) * CFrame.Angles(math.rad(-90), 0, 0)
-            State.VoidDropTargetCF = instantDropCF
-            if State.Root then
-                State.Root.CFrame = instantDropCF
-                State.Root.AssemblyLinearVelocity = Vector3.zero
-                State.Root.AssemblyAngularVelocity = Vector3.zero
-            end
-
-            local dropStartTick = tick()
-            local minStayInVoid = 0.25
-
-            while Config.ScriptRunning and Config.AutoVoidKill and State.Root and State.Hum and State.Hum.Health > 0 do
-                local elapsed = tick() - dropStartTick
-                if elapsed >= Config.VoidMaxHoldTime then
-                    break
-                end
-
-                local microDip = math.sin(elapsed * 40) * 0.55
-                local clampedY = math.max(voidDamageY + 1.4, safeHoverY + microDip)
-                local activeCF = CFrame.new(voidXZ.X, clampedY, voidXZ.Z) * CFrame.Angles(math.rad(-90), 0, 0)
-                State.VoidDropTargetCF = activeCF
-
-                State.Root.CFrame = activeCF
-                State.Root.AssemblyLinearVelocity = Vector3.zero
-                State.Root.AssemblyAngularVelocity = Vector3.zero
-
-                local carriedList = getConfirmedCarriedEnemies()
-                local allDeadOrDeleted = true
-                for _, victimModel in ipairs(carriedList) do
-                    local vHum = victimModel and victimModel:FindFirstChildOfClass("Humanoid")
-                    local vRoot = victimModel and victimModel:FindFirstChild("HumanoidRootPart")
-                    if vHum and vHum.Health > 0 and vRoot and vRoot.Parent then
-                        allDeadOrDeleted = false
-                        break
+            -- If "ALL" or specific players are ticked in MultiTargetSelectedMap, teleport to each selected player's root position first!
+            local visitedAnyTarget = false
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= LocalPlayer and plr.Character then
+                    local pName = plr.Name
+                    local isSelected = Config.MultiTargetSelectAll or Config.MultiTargetSelectedMap[pName]
+                    if isSelected then
+                        local pRoot = plr.Character:FindFirstChild("HumanoidRootPart")
+                        local pHum = plr.Character:FindFirstChildOfClass("Humanoid")
+                        if pRoot and pHum and pHum.Health > 0 then
+                            visitedAnyTarget = true
+                            if State.Root then
+                                State.Root.CFrame = pRoot.CFrame * CFrame.new(0, 0, -1.0)
+                                State.Root.AssemblyLinearVelocity = Vector3.zero
+                            end
+                            RunService.Heartbeat:Wait()
+                        end
                     end
                 end
-
-                if elapsed >= minStayInVoid and (allDeadOrDeleted and not isCharacterStillInSkill(State.Char)) then
-                    break
-                end
-
-                RunService.Heartbeat:Wait()
             end
+
+            -- Then deliver to the final destination (Void / High Place / Ultra-Far)
+            if State.Root then
+                if Config.AutoVoidKill then
+                    local voidDamageY = getVoidKillPlaneY()
+                    local microDip = math.sin(elapsed * 40) * 0.55
+                    local clampedY = math.max(voidDamageY + 1.4, destinationCF.Position.Y + microDip)
+                    State.Root.CFrame = CFrame.new(destinationCF.Position.X, clampedY, destinationCF.Position.Z) * destinationCF.Rotation
+                else
+                    State.Root.CFrame = destinationCF
+                end
+                State.Root.AssemblyLinearVelocity = Vector3.zero
+                State.Root.AssemblyAngularVelocity = Vector3.zero
+            end
+
+            local carriedList = getConfirmedCarriedEnemies()
+            local allDone = (#carriedList == 0 and not isCharacterStillInSkill(State.Char))
+            if elapsed >= minHold and (allDone or not visitedAnyTarget) then
+                break
+            end
+
+            RunService.Heartbeat:Wait()
         end
 
         State.VoidDropTargetCF = nil
@@ -871,152 +810,12 @@ local function executeGrabCarryTrip()
     end)
 end
 
--- // SPECIAL SKILL SEQUENCES
-local function runMineMultiTargetSequence()
+-- // UNIFIED SKILL TRIGGERS FOR MINE / PIERCE / BLAST AWAY
+local function runUnifiedMultiTargetSequence(skillLabel)
     if State.VoidKillActive then return end
-    State.ActiveSpecialSkill = "MINE"
+    State.ActiveSpecialSkill = skillLabel or "MULTI_GRAB"
     State.VoidReturnCFrame = State.LastSafeCFrame or (State.Root and State.Root.CFrame)
-
-    task.spawn(function()
-        local startWait = tick()
-        local firstGrabbed = nil
-
-        while (tick() - startWait) < 2.2 and Config.ScriptRunning and isAnyGrabCarryModeActive() and not State.VoidKillActive do
-            local list = getConfirmedCarriedEnemies()
-            if #list > 0 then
-                firstGrabbed = list[1]
-                break
-            end
-            RunService.Heartbeat:Wait()
-        end
-
-        if not firstGrabbed or not State.Root then
-            State.ActiveSpecialSkill = nil
-            return
-        end
-
-        for targetName, isSelected in pairs(Config.MineSelectedTargets) do
-            if isSelected and Config.ScriptRunning and isAnyGrabCarryModeActive() and State.Root then
-                local tPlr = Players:FindFirstChild(targetName)
-                local tChar = tPlr and tPlr.Character
-                local tRoot = tChar and tChar:FindFirstChild("HumanoidRootPart")
-                local tHum = tChar and tChar:FindFirstChildOfClass("Humanoid")
-                if tChar and tChar ~= firstGrabbed and tRoot and tHum and tHum.Health > 0 then
-                    for _ = 1, 3 do
-                        if State.Root then
-                            State.Root.CFrame = tRoot.CFrame * CFrame.new(0, 0, -1.2)
-                            State.Root.AssemblyLinearVelocity = Vector3.zero
-                        end
-                        RunService.Heartbeat:Wait()
-                    end
-                end
-            end
-        end
-
-        executeGrabCarryTrip()
-    end)
-end
-
-local function runPierceTheHeavensSequence()
-    if State.VoidKillActive then return end
-    State.ActiveSpecialSkill = "Pierce The Heavens"
-    State.VoidReturnCFrame = State.LastSafeCFrame or (State.Root and State.Root.CFrame)
-
-    task.spawn(function()
-        local startWait = tick()
-        local grabbedList, grabbedMap = {}, {}
-
-        while (tick() - startWait) < 3.6 and Config.ScriptRunning and isAnyGrabCarryModeActive() and not State.VoidKillActive do
-            grabbedList, grabbedMap = getConfirmedCarriedEnemies()
-            if #grabbedList >= 1 then
-                break
-            end
-            RunService.Heartbeat:Wait()
-        end
-
-        if #grabbedList == 0 or not State.Root then
-            State.ActiveSpecialSkill = nil
-            return
-        end
-
-        local candidates = {}
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer and plr.Character and not grabbedMap[plr.Character] then
-                local eRoot = plr.Character:FindFirstChild("HumanoidRootPart")
-                local eHum = plr.Character:FindFirstChildOfClass("Humanoid")
-                if eRoot and eHum and eHum.Health > 0 then
-                    table.insert(candidates, { Model = plr.Character, Root = eRoot, Dist = (eRoot.Position - State.Root.Position).Magnitude })
-                end
-            end
-        end
-        table.sort(candidates, function(a, b) return a.Dist < b.Dist end)
-
-        for _, cand in ipairs(candidates) do
-            local curList, curMap = getConfirmedCarriedEnemies()
-            if #curList >= 3 then break end
-            if not curMap[cand.Model] and cand.Root and cand.Root.Parent then
-                local sweepStart = tick()
-                while (tick() - sweepStart) < 0.16 and Config.ScriptRunning and isAnyGrabCarryModeActive() and State.Root do
-                    State.Root.CFrame = cand.Root.CFrame * CFrame.new(0, 0, -1.0)
-                    State.Root.AssemblyLinearVelocity = Vector3.zero
-                    local _, checkMap = getConfirmedCarriedEnemies()
-                    if checkMap[cand.Model] then break end
-                    RunService.Heartbeat:Wait()
-                end
-            end
-        end
-
-        executeGrabCarryTrip()
-    end)
-end
-
-local function runBlastAwayLoopSequence()
-    if State.VoidKillActive then return end
-    State.ActiveSpecialSkill = "BLAST AWAY"
-    State.GrabbedThisCast = {}
-    State.VoidReturnCFrame = State.LastSafeCFrame or (State.Root and State.Root.CFrame)
-
-    task.spawn(function()
-        local loopStart = tick()
-        while (tick() - loopStart) < 0.85 and Config.ScriptRunning and isAnyGrabCarryModeActive() and State.Root and State.Hum and State.Hum.Health > 0 do
-            local _, grabbedMap = getConfirmedCarriedEnemies()
-            for m, _ in pairs(grabbedMap) do
-                State.GrabbedThisCast[m] = true
-            end
-
-            local nextTargetRoot = nil
-            local shortest = math.huge
-            for _, plr in ipairs(Players:GetPlayers()) do
-                if plr ~= LocalPlayer and plr.Character and not State.GrabbedThisCast[plr.Character] then
-                    local eRoot = plr.Character:FindFirstChild("HumanoidRootPart")
-                    local eHum = plr.Character:FindFirstChildOfClass("Humanoid")
-                    if eRoot and eHum and eHum.Health > 0 then
-                        local d = (eRoot.Position - State.Root.Position).Magnitude
-                        if d < shortest and d <= 120 then
-                            shortest = d
-                            nextTargetRoot = eRoot
-                        end
-                    end
-                end
-            end
-
-            if nextTargetRoot then
-                State.Root.CFrame = nextTargetRoot.CFrame * CFrame.new(0, 0, -0.8)
-                State.Root.AssemblyLinearVelocity = Vector3.zero
-            else
-                break
-            end
-
-            RunService.Heartbeat:Wait()
-        end
-
-        local finalGrabbed = getConfirmedCarriedEnemies()
-        if #finalGrabbed > 0 then
-            executeGrabCarryTrip()
-        else
-            State.ActiveSpecialSkill = nil
-        end
-    end)
+    executeUnifiedMultiTargetGrabTrip()
 end
 
 local KeyMap1To4 = {
@@ -1067,32 +866,8 @@ local function onSkillSlotTriggered(slotStr)
 
     State.GrabWatchWindowUntil = tick() + 2.2
 
-    if lowerSkill == "mine" or string.find(lowerSkill, "^mine$") then
-        runMineMultiTargetSequence()
-        return
-    end
-
-    if string.find(lowerSkill, "pierce the heavens", 1, true) then
-        runPierceTheHeavensSequence()
-        return
-    end
-
-    if string.find(lowerSkill, "blast away", 1, true) then
-        runBlastAwayLoopSequence()
-        return
-    end
-
-    task.spawn(function()
-        local waitStart = tick()
-        while (tick() - waitStart) < 2.2 and Config.ScriptRunning and isAnyGrabCarryModeActive() and not State.VoidKillActive do
-            local carried = getConfirmedCarriedEnemies()
-            if #carried > 0 then
-                executeGrabCarryTrip()
-                return
-            end
-            RunService.Heartbeat:Wait()
-        end
-    end)
+    -- Any supported grab skill (Mine, Pierce The Heavens, Blast Away, Quintuple Smash, etc.) triggers the unified multi-target handler!
+    runUnifiedMultiTargetSequence(skillName)
 end
 
 -- // ZERO-INSTANCE ANTI-SKILL EVASION
@@ -1116,15 +891,6 @@ local function isEnemyActuallyCastingSkillNearMe(enemyChar, enemyRoot, myPositio
         end
         if child:IsA("Tool") then
             return true
-        end
-    end
-
-    for _, desc in ipairs(enemyRoot:GetChildren()) do
-        if desc:IsA("BodyVelocity") or desc:IsA("BodyPosition") or desc:IsA("LinearVelocity") or desc:IsA("BodyGyro") or desc:IsA("AlignPosition") then
-            local dn = string.lower(desc.Name)
-            if not string.find(dn, "knockback") and not string.find(dn, "stun") then
-                return true
-            end
         end
     end
 
@@ -1386,7 +1152,7 @@ local function scanProximityGrab()
     local carriedList = getConfirmedCarriedEnemies()
     if #carriedList > 0 then
         State.GrabWatchWindowUntil = 0
-        executeGrabCarryTrip()
+        executeUnifiedMultiTargetGrabTrip()
     end
 end
 
@@ -1449,7 +1215,7 @@ local function bindCharacter(char)
                 end
                 local victim = checkStrictGrabJoint(inst)
                 if victim then
-                    executeGrabCarryTrip()
+                    executeUnifiedMultiTargetGrabTrip()
                 end
             end)
         end
@@ -1799,7 +1565,7 @@ local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 290, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v38 1.7kHigh+10B"
+SubTitle.Text = "Heroes Battlegrounds v39 UnifiedMultiTarget"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
@@ -2300,8 +2066,7 @@ local function addDropdown(parent, label, options, defaultIndex, callback)
     }
 end
 
-local function addMultiDropdown(parent, label, options, callback)
-    local selectedMap = {}
+local function addUnifiedMultiTargetDropdown(parent, label, options, callback)
     local currentOptions = options
     local ownerId = tostring({})
 
@@ -2372,14 +2137,18 @@ local function addMultiDropdown(parent, label, options, callback)
     Chevron.Parent = SelectBox
 
     local function updateSummaryText()
-        local names = {}
-        for k, v in pairs(selectedMap) do
-            if v then table.insert(names, k) end
-        end
-        if #names == 0 then
-            ValueLbl.Text = "None Selected"
+        if Config.MultiTargetSelectAll then
+            ValueLbl.Text = "[ALL PLAYERS]"
         else
-            ValueLbl.Text = table.concat(names, ", ")
+            local names = {}
+            for k, v in pairs(Config.MultiTargetSelectedMap) do
+                if v then table.insert(names, k) end
+            end
+            if #names == 0 then
+                ValueLbl.Text = "None Selected"
+            else
+                ValueLbl.Text = table.concat(names, ", ")
+            end
         end
     end
 
@@ -2389,9 +2158,33 @@ local function addMultiDropdown(parent, label, options, callback)
         end
         DropPopTitle.Text = label
 
+        -- Render "ALL" Button First
+        local allSelected = Config.MultiTargetSelectAll
+        local AllBtn = Instance.new("TextButton")
+        AllBtn.Size = UDim2.new(1, 0, 0, 28)
+        AllBtn.BackgroundColor3 = allSelected and Color3.fromRGB(195, 85, 45) or Color3.fromRGB(32, 35, 42)
+        AllBtn.BackgroundTransparency = allSelected and 0.05 or 0.25
+        AllBtn.Text = (allSelected and "  ● [ALL]  " or "  ○ [ALL]  ") .. "Select All Players"
+        AllBtn.TextColor3 = allSelected and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(255, 215, 115)
+        AllBtn.Font = allSelected and Enum.Font.GothamBold or Enum.Font.GothamMedium
+        AllBtn.TextSize = 12
+        AllBtn.TextXAlignment = Enum.TextXAlignment.Left
+        AllBtn.AutoButtonColor = false
+        AllBtn.ZIndex = 53
+        AllBtn.Parent = DropPopScroll
+        Instance.new("UICorner", AllBtn).CornerRadius = UDim.new(0, 5)
+
+        AllBtn.MouseButton1Click:Connect(function()
+            Config.MultiTargetSelectAll = not Config.MultiTargetSelectAll
+            updateSummaryText()
+            callback(Config.MultiTargetSelectedMap, Config.MultiTargetSelectAll)
+            renderExternalMultiPopup()
+        end)
+
+        -- Render Individual Players
         for _, opt in ipairs(currentOptions) do
             if opt ~= "None" then
-                local isSelected = (selectedMap[opt] == true)
+                local isSelected = (Config.MultiTargetSelectedMap[opt] == true) and not Config.MultiTargetSelectAll
                 local ItemBtn = Instance.new("TextButton")
                 ItemBtn.Size = UDim2.new(1, 0, 0, 28)
                 ItemBtn.BackgroundColor3 = isSelected and Color3.fromRGB(40, 125, 195) or Color3.fromRGB(32, 35, 42)
@@ -2407,9 +2200,10 @@ local function addMultiDropdown(parent, label, options, callback)
                 Instance.new("UICorner", ItemBtn).CornerRadius = UDim.new(0, 5)
 
                 ItemBtn.MouseButton1Click:Connect(function()
-                    selectedMap[opt] = not selectedMap[opt]
+                    Config.MultiTargetSelectAll = false
+                    Config.MultiTargetSelectedMap[opt] = not Config.MultiTargetSelectedMap[opt]
                     updateSummaryText()
-                    callback(selectedMap)
+                    callback(Config.MultiTargetSelectedMap, Config.MultiTargetSelectAll)
                     renderExternalMultiPopup()
                 end)
             end
@@ -2432,11 +2226,11 @@ local function addMultiDropdown(parent, label, options, callback)
             currentOptions = newOptions
             local validSet = {}
             for _, o in ipairs(newOptions) do validSet[o] = true end
-            for k, _ in pairs(selectedMap) do
-                if not validSet[k] then selectedMap[k] = nil end
+            for k, _ in pairs(Config.MultiTargetSelectedMap) do
+                if not validSet[k] then Config.MultiTargetSelectedMap[k] = nil end
             end
             updateSummaryText()
-            callback(selectedMap)
+            callback(Config.MultiTargetSelectedMap, Config.MultiTargetSelectAll)
             if DropdownPopup.Visible and activePopupOwner == ownerId then
                 renderExternalMultiPopup()
             end
@@ -2691,39 +2485,14 @@ local currentTargetList = getPlayerNames()
 Config.SelectedPlayer = currentTargetList[1]
 
 -- // ==========================================================================
--- // 1. POPULATE VOID KILL TAB (3 SEPARATE GRAB-CARRY MODES)
+-- // 1. POPULATE VOID KILL TAB
 -- // ==========================================================================
-local SlotPreviewCard = Instance.new("Frame")
-SlotPreviewCard.Size = UDim2.new(1, 0, 0, 44)
-SlotPreviewCard.BackgroundColor3 = Color3.fromRGB(28, 32, 42)
-SlotPreviewCard.BackgroundTransparency = 0.15
-SlotPreviewCard.BorderSizePixel = 0
-SlotPreviewCard.Parent = TabVoid
-Instance.new("UICorner", SlotPreviewCard).CornerRadius = UDim.new(0, 6)
-
-local SlotPreviewStroke = Instance.new("UIStroke", SlotPreviewCard)
-SlotPreviewStroke.Color = Color3.fromRGB(65, 165, 245)
-SlotPreviewStroke.Transparency = 0.35
-SlotPreviewStroke.Thickness = 1
-
-State.SlotStatusLabel = Instance.new("TextLabel")
-State.SlotStatusLabel.Size = UDim2.new(1, -20, 1, -8)
-State.SlotStatusLabel.Position = UDim2.new(0, 10, 0, 4)
-State.SlotStatusLabel.BackgroundTransparency = 1
-State.SlotStatusLabel.Text = "Slot 1: Unscanned  |  Slot 2: Unscanned\nSlot 3: Unscanned  |  Slot 4: Unscanned"
-State.SlotStatusLabel.TextColor3 = Color3.fromRGB(165, 225, 255)
-State.SlotStatusLabel.Font = Enum.Font.GothamSemibold
-State.SlotStatusLabel.TextSize = 11
-State.SlotStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
-State.SlotStatusLabel.Parent = SlotPreviewCard
-
 addDualButtons(
     TabVoid,
     "TP Void (2k White Floor)", Color3.fromRGB(45, 115, 195), function() teleportToDeepVoid() end,
     "TP Back (Full Resync)", Color3.fromRGB(55, 135, 95), function() teleportBackFromDeepVoid() end
 )
 
--- Mode 1: Auto Void Kill (Y = -500)
 addFeatureToggle(TabVoid, "AutoVoidKill", "1. Auto Void Kill (Drop Enemy Below Y = -500)", "VOIDK", false, function(v)
     Config.AutoVoidKill = v
     if v then
@@ -2743,7 +2512,6 @@ addFeatureToggle(TabVoid, "AutoVoidKill", "1. Auto Void Kill (Drop Enemy Below Y
     end
 end)
 
--- Mode 2: Auto Carry To High Place -> Vector3.new(35.79, 1700.00, -207.31)
 addFeatureToggle(TabVoid, "AutoHighPlaceCarry", "2. Auto Carry High Place (35.79, 1800.00, -207.31)", "HIGHC", false, function(v)
     Config.AutoHighPlaceCarry = v
     if v then
@@ -2763,7 +2531,6 @@ addFeatureToggle(TabVoid, "AutoHighPlaceCarry", "2. Auto Carry High Place (35.79
     end
 end)
 
--- Mode 3: Auto Carry Ultra-Far (1B to 10B Studs)
 addFeatureToggle(TabVoid, "AutoUltraFarCarry", "3. Auto Carry Ultra-Far (1B - 10B Studs)", "FARC", false, function(v)
     Config.AutoUltraFarCarry = v
     if v then
@@ -2787,8 +2554,9 @@ addSlider(TabVoid, "Ultra-Far Distance (Billion Studs)", 1, 10, 1, function(v)
     Config.UltraFarDistanceBillions = v
 end)
 
-local MineMultiDropdown = addMultiDropdown(TabVoid, "Mine Multi Targets", currentTargetList, function(selectedMap)
-    Config.MineSelectedTargets = selectedMap
+local UnifiedMultiTargetDropdown = addUnifiedMultiTargetDropdown(TabVoid, "Multi-Target Grab (Select Players or ALL)", currentTargetList, function(selectedMap, selectAll)
+    Config.MultiTargetSelectedMap = selectedMap
+    Config.MultiTargetSelectAll = selectAll
 end)
 
 addSlider(TabVoid, "Carry / Void Hold Duration", 0.35, 3.00, 1.45, function(v)
@@ -2900,7 +2668,7 @@ addFeatureToggle(TabTarget, "TeleportPlayer", "Pin-able Instant Teleport To Play
     end
 end)
 
--- // 4. POPULATE LOCALPLAYER TAB (ZERO-DROP R6/R15 GROUND PAD FLY)
+-- // 4. POPULATE LOCALPLAYER TAB
 addFeatureToggle(TabMove, "Fly", "Fly (Zero-Drop Invisible Ground Pad)", "FLY", false, function(v)
     Config.FlyEnabled = v
     if v and State.Root then
@@ -3000,7 +2768,7 @@ end)
 addButton(TabVisual, "Refresh Player Lists", nil, function()
     local updated = getPlayerNames()
     PlayerDropdown.Refresh(updated)
-    MineMultiDropdown.Refresh(updated)
+    UnifiedMultiTargetDropdown.Refresh(updated)
 end)
 
 addButton(TabVisual, "Unload Script", Color3.fromRGB(145, 45, 50), function()
@@ -3018,7 +2786,7 @@ table.insert(State.Connections, Players.PlayerAdded:Connect(function()
     if Config.ScriptRunning then
         local updated = getPlayerNames()
         PlayerDropdown.Refresh(updated)
-        MineMultiDropdown.Refresh(updated)
+        UnifiedMultiTargetDropdown.Refresh(updated)
     end
 end))
 
@@ -3034,7 +2802,7 @@ table.insert(State.Connections, Players.PlayerRemoving:Connect(function(leavingP
     task.wait(0.2)
     local updated = getPlayerNames()
     PlayerDropdown.Refresh(updated)
-    MineMultiDropdown.Refresh(updated)
+    UnifiedMultiTargetDropdown.Refresh(updated)
 end))
 
 -- // STEALTH ESP
@@ -3374,7 +3142,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             end
         end
 
-        -- TRUE ZERO-DROP R6/R15 INVISIBLE GROUND PAD FLY + LOOP FLY
+        -- FLY
         if Config.FlyEnabled and not Config.AutoTargetEnabled and not State.VoidKillActive and not State.AntiSkillEvading then
             local moveDir = getFlightDirection(hum)
             local spd = Config.FlySpeed or 75
