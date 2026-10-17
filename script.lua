@@ -49,7 +49,7 @@ local Config = {
     AutoHighPlaceCarry = false,
     AutoUltraFarCarry = false,
 
-    HighPlaceTargetPos = Vector3.new(35.79, 1700.00, -207.31),
+    HighPlaceTargetPos = Vector3.new(35.79, 1800.00, -207.31),
     UltraFarDistanceBillions = 1, -- Default 1B studs (Slider: 1B to 10B studs)
     VoidMaxHoldTime = 1.45,
 
@@ -766,7 +766,7 @@ local function executeGrabCarryTrip()
                 flatDir = flatDir.Unit
             end
 
-            local farPos = Vector3.new(flatDir.X * studDist, 1700, flatDir.Z * studDist)
+            local farPos = Vector3.new(flatDir.X * studDist, 1800, flatDir.Z * studDist)
             local targetCF = CFrame.new(farPos)
             State.VoidDropTargetCF = targetCF
 
@@ -2744,7 +2744,7 @@ addFeatureToggle(TabVoid, "AutoVoidKill", "1. Auto Void Kill (Drop Enemy Below Y
 end)
 
 -- Mode 2: Auto Carry To High Place -> Vector3.new(35.79, 1700.00, -207.31)
-addFeatureToggle(TabVoid, "AutoHighPlaceCarry", "2. Auto Carry High Place (35.79, 1700.00, -207.31)", "HIGHC", false, function(v)
+addFeatureToggle(TabVoid, "AutoHighPlaceCarry", "2. Auto Carry High Place (35.79, 1800.00, -207.31)", "HIGHC", false, function(v)
     Config.AutoHighPlaceCarry = v
     if v then
         if Config.AutoVoidKill and State.ToggleRegistry["AutoVoidKill"] then
