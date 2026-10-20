@@ -1,10 +1,9 @@
--- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v39)
--- Updates in v39:
---   1. Unified Multi-Target Grab Engine: MINE, Pierce The Heavens, and BLAST AWAY now share a single dropdown selection pool!
---   2. "ALL" Selector Option: Instantly selects all players in the server for multi-target sweeps.
---   3. Fixed Multi-Target Teleportation: Iterates through checked targets with proper yield timing so character cleanly visits every selected player before executing the Void/Far/High drop.
---   4. High Place altitude set to Y = 1800: Vector3.new(35.79, 1800.00, -207.31).
---   5. Ultra-Far distance increased to 1 Billion (1B) - 10 Billion (10B) studs.
+-- Context: Luau (Roblox Client Executor - Heroes Battlegrounds Edition v40)
+-- Updates in v40:
+--   1. Fake Hitbox Engine: Displaces server-side hitbox (HumanoidRootPart) far away while keeping character skin (Model) and Camera anchored at original position.
+--   2. Multiple Fake Hitbox Modes: Offset Direction (Behind/Above/Underground/Custom), Static Anchor, Jitter Spoof, and Safe Void Hover.
+--   3. Live Hitbox Visualizer: Optional neon ghost indicator showing exact server hitbox position.
+--   4. Preserved all v39 Unified Multi-Target Grab, Void Kill, Combat, AutoFarm, and Movement features.
 
 local cloneref = cloneref or function(obj) return obj end
 
@@ -69,6 +68,17 @@ local Config = {
         "Razor Blitz", "Assasin's Eclipse", "Assassin's Eclipse",
     },
 
+    -- Fake Hitbox Settings
+    FakeHitboxEnabled = false,
+    FakeHitboxMethod = "Motor6D+Cycle", -- "Motor6D+Cycle" or "PureCFrameCycle"
+    FakeHitboxMode = "OffsetDirection", -- "OffsetDirection", "StaticAnchor", "RandomJitter", "SafeVoidLevel"
+    FakeHitboxDistX = 0,
+    FakeHitboxDistY = 35,
+    FakeHitboxDistZ = 28,
+    FakeHitboxRadius = 35,
+    FakeHitboxVisualizer = true,
+    PauseFakeHitboxOnAttack = true,
+
     -- Combat & Auto Features
     AutoSkillEnabled = false,
     AutoSkillDelay = 0.45,
@@ -111,6 +121,8 @@ local State = {
     UIToken = randomToken(),
     WhiteFloorToken = randomToken(),
     GroundPadToken = randomToken(),
+    HitboxVisToken = randomToken(),
+    CameraProxyToken = randomToken(),
 
     Char = nil,
     Root = nil,
@@ -119,6 +131,14 @@ local State = {
     OrigRootJointC0 = nil,
     OrigRootJointC1 = nil,
     CharConnections = {},
+
+    -- Fake Hitbox State
+    RealCharacterCF = nil,
+    FakeHitboxCF = nil,
+    StaticAnchorCF = nil,
+    IsCurrentlySpoofed = false,
+    HitboxVisPart = nil,
+    CameraProxyPart = nil,
 
     DetectedSlotNames = {
         ["1"] = "Unscanned",
@@ -215,13 +235,14 @@ local function destroyInvisibleGroundPad()
     end
 end
 
-local function updateGroundPadUnderCharacter(char, root, hum, lockedRootY)
+local function updateGroundPadUnderCharacter(char, root, hum, lockedRootY, overrideXZPos)
     if not root or not hum then return end
     local pad = ensureInvisibleGroundPad()
     local footBottomDist = getExactFootBottomOffset(char, root, hum)
     local padTopY = lockedRootY - footBottomDist + 0.03
     local padCenterY = padTopY - (pad.Size.Y * 0.5)
-    pad.CFrame = CFrame.new(root.Position.X, padCenterY, root.Position.Z)
+    local refPos = overrideXZPos or root.Position
+    pad.CFrame = CFrame.new(refPos.X, padCenterY, refPos.Z)
     pad.AssemblyLinearVelocity = Vector3.zero
 end
 
@@ -229,7 +250,7 @@ local function syncFlyAltitudeToCFrame(newCF)
     if not newCF then return end
     State.FlyAltitudeY = newCF.Position.Y
     if Config.FlyEnabled and State.Root and State.Hum then
-        updateGroundPadUnderCharacter(State.Char, State.Root, State.Hum, State.FlyAltitudeY)
+        updateGroundPadUnderCharacter(State.Char, State.Root, State.Hum, State.FlyAltitudeY, newCF.Position)
     end
 end
 
@@ -295,6 +316,127 @@ local function getRootMotor(char)
     return nil
 end
 
+-- // ==========================================================================
+-- // FAKE HITBOX ENGINE (SERVER HITBOX DISPLACEMENT + VISUAL/CAMERA ANCHOR)
+-- // ==========================================================================
+local function ensureHitboxVisualizer()
+    if State.HitboxVisPart and State.HitboxVisPart.Parent then
+        return State.HitboxVisPart
+    end
+    local vis = Instance.new("Part")
+    vis.Name = State.HitboxVisToken
+    vis.Archivable = false
+    vis.Size = Vector3.new(4, 5, 2)
+    vis.Anchored = true
+    vis.CanCollide = false
+    vis.CanQuery = false
+    vis.CanTouch = false
+    vis.Material = Enum.Material.ForceField
+    vis.Color = Color3.fromRGB(0, 215, 255)
+    vis.Transparency = 0.35
+    vis.Parent = Workspace.Terrain
+
+    local box = Instance.new("SelectionBox")
+    box.Adornee = vis
+    box.Color3 = Color3.fromRGB(70, 200, 255)
+    box.LineThickness = 0.04
+    box.SurfaceTransparency = 0.85
+    box.Parent = vis
+
+    State.HitboxVisPart = vis
+    return vis
+end
+
+local function destroyHitboxVisualizer()
+    if State.HitboxVisPart then
+        pcall(function() State.HitboxVisPart:Destroy() end)
+        State.HitboxVisPart = nil
+    end
+end
+
+local function ensureCameraProxy()
+    if State.CameraProxyPart and State.CameraProxyPart.Parent then
+        return State.CameraProxyPart
+    end
+    local proxy = Instance.new("Part")
+    proxy.Name = State.CameraProxyToken
+    proxy.Archivable = false
+    proxy.Size = Vector3.new(1, 1, 1)
+    proxy.Anchored = true
+    proxy.CanCollide = false
+    proxy.CanQuery = false
+    proxy.CanTouch = false
+    proxy.Transparency = 1
+    proxy.Parent = Workspace.Terrain
+    State.CameraProxyPart = proxy
+    return proxy
+end
+
+local function destroyCameraProxy()
+    if State.CameraProxyPart then
+        pcall(function() State.CameraProxyPart:Destroy() end)
+        State.CameraProxyPart = nil
+    end
+end
+
+local function resetFakeHitboxState()
+    local char = State.Char
+    local root = State.Root
+    local hum = State.Hum
+
+    if State.IsCurrentlySpoofed and root and State.RealCharacterCF then
+        pcall(function()
+            root.CFrame = State.RealCharacterCF
+        end)
+    end
+    State.IsCurrentlySpoofed = false
+
+    if char and not Config.InvisibleEnabled then
+        local motor = getRootMotor(char)
+        if motor and State.OrigRootJointC0 then
+            motor.C0 = State.OrigRootJointC0
+        end
+    end
+
+    if hum and Camera and Camera.CameraSubject == State.CameraProxyPart then
+        Camera.CameraSubject = hum
+    end
+
+    destroyHitboxVisualizer()
+    destroyCameraProxy()
+end
+
+local function computeFakeHitboxCFrame(realCF)
+    if Config.FakeHitboxMode == "StaticAnchor" then
+        if not State.StaticAnchorCF then
+            State.StaticAnchorCF = realCF * CFrame.new(Config.FakeHitboxDistX, Config.FakeHitboxDistY, Config.FakeHitboxDistZ)
+        end
+        return State.StaticAnchorCF
+    elseif Config.FakeHitboxMode == "RandomJitter" then
+        local r = Config.FakeHitboxRadius
+        local angle = math.random() * math.pi * 2
+        local ox = math.cos(angle) * r
+        local oz = math.sin(angle) * r
+        local oy = Config.FakeHitboxDistY
+        return CFrame.new(realCF.Position + Vector3.new(ox, oy, oz)) * realCF.Rotation
+    elseif Config.FakeHitboxMode == "SafeVoidLevel" then
+        local safeY = getVoidKillPlaneY() + 32
+        return CFrame.new(realCF.Position.X + Config.FakeHitboxDistX, safeY, realCF.Position.Z + Config.FakeHitboxDistZ) * realCF.Rotation
+    else
+        -- Default: OffsetDirection (Relative to character CFrame)
+        return realCF * CFrame.new(Config.FakeHitboxDistX, Config.FakeHitboxDistY, Config.FakeHitboxDistZ)
+    end
+end
+
+local function shouldBypassFakeHitbox()
+    if not Config.FakeHitboxEnabled or not Config.ScriptRunning then return true end
+    if State.VoidKillActive or State.AntiSkillEvading or Config.DeepVoidActive then return true end
+    if Config.PauseFakeHitboxOnAttack and (tick() - State.LastSkillCastTick < 0.55) then
+        return true
+    end
+    return false
+end
+
 local function forceFullCharacterAndCameraResync(targetCF)
     local char = LocalPlayer.Character or State.Char
     local root = (char and char:FindFirstChild("HumanoidRootPart")) or State.Root
@@ -302,6 +444,7 @@ local function forceFullCharacterAndCameraResync(targetCF)
     if not char or not root or not targetCF then return end
 
     pcall(function()
+        State.IsCurrentlySpoofed = false
         local motor = getRootMotor(char)
         if motor and not Config.InvisibleEnabled then
             if State.OrigRootJointC0 then motor.C0 = State.OrigRootJointC0 end
@@ -332,6 +475,7 @@ local function forceFullCharacterAndCameraResync(targetCF)
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
 
+        State.RealCharacterCF = uprightCF
         syncFlyAltitudeToCFrame(uprightCF)
 
         for _, part in ipairs(char:GetDescendants()) do
@@ -363,8 +507,9 @@ local function teleportToDeepVoid()
     local myRoot = State.Root
     if not myRoot then return end
 
-    if not Config.DeepVoidActive and myRoot.Position.Y > -100 and myRoot.Position.Magnitude < 1400 then
-        State.PreDeepVoidCFrame = myRoot.CFrame
+    local refCF = State.RealCharacterCF or myRoot.CFrame
+    if not Config.DeepVoidActive and refCF.Position.Y > -100 and refCF.Position.Magnitude < 1400 then
+        State.PreDeepVoidCFrame = refCF
     end
 
     Config.DeepVoidActive = true
@@ -404,7 +549,7 @@ end
 
 local function findNearestValidPlayer(maxRange)
     local myRoot = State.Root
-    local refPos = myRoot and myRoot.Position or Camera.CFrame.Position
+    local refPos = (State.RealCharacterCF and State.RealCharacterCF.Position) or (myRoot and myRoot.Position) or Camera.CFrame.Position
     local closestPlayer = nil
     local shortestDist = maxRange or math.huge
 
@@ -659,6 +804,8 @@ local function getConfirmedCarriedEnemies()
     local grabbedList = {}
     if not myChar or not myRoot then return grabbedList, grabbedMap end
 
+    local refPos = (State.RealCharacterCF and State.RealCharacterCF.Position) or myRoot.Position
+
     for _, desc in ipairs(myChar:GetDescendants()) do
         local m = checkStrictGrabJoint(desc)
         if m and not grabbedMap[m] then
@@ -673,7 +820,7 @@ local function getConfirmedCarriedEnemies()
         if enemyModel ~= myChar and enemyModel:IsA("Model") and not grabbedMap[enemyModel] then
             local eRoot = enemyModel:FindFirstChild("HumanoidRootPart")
             local eHum = enemyModel:FindFirstChildOfClass("Humanoid")
-            if eRoot and eHum and eHum.Health > 0 and (eRoot.Position - myRoot.Position).Magnitude <= 12 then
+            if eRoot and eHum and eHum.Health > 0 and (eRoot.Position - refPos).Magnitude <= 12 then
                 for _, desc in ipairs(enemyModel:GetDescendants()) do
                     if checkStrictGrabJoint(desc) then
                         grabbedMap[enemyModel] = true
@@ -687,7 +834,7 @@ local function getConfirmedCarriedEnemies()
                         or (enemyModel:GetAttribute("Grabbed") == true)
                         or (eRoot:FindFirstChildOfClass("AlignPosition") ~= nil)
                         or (eRoot:FindFirstChildOfClass("WeldConstraint") ~= nil)
-                    if hasGrabTag and (eRoot.Position - myRoot.Position).Magnitude <= 6.5 then
+                    if hasGrabTag and (eRoot.Position - refPos).Magnitude <= 6.5 then
                         grabbedMap[enemyModel] = true
                         table.insert(grabbedList, enemyModel)
                     end
@@ -700,7 +847,7 @@ local function getConfirmedCarriedEnemies()
 end
 
 -- // ==========================================================================
--- // UNIFIED MULTI-TARGET GRAB & CARRY ENGINE (SUPPORTS ALL 3 SKILLS + ALL TOGGLE + TELEPORT ITERATION)
+-- // UNIFIED MULTI-TARGET GRAB & CARRY ENGINE
 -- // ==========================================================================
 local function executeUnifiedMultiTargetGrabTrip()
     if not Config.ScriptRunning or State.VoidKillActive or not isAnyGrabCarryModeActive() then return end
@@ -710,16 +857,16 @@ local function executeUnifiedMultiTargetGrabTrip()
     if not myChar or not myRoot or not myHum or myHum.Health <= 0 then return end
 
     State.VoidKillActive = true
+    local currentRealCF = State.RealCharacterCF or myRoot.CFrame
     if State.LastSafeCFrame and State.LastSafeCFrame.Position.Y > -20 and State.LastSafeCFrame.Position.Magnitude < 2000 then
         State.VoidReturnCFrame = State.LastSafeCFrame
-    elseif myRoot.Position.Y > -20 and myRoot.Position.Magnitude < 2000 then
-        State.VoidReturnCFrame = myRoot.CFrame
+    elseif currentRealCF.Position.Y > -20 and currentRealCF.Position.Magnitude < 2000 then
+        State.VoidReturnCFrame = currentRealCF
     else
         State.VoidReturnCFrame = CFrame.new(0, 55, 0)
     end
 
     task.spawn(function()
-        -- 1. Determine Target Destination based on active mode
         local targetCFs = {}
 
         if Config.AutoHighPlaceCarry then
@@ -732,7 +879,6 @@ local function executeUnifiedMultiTargetGrabTrip()
             local farPos = Vector3.new(flatDir.X * billDist, 1800, flatDir.Z * billDist)
             table.insert(targetCFs, CFrame.new(farPos))
         else
-            -- Auto Void Kill (Y = -500)
             local voidDamageY = getVoidKillPlaneY()
             local safeHoverY = getPlayerSafeVoidKillHoverY()
             local originPos = State.VoidReturnCFrame.Position
@@ -742,7 +888,6 @@ local function executeUnifiedMultiTargetGrabTrip()
             table.insert(targetCFs, CFrame.new(voidXZ.X, safeHoverY, voidXZ.Z) * CFrame.Angles(math.rad(-90), 0, 0))
         end
 
-        -- 2. Gather Multi-Target Characters (checked in MultiTargetSelectedMap or ALL)
         local destinationCF = targetCFs[1]
         local dropStartTick = tick()
         local minHold = 0.35
@@ -753,7 +898,6 @@ local function executeUnifiedMultiTargetGrabTrip()
                 break
             end
 
-            -- If "ALL" or specific players are ticked in MultiTargetSelectedMap, teleport to each selected player's root position first!
             local visitedAnyTarget = false
             for _, plr in ipairs(Players:GetPlayers()) do
                 if plr ~= LocalPlayer and plr.Character then
@@ -774,7 +918,6 @@ local function executeUnifiedMultiTargetGrabTrip()
                 end
             end
 
-            -- Then deliver to the final destination (Void / High Place / Ultra-Far)
             if State.Root then
                 if Config.AutoVoidKill then
                     local voidDamageY = getVoidKillPlaneY()
@@ -810,11 +953,10 @@ local function executeUnifiedMultiTargetGrabTrip()
     end)
 end
 
--- // UNIFIED SKILL TRIGGERS FOR MINE / PIERCE / BLAST AWAY
 local function runUnifiedMultiTargetSequence(skillLabel)
     if State.VoidKillActive then return end
     State.ActiveSpecialSkill = skillLabel or "MULTI_GRAB"
-    State.VoidReturnCFrame = State.LastSafeCFrame or (State.Root and State.Root.CFrame)
+    State.VoidReturnCFrame = State.LastSafeCFrame or State.RealCharacterCF or (State.Root and State.Root.CFrame)
     executeUnifiedMultiTargetGrabTrip()
 end
 
@@ -828,6 +970,16 @@ local KeyMap1To4 = {
 local function onSkillSlotTriggered(slotStr)
     State.LastKeyPressed = slotStr
     State.LastSkillCastTick = tick()
+
+    -- Temporarily snap real CFrame if FakeHitbox is active and PauseFakeHitboxOnAttack is on
+    if Config.FakeHitboxEnabled and Config.PauseFakeHitboxOnAttack and State.Root and State.RealCharacterCF then
+        State.IsCurrentlySpoofed = false
+        State.Root.CFrame = State.RealCharacterCF
+        local motor = getRootMotor(State.Char)
+        if motor and State.OrigRootJointC0 and not Config.InvisibleEnabled then
+            motor.C0 = State.OrigRootJointC0
+        end
+    end
 
     local slots = scanHotbarSkills1To4()
     local skillName = slots[slotStr] or ("Skill_" .. slotStr)
@@ -865,8 +1017,6 @@ local function onSkillSlotTriggered(slotStr)
     end
 
     State.GrabWatchWindowUntil = tick() + 2.2
-
-    -- Any supported grab skill (Mine, Pierce The Heavens, Blast Away, Quintuple Smash, etc.) triggers the unified multi-target handler!
     runUnifiedMultiTargetSequence(skillName)
 end
 
@@ -898,7 +1048,9 @@ local function isEnemyActuallyCastingSkillNearMe(enemyChar, enemyRoot, myPositio
 end
 
 local function detectNearbyEnemySkillThreat()
-    local refPos = State.AntiSkillEvading and (State.DecoyCFrame and State.DecoyCFrame.Position) or (State.Root and State.Root.Position)
+    local refPos = State.AntiSkillEvading and (State.DecoyCFrame and State.DecoyCFrame.Position)
+        or (State.RealCharacterCF and State.RealCharacterCF.Position)
+        or (State.Root and State.Root.Position)
     if not refPos then return false end
 
     for _, plr in ipairs(Players:GetPlayers()) do
@@ -930,7 +1082,7 @@ local function stopMovableGhostDecoy()
     State.DecoyCFrame = nil
 end
 
--- // PUBLIC SERVER HOP FUNCTIONS (LOWEST PING & LOWEST PLAYERS)
+-- // PUBLIC SERVER HOP FUNCTIONS
 local function rejoinCurrentServer()
     TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
 end
@@ -1161,6 +1313,9 @@ local function bindCharacter(char)
         pcall(function() c:Disconnect() end)
     end
     State.CharConnections = {}
+    State.IsCurrentlySpoofed = false
+    State.RealCharacterCF = nil
+    State.FakeHitboxCF = nil
 
     if not char or not Config.ScriptRunning then return end
     State.Char = char
@@ -1168,6 +1323,7 @@ local function bindCharacter(char)
     State.Hum = char:WaitForChild("Humanoid", 5)
 
     if not State.Root or not State.Hum then return end
+    State.RealCharacterCF = State.Root.CFrame
 
     task.defer(function()
         local motor = getRootMotor(char)
@@ -1565,7 +1721,7 @@ local SubTitle = Instance.new("TextLabel")
 SubTitle.Size = UDim2.new(0, 290, 1, 0)
 SubTitle.Position = UDim2.new(0, 134, 0, 0)
 SubTitle.BackgroundTransparency = 1
-SubTitle.Text = "Heroes Battlegrounds v39 UnifiedMultiTarget"
+SubTitle.Text = "Heroes Battlegrounds v40 FakeHitbox"
 SubTitle.TextColor3 = Color3.fromRGB(155, 165, 180)
 SubTitle.Font = Enum.Font.Gotham
 SubTitle.TextSize = 12
@@ -1629,6 +1785,7 @@ end
 
 local function unloadEntireScript()
     Config.ScriptRunning = false
+    Config.FakeHitboxEnabled = false
     Config.FlyEnabled = false
     Config.InfJumpEnabled = false
     Config.AutoTargetEnabled = false
@@ -1644,6 +1801,7 @@ local function unloadEntireScript()
     Config.AimbotActive = false
     Config.ESPEnabled = false
 
+    pcall(resetFakeHitboxState)
     pcall(stopMovableGhostDecoy)
     pcall(destroyWhiteVoidPlatform)
     pcall(destroyInvisibleGroundPad)
@@ -2158,7 +2316,6 @@ local function addUnifiedMultiTargetDropdown(parent, label, options, callback)
         end
         DropPopTitle.Text = label
 
-        -- Render "ALL" Button First
         local allSelected = Config.MultiTargetSelectAll
         local AllBtn = Instance.new("TextButton")
         AllBtn.Size = UDim2.new(1, 0, 0, 28)
@@ -2181,7 +2338,6 @@ local function addUnifiedMultiTargetDropdown(parent, label, options, callback)
             renderExternalMultiPopup()
         end)
 
-        -- Render Individual Players
         for _, opt in ipairs(currentOptions) do
             if opt ~= "None" then
                 local isSelected = (Config.MultiTargetSelectedMap[opt] == true) and not Config.MultiTargetSelectAll
@@ -2422,6 +2578,7 @@ end
 
 -- // CREATE SIDEBAR TABS
 local TabVoid   = createTab("Void Kill", "🌀")
+local TabHitbox = createTab("Fake Hitbox", "🛡")
 local TabCombat = createTab("Combat", "⚔")
 local TabTarget = createTab("AutoFarm", "◇")
 local TabMove   = createTab("LocalPlayer", "👤")
@@ -2563,7 +2720,78 @@ addSlider(TabVoid, "Carry / Void Hold Duration", 0.35, 3.00, 1.45, function(v)
     Config.VoidMaxHoldTime = v
 end)
 
--- // 2. POPULATE COMBAT TAB
+-- // ==========================================================================
+-- // 2. POPULATE FAKE HITBOX TAB
+-- // ==========================================================================
+addFeatureToggle(TabHitbox, "FakeHitbox", "Enable Fake Hitbox (Skin & Cam Stay Original)", "FHIT", false, function(v)
+    Config.FakeHitboxEnabled = v
+    if v then
+        if State.Root then
+            State.RealCharacterCF = State.Root.CFrame
+            State.StaticAnchorCF = State.Root.CFrame * CFrame.new(Config.FakeHitboxDistX, Config.FakeHitboxDistY, Config.FakeHitboxDistZ)
+        end
+    else
+        resetFakeHitboxState()
+    end
+end)
+
+addDropdown(TabHitbox, "Desync Engine Method", {"Motor6D+Cycle", "PureCFrameCycle"}, 1, function(method)
+    Config.FakeHitboxMethod = method
+    if not Config.FakeHitboxEnabled then return end
+    local motor = getRootMotor(State.Char)
+    if motor and State.OrigRootJointC0 and method == "PureCFrameCycle" then
+        motor.C0 = State.OrigRootJointC0
+    end
+end)
+
+addDropdown(TabHitbox, "Hitbox Placement Mode", {"OffsetDirection", "StaticAnchor", "RandomJitter", "SafeVoidLevel"}, 1, function(mode)
+    Config.FakeHitboxMode = mode
+    if mode == "StaticAnchor" and State.RealCharacterCF then
+        State.StaticAnchorCF = State.RealCharacterCF * CFrame.new(Config.FakeHitboxDistX, Config.FakeHitboxDistY, Config.FakeHitboxDistZ)
+    end
+end)
+
+addButton(TabHitbox, "Set Current Fake Position As Static Anchor", Color3.fromRGB(45, 115, 195), function(btn)
+    local baseCF = State.RealCharacterCF or (State.Root and State.Root.CFrame)
+    if baseCF then
+        State.StaticAnchorCF = baseCF * CFrame.new(Config.FakeHitboxDistX, Config.FakeHitboxDistY, Config.FakeHitboxDistZ)
+        btn.Text = "Static Anchor Updated!"
+        task.delay(1.2, function()
+            if btn and btn.Parent then
+                btn.Text = "Set Current Fake Position As Static Anchor"
+            end
+        end)
+    end
+end)
+
+addFeatureToggle(TabHitbox, "FakeHitboxVis", "Show Fake Hitbox Visualizer (Ghost Box)", "HVIS", true, function(v)
+    Config.FakeHitboxVisualizer = v
+    if not v then
+        destroyHitboxVisualizer()
+    end
+end)
+
+addFeatureToggle(TabHitbox, "PauseFakeHitboxOnAttack", "Snap Hitbox Back Briefly On Skill Cast", "HSNAP", true, function(v)
+    Config.PauseFakeHitboxOnAttack = v
+end)
+
+addSlider(TabHitbox, "Hitbox Offset X (Left / Right Studs)", -150, 150, 0, function(v)
+    Config.FakeHitboxDistX = v
+end)
+
+addSlider(TabHitbox, "Hitbox Offset Y (Up / Down Studs)", -150, 250, 35, function(v)
+    Config.FakeHitboxDistY = v
+end)
+
+addSlider(TabHitbox, "Hitbox Offset Z (Front / Back Studs)", -150, 150, 28, function(v)
+    Config.FakeHitboxDistZ = v
+end)
+
+addSlider(TabHitbox, "Jitter Mode Radius (Studs)", 5, 180, 35, function(v)
+    Config.FakeHitboxRadius = v
+end)
+
+-- // 3. POPULATE COMBAT TAB
 addFeatureToggle(TabCombat, "AutoSkill", "Auto Skill (1 - 4)", "ASKL", false, function(v)
     Config.AutoSkillEnabled = v
     if v then scanHotbarSkills1To4() end
@@ -2599,13 +2827,13 @@ addDropdown(TabCombat, "Aimbot Part", {"Head", "HumanoidRootPart"}, 1, function(
     Config.AimPart = part
 end)
 
--- // 3. POPULATE AUTOFARM TAB
+-- // 4. POPULATE AUTOFARM TAB
 addFeatureToggle(TabTarget, "AutoTarget", "AutoFarm Player", "TAR", false, function(v)
     Config.AutoTargetEnabled = v
     State.FreeMoveOffset = Vector3.zero
     if not v and State.Root then
         State.Root.AssemblyLinearVelocity = Vector3.zero
-        syncFlyAltitudeToCFrame(State.Root.CFrame)
+        syncFlyAltitudeToCFrame(State.RealCharacterCF or State.Root.CFrame)
     end
 end)
 
@@ -2638,11 +2866,13 @@ local function executeInstantTeleportToSelectedPlayer()
     local tRoot = targetPlr and targetPlr.Character and targetPlr.Character:FindFirstChild("HumanoidRootPart")
     if myRoot and tRoot then
         local destCF = tRoot.CFrame * CFrame.new(0, 0, 3)
+        State.RealCharacterCF = destCF
         syncFlyAltitudeToCFrame(destCF)
         task.spawn(function()
             for _ = 1, 4 do
                 if State.Root and tRoot and tRoot.Parent then
                     local liveDest = tRoot.CFrame * CFrame.new(0, 0, 3)
+                    State.RealCharacterCF = liveDest
                     syncFlyAltitudeToCFrame(liveDest)
                     State.Root.CFrame = liveDest
                     State.Root.AssemblyLinearVelocity = Vector3.zero
@@ -2668,12 +2898,13 @@ addFeatureToggle(TabTarget, "TeleportPlayer", "Pin-able Instant Teleport To Play
     end
 end)
 
--- // 4. POPULATE LOCALPLAYER TAB
+-- // 5. POPULATE LOCALPLAYER TAB
 addFeatureToggle(TabMove, "Fly", "Fly (Zero-Drop Invisible Ground Pad)", "FLY", false, function(v)
     Config.FlyEnabled = v
-    if v and State.Root then
-        State.FlyAltitudeY = State.Root.Position.Y
-        updateGroundPadUnderCharacter(State.Char, State.Root, State.Hum, State.FlyAltitudeY)
+    local refCF = State.RealCharacterCF or (State.Root and State.Root.CFrame)
+    if v and State.Root and refCF then
+        State.FlyAltitudeY = refCF.Position.Y
+        updateGroundPadUnderCharacter(State.Char, State.Root, State.Hum, State.FlyAltitudeY, refCF.Position)
         State.Root.AssemblyLinearVelocity = Vector3.zero
     else
         State.FlyAltitudeY = nil
@@ -2686,9 +2917,10 @@ end)
 
 addDropdown(TabMove, "Fly Mode", {"InvisibleGroundPad", "LoopFly"}, 1, function(opt)
     Config.FlyMode = opt
-    if State.Root then
-        State.FlyAltitudeY = State.Root.Position.Y
-        updateGroundPadUnderCharacter(State.Char, State.Root, State.Hum, State.FlyAltitudeY)
+    local refCF = State.RealCharacterCF or (State.Root and State.Root.CFrame)
+    if State.Root and refCF then
+        State.FlyAltitudeY = refCF.Position.Y
+        updateGroundPadUnderCharacter(State.Char, State.Root, State.Hum, State.FlyAltitudeY, refCF.Position)
     end
 end)
 
@@ -2733,7 +2965,7 @@ addSlider(TabMove, "JumpPower", 50, 350, 100, function(v)
     Config.JumpPower = v
 end)
 
--- // 5. POPULATE SERVER TAB
+-- // 6. POPULATE SERVER TAB
 addButton(TabServer, "Rejoin Current Server", Color3.fromRGB(45, 110, 185), function()
     rejoinCurrentServer()
 end)
@@ -2754,7 +2986,7 @@ addButton(TabServer, "Join Job ID", Color3.fromRGB(65, 95, 165), function(btn)
     joinServerByJobId(btn)
 end)
 
--- // 6. POPULATE SETTINGS TAB
+-- // 7. POPULATE SETTINGS TAB
 addFeatureToggle(TabVisual, "ESP", "Player ESP", "ESP", false, function(v)
     Config.ESPEnabled = v
     if not v then
@@ -2812,7 +3044,7 @@ local function updateESP()
     if now - State.LastESPRefresh < 0.15 then return end
     State.LastESPRefresh = now
 
-    local myRoot = State.Root
+    local myPos = (State.RealCharacterCF and State.RealCharacterCF.Position) or (State.Root and State.Root.Position)
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer then
             local char = plr.Character
@@ -2843,7 +3075,7 @@ local function updateESP()
                     State.ESPObjects[plr] = {Char = char, Billboard = bb, Label = txt}
                 end
 
-                local dist = myRoot and math.floor((myRoot.Position - root.Position).Magnitude) or 0
+                local dist = myPos and math.floor((myPos - root.Position).Magnitude) or 0
                 State.ESPObjects[plr].Label.Text = string.format("%s [%d HP]\n[%dm]", plr.Name, math.floor(hum.Health), dist)
             elseif State.ESPObjects[plr] then
                 pcall(function() State.ESPObjects[plr].Billboard:Destroy() end)
@@ -2881,56 +3113,27 @@ local function getFlightDirection(hum)
     return Vector3.zero
 end
 
--- // STEPPED LOOP
-table.insert(State.Connections, RunService.Stepped:Connect(function(_, dt)
-    if not Config.ScriptRunning then return end
-    local voidDamageY = getVoidKillPlaneY()
-
-    if State.VoidKillActive and State.VoidDropTargetCF and State.Root then
-        if (Config.AutoHighPlaceCarry or Config.AutoUltraFarCarry) and not Config.AutoVoidKill then
-            State.Root.CFrame = State.VoidDropTargetCF
-        else
-            local pos = State.VoidDropTargetCF.Position
-            local safeY = math.max(pos.Y, voidDamageY + 1.4)
-            State.Root.CFrame = CFrame.new(pos.X, safeY, pos.Z) * State.VoidDropTargetCF.Rotation
-        end
-        State.Root.AssemblyLinearVelocity = Vector3.zero
-        State.Root.AssemblyAngularVelocity = Vector3.zero
-    elseif State.AntiSkillEvading and State.DecoyCFrame and State.Root then
-        local safeY = voidDamageY + 35
-        local voidPos = Vector3.new(State.DecoyCFrame.Position.X, safeY, State.DecoyCFrame.Position.Z)
-        State.Root.CFrame = CFrame.new(voidPos) * State.DecoyCFrame.Rotation
-        State.Root.AssemblyLinearVelocity = Vector3.zero
-    elseif Config.DeepVoidActive and State.Root and State.DeepVoidStandCF then
-        local surfaceY = State.DeepVoidStandCF.Position.Y - 3.5
-        ensureWhiteVoidPlatform(Vector3.new(State.Root.Position.X, surfaceY, State.Root.Position.Z))
-        if State.Root.Position.Y < (surfaceY + 2.5) then
-            State.Root.CFrame = CFrame.new(State.Root.Position.X, surfaceY + 3.2, State.Root.Position.Z) * State.Root.CFrame.Rotation
-            State.Root.AssemblyLinearVelocity = Vector3.new(State.Root.AssemblyLinearVelocity.X, 0, State.Root.AssemblyLinearVelocity.Z)
-        end
-    elseif Config.FlyEnabled and not Config.AutoTargetEnabled and State.Root and State.Hum then
-        if not State.FlyAltitudeY then
-            State.FlyAltitudeY = State.Root.Position.Y
-        end
-        updateGroundPadUnderCharacter(State.Char, State.Root, State.Hum, State.FlyAltitudeY)
-        local curVel = State.Root.AssemblyLinearVelocity
-        if curVel.Y < 0 then
-            State.Root.AssemblyLinearVelocity = Vector3.new(curVel.X, 0, curVel.Z)
-        end
-    end
-
-    if Config.AntiStunEnabled and State.Char and State.Root and State.Hum then
-        enforceRealAntiStun(State.Char, State.Root, State.Hum, dt)
-    end
-end))
-
--- // RENDERSTEPPED LOOP
+-- // ==========================================================================
+-- // RENDERSTEPPED LOOP (RESTORES REAL SKIN & CAMERA BEFORE FRAME RENDER)
+-- // ==========================================================================
 table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
     if not Config.ScriptRunning then return end
     local char = State.Char
     local root = State.Root
     local hum = State.Hum
     local voidDamageY = getVoidKillPlaneY()
+
+    -- Restore Real Character CFrame prior to rendering & local movement physics
+    if State.IsCurrentlySpoofed and root and State.RealCharacterCF then
+        root.CFrame = State.RealCharacterCF
+        State.IsCurrentlySpoofed = false
+        if char and not Config.InvisibleEnabled then
+            local motor = getRootMotor(char)
+            if motor and State.OrigRootJointC0 then
+                motor.C0 = State.OrigRootJointC0
+            end
+        end
+    end
 
     if State.VoidKillActive and State.VoidDropTargetCF and root then
         if (Config.AutoHighPlaceCarry or Config.AutoUltraFarCarry) and not Config.AutoVoidKill then
@@ -3020,6 +3223,7 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
             local finalPos = basePos + State.FreeMoveOffset
             local lookCF = CFrame.lookAt(finalPos, targetPos)
             root.CFrame = lookCF
+            State.RealCharacterCF = lookCF
             root.AssemblyLinearVelocity = Vector3.zero
             root.AssemblyAngularVelocity = Vector3.zero
             syncFlyAltitudeToCFrame(lookCF)
@@ -3035,7 +3239,66 @@ table.insert(State.Connections, RunService.RenderStepped:Connect(function(dt)
     end
 end))
 
--- // HEARTBEAT LOOP
+-- // ==========================================================================
+-- // STEPPED LOOP (PHYSICS & RESTORING REAL POSITION FOR MOVEMENT)
+-- // ==========================================================================
+table.insert(State.Connections, RunService.Stepped:Connect(function(_, dt)
+    if not Config.ScriptRunning then return end
+    local voidDamageY = getVoidKillPlaneY()
+
+    -- Ensure character simulates local walking physics from RealCharacterCF
+    if State.IsCurrentlySpoofed and State.Root and State.RealCharacterCF then
+        State.Root.CFrame = State.RealCharacterCF
+        State.IsCurrentlySpoofed = false
+        if State.Char and not Config.InvisibleEnabled then
+            local motor = getRootMotor(State.Char)
+            if motor and State.OrigRootJointC0 then
+                motor.C0 = State.OrigRootJointC0
+            end
+        end
+    end
+
+    if State.VoidKillActive and State.VoidDropTargetCF and State.Root then
+        if (Config.AutoHighPlaceCarry or Config.AutoUltraFarCarry) and not Config.AutoVoidKill then
+            State.Root.CFrame = State.VoidDropTargetCF
+        else
+            local pos = State.VoidDropTargetCF.Position
+            local safeY = math.max(pos.Y, voidDamageY + 1.4)
+            State.Root.CFrame = CFrame.new(pos.X, safeY, pos.Z) * State.VoidDropTargetCF.Rotation
+        end
+        State.Root.AssemblyLinearVelocity = Vector3.zero
+        State.Root.AssemblyAngularVelocity = Vector3.zero
+    elseif State.AntiSkillEvading and State.DecoyCFrame and State.Root then
+        local safeY = voidDamageY + 35
+        local voidPos = Vector3.new(State.DecoyCFrame.Position.X, safeY, State.DecoyCFrame.Position.Z)
+        State.Root.CFrame = CFrame.new(voidPos) * State.DecoyCFrame.Rotation
+        State.Root.AssemblyLinearVelocity = Vector3.zero
+    elseif Config.DeepVoidActive and State.Root and State.DeepVoidStandCF then
+        local surfaceY = State.DeepVoidStandCF.Position.Y - 3.5
+        ensureWhiteVoidPlatform(Vector3.new(State.Root.Position.X, surfaceY, State.Root.Position.Z))
+        if State.Root.Position.Y < (surfaceY + 2.5) then
+            State.Root.CFrame = CFrame.new(State.Root.Position.X, surfaceY + 3.2, State.Root.Position.Z) * State.Root.CFrame.Rotation
+            State.Root.AssemblyLinearVelocity = Vector3.new(State.Root.AssemblyLinearVelocity.X, 0, State.Root.AssemblyLinearVelocity.Z)
+        end
+    elseif Config.FlyEnabled and not Config.AutoTargetEnabled and State.Root and State.Hum then
+        if not State.FlyAltitudeY then
+            State.FlyAltitudeY = State.Root.Position.Y
+        end
+        updateGroundPadUnderCharacter(State.Char, State.Root, State.Hum, State.FlyAltitudeY, State.Root.Position)
+        local curVel = State.Root.AssemblyLinearVelocity
+        if curVel.Y < 0 then
+            State.Root.AssemblyLinearVelocity = Vector3.new(curVel.X, 0, curVel.Z)
+        end
+    end
+
+    if Config.AntiStunEnabled and State.Char and State.Root and State.Hum then
+        enforceRealAntiStun(State.Char, State.Root, State.Hum, dt)
+    end
+end))
+
+-- // ==========================================================================
+-- // HEARTBEAT LOOP (APPLIES SERVER FAKE HITBOX & COUNTER-OFFSETS SKIN/CAMERA)
+-- // ==========================================================================
 table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
     if not Config.ScriptRunning then return end
     local char = State.Char
@@ -3081,7 +3344,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             local dangerNear = detectNearbyEnemySkillThreat()
             if dangerNear and not State.AntiSkillEvading then
                 State.AntiSkillEvading = true
-                spawnMovableGhostDecoy(root.CFrame)
+                spawnMovableGhostDecoy(State.RealCharacterCF or root.CFrame)
                 local voidPos = Vector3.new(State.DecoyCFrame.Position.X, voidDamageY + 35, State.DecoyCFrame.Position.Z)
                 root.CFrame = CFrame.new(voidPos) * State.DecoyCFrame.Rotation
                 root.AssemblyLinearVelocity = Vector3.zero
@@ -3094,28 +3357,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             stopMovableGhostDecoy()
         end
 
-        -- Anti-Void Protection
-        if State.VoidKillActive and Config.AutoVoidKill then
-            if root.Position.Y <= (voidDamageY + 1.2) then
-                root.CFrame = CFrame.new(root.Position.X, voidDamageY + 2.2, root.Position.Z) * root.CFrame.Rotation
-                root.AssemblyLinearVelocity = Vector3.zero
-            end
-        elseif not State.VoidKillActive and not State.AntiSkillEvading and not Config.DeepVoidActive then
-            if hum.FloorMaterial ~= Enum.Material.Air and root.Position.Y > -30 and root.Position.Magnitude < 1200 and not Config.FlyEnabled then
-                State.LastSafeCFrame = root.CFrame
-            end
-
-            if Config.AntiVoidEnabled and root.Position.Y < (voidDamageY + 55) then
-                local safeCF = (State.LastSafeCFrame and State.LastSafeCFrame.Position.Y > -20) and (State.LastSafeCFrame + Vector3.new(0, 5, 0)) or CFrame.new(0, 60, 0)
-                forceFullCharacterAndCameraResync(safeCF)
-            end
-        end
-
-        if isAnyGrabCarryModeActive() and not State.VoidKillActive and not State.AntiSkillEvading then
-            scanProximityGrab()
-        end
-
-        -- Speed Boost
+        -- Speed Boost (applied on Real position before Fake Hitbox shift)
         if Config.SpeedEnabled and hum.MoveDirection.Magnitude > 0 and not Config.FlyEnabled and not Config.AutoTargetEnabled and not isCharacterStillInSkill(char) then
             local extraSpeed = math.max(0, Config.WalkSpeed - 16)
             if extraSpeed > 0 then
@@ -3155,7 +3397,7 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
                 State.FlyAltitudeY = State.FlyAltitudeY + (moveDir.Y * spd * dt)
             end
 
-            updateGroundPadUnderCharacter(char, root, hum, State.FlyAltitudeY)
+            updateGroundPadUnderCharacter(char, root, hum, State.FlyAltitudeY, root.Position)
 
             if Config.FlyMode == "InvisibleGroundPad" then
                 if moveDir.Magnitude > 0 then
@@ -3179,6 +3421,73 @@ table.insert(State.Connections, RunService.Heartbeat:Connect(function(dt)
             end
         elseif not Config.FlyEnabled and State.InvisibleGroundPad then
             destroyInvisibleGroundPad()
+        end
+
+        -- Save RealCharacterCF after all normal local movement updates have completed
+        State.RealCharacterCF = root.CFrame
+
+        -- Anti-Void Protection (checks RealCharacterCF so FakeHitbox doesn't false-trigger it)
+        if State.VoidKillActive and Config.AutoVoidKill then
+            if root.Position.Y <= (voidDamageY + 1.2) then
+                root.CFrame = CFrame.new(root.Position.X, voidDamageY + 2.2, root.Position.Z) * root.CFrame.Rotation
+                root.AssemblyLinearVelocity = Vector3.zero
+            end
+        elseif not State.VoidKillActive and not State.AntiSkillEvading and not Config.DeepVoidActive then
+            if hum.FloorMaterial ~= Enum.Material.Air and State.RealCharacterCF.Position.Y > -30 and State.RealCharacterCF.Position.Magnitude < 1200 and not Config.FlyEnabled then
+                State.LastSafeCFrame = State.RealCharacterCF
+            end
+
+            if Config.AntiVoidEnabled and State.RealCharacterCF.Position.Y < (voidDamageY + 55) then
+                local safeCF = (State.LastSafeCFrame and State.LastSafeCFrame.Position.Y > -20) and (State.LastSafeCFrame + Vector3.new(0, 5, 0)) or CFrame.new(0, 60, 0)
+                forceFullCharacterAndCameraResync(safeCF)
+            end
+        end
+
+        if isAnyGrabCarryModeActive() and not State.VoidKillActive and not State.AntiSkillEvading then
+            scanProximityGrab()
+        end
+
+        -- // APPLY FAKE HITBOX DISPLACEMENT FOR SERVER REPLICATION
+        if not shouldBypassFakeHitbox() then
+            local realCF = State.RealCharacterCF
+            local fakeCF = computeFakeHitboxCFrame(realCF)
+            State.FakeHitboxCF = fakeCF
+
+            -- Lock Camera to Proxy at Real Position so camera never twitches
+            local camProxy = ensureCameraProxy()
+            camProxy.CFrame = realCF * CFrame.new(0, 1.5, 0)
+            if Camera and Camera.CameraSubject ~= camProxy then
+                Camera.CameraSubject = camProxy
+            end
+
+            -- Update Visualizer
+            if Config.FakeHitboxVisualizer then
+                local vis = ensureHitboxVisualizer()
+                vis.CFrame = fakeCF
+            else
+                destroyHitboxVisualizer()
+            end
+
+            -- Counter-offset RootJoint.C0 so Character Skin (Torso, Limbs, Head) stays at realCF
+            if Config.FakeHitboxMethod == "Motor6D+Cycle" and not Config.InvisibleEnabled then
+                local motor = getRootMotor(char)
+                if motor and State.OrigRootJointC0 then
+                    local relativeOffset = fakeCF:ToObjectSpace(realCF)
+                    motor.C0 = relativeOffset * State.OrigRootJointC0
+                end
+            end
+
+            -- Shift HumanoidRootPart to Fake Hitbox CFrame for Server Replication
+            root.CFrame = fakeCF
+            State.IsCurrentlySpoofed = true
+        else
+            if State.CameraProxyPart and Camera and Camera.CameraSubject == State.CameraProxyPart then
+                Camera.CameraSubject = hum
+                destroyCameraProxy()
+            end
+            if not Config.FakeHitboxEnabled then
+                destroyHitboxVisualizer()
+            end
         end
     end
 
